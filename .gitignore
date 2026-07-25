@@ -1,0 +1,28 @@
+# Android (android/)
+android/.gradle/
+android/.gradle-dist/
+android/.android-sdk/
+android/app/build/
+android/build/
+android/local.properties
+*.apk
+*.aab
+*.iml
+.idea/
+
+# Server (server/)
+server/node_modules/
+server/.env
+server/data/
+
+# Apple (apple/)
+apple/**/xcuserdata/
+apple/**/DerivedData/
+apple/**/Pods/
+apple/**/.build/
+apple/*.xcworkspace/xcuserdata/
+
+# Linux (linux/)
+linux/**/__pycache__/
+**/__pycache__/
+

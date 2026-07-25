@@ -39,3 +39,24 @@ shared server.
   (apple) — those original folders were left in place untouched (not moved),
   since `FredPlayerForAliens` has an installed desktop launcher and a running
   process pointing at its original path.
+- **nginx `client_max_body_size` is still the default (1MB)** on the
+  `/fredplayer-media/` location block in `/etc/nginx/sites-available/default`
+  on the host. Large visual-cache uploads (spectrum/waveform data, ~3.3MB
+  observed) get rejected with a 413 — the upload code degrades gracefully
+  (silently fails, recomputes locally next time) so nothing breaks, but
+  cross-device cache sharing doesn't fully work at that size yet. Fix needs
+  the host's own sudo access: add `client_max_body_size 25m;` next to the
+  existing `proxy_read_timeout 300;` in that block, then
+  `sudo nginx -t && sudo systemctl reload nginx`.
+
+## Operational cautions (learned the hard way)
+
+- **Don't interactively test the Android app's playlist features against a
+  real device without care.** A UI test once wiped a real, non-backed-up
+  106-song local playlist. Prefer code review + `./gradlew assembleDebug` +
+  targeted `adb` checks over exploratory tapping through playlist
+  add/remove/switch flows on a device with real data on it.
+- **Restarting `fredplayer-media.service` (the `server/` process) drops any
+  client currently streaming from it.** Avoid restarting it during active
+  playback; if a restart is needed, treat it like a deploy, not a routine
+  dev-loop action.

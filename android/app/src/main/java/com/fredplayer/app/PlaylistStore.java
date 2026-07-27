@@ -40,6 +40,7 @@ final class PlaylistStore {
     private static final String KEY_SHUFFLE_ENABLED = "shuffle_enabled";
     private static final String KEY_SERVER_BASE_URL = "server_base_url";
     private static final String KEY_SERVER_TOKEN = "server_token";
+    private static final String KEY_TRACK_METADATA = "track_metadata";
 
     private PlaylistStore() {
     }
@@ -271,6 +272,59 @@ final class PlaylistStore {
                 .edit()
                 .putString(KEY_SERVER_TOKEN, token == null ? "" : token.trim())
                 .apply();
+    }
+
+    /**
+     * Returns cached {title, artist, album} for a track URI (as fetched once
+     * from the server's /api/library when the track was added), or null if
+     * nothing is cached — the caller should fall back to on-device tag
+     * extraction in that case.
+     */
+    static String[] loadTrackMetadata(Context context, String uriString) {
+        String stored = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_TRACK_METADATA, "");
+        if (stored == null || stored.isEmpty()) {
+            return null;
+        }
+        try {
+            JSONObject entry = new JSONObject(stored).optJSONObject(uriString);
+            if (entry == null) {
+                return null;
+            }
+            return new String[]{
+                    entry.optString("title", ""),
+                    entry.optString("artist", ""),
+                    entry.optString("album", "")
+            };
+        } catch (JSONException e) {
+            return null;
+        }
+    }
+
+    static void saveTrackMetadata(Context context, Map<String, String[]> entries) {
+        if (entries.isEmpty()) {
+            return;
+        }
+        SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        String stored = prefs.getString(KEY_TRACK_METADATA, "");
+        JSONObject all;
+        try {
+            all = (stored == null || stored.isEmpty()) ? new JSONObject() : new JSONObject(stored);
+        } catch (JSONException e) {
+            all = new JSONObject();
+        }
+        try {
+            for (Map.Entry<String, String[]> entry : entries.entrySet()) {
+                String[] fields = entry.getValue();
+                JSONObject value = new JSONObject();
+                value.put("title", fields[0]);
+                value.put("artist", fields[1]);
+                value.put("album", fields[2]);
+                all.put(entry.getKey(), value);
+            }
+            prefs.edit().putString(KEY_TRACK_METADATA, all.toString()).apply();
+        } catch (JSONException ignored) {
+        }
     }
 
     static String displayName(Context context, String uriString) {

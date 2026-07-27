@@ -13,7 +13,7 @@ final class TrackMetadata {
     final String artist;
     final String album;
 
-    private TrackMetadata(String title, String artist, String album) {
+    TrackMetadata(String title, String artist, String album) {
         this.title = clean(title);
         this.artist = clean(artist);
         this.album = clean(album);

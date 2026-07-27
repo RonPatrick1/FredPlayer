@@ -22,11 +22,11 @@ final class VisualizationSettings {
             int fftBars,
             float smoothing,
             boolean logScale) {
-        this.fps = clamp(fps, 5, 30);
-        this.waveformMs = clamp(waveformMs, 30, 250);
+        this.fps = clamp(fps, 5, 60);
+        this.waveformMs = clamp(waveformMs, 20, 90);
         this.fftSize = nearestFftSize(fftSize);
         this.fftBars = clamp(fftBars, 16, 64);
-        this.smoothing = clamp(smoothing, 0f, 0.9f);
+        this.smoothing = clamp(smoothing, 0f, 0.95f);
         this.logScale = logScale;
     }
 

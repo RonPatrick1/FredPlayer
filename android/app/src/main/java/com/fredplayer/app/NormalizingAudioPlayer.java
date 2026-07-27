@@ -459,15 +459,16 @@ final class NormalizingAudioPlayer {
                 }
                 try {
                     Uri uri = Uri.parse(uriString);
+                    TrackProfile profile = null;
                     if (levelingSettings.analysisSeconds > 0f) {
-                        obtainProfile(uri, run, Math.round(levelingSettings.analysisSeconds * ONE_SECOND_US));
+                        profile = obtainProfile(uri, run, Math.round(levelingSettings.analysisSeconds * ONE_SECOND_US));
                     }
                     File visualFile = visualCacheFile(uri, visualSettings);
                     if (!run.stopRequested.get() && !visualFile.exists() && isRemote(uri)) {
                         fetchRemoteVisualQuietly(uri, visualFile);
                     }
                     if (!run.stopRequested.get() && !visualFile.exists()) {
-                        writeVisualCache(uri, visualFile, visualSettings, run);
+                        writeVisualCache(uri, visualFile, visualSettings, run, profile);
                         if (!run.stopRequested.get() && visualFile.exists() && isRemote(uri)) {
                             uploadRemoteVisualQuietly(uri, visualFile);
                         }
@@ -753,7 +754,8 @@ final class NormalizingAudioPlayer {
             Uri uri,
             File cacheFile,
             VisualizationSettings settings,
-            PlaybackRun run) throws IOException, InterruptedException {
+            PlaybackRun run,
+            TrackProfile profile) throws IOException, InterruptedException {
         File parent = cacheFile.getParentFile();
         if (parent != null && !parent.exists() && !parent.mkdirs()) {
             throw new IOException("Visual cache directory unavailable");
@@ -768,7 +770,7 @@ final class NormalizingAudioPlayer {
             output.writeInt(VISUAL_WAVEFORM_POINTS);
             output.writeInt(settings.fftBars);
             output.writeInt(0);
-            decodeVisualization(uri, settings, run, (waveform, spectrum) -> {
+            decodeVisualization(uri, settings, run, profile, (waveform, spectrum) -> {
                 output.write(waveform);
                 output.write(spectrum);
                 frameCount[0]++;
@@ -799,6 +801,7 @@ final class NormalizingAudioPlayer {
             Uri uri,
             VisualizationSettings settings,
             PlaybackRun run,
+            TrackProfile profile,
             VisualizationSink sink) throws IOException, InterruptedException {
         MediaExtractor extractor = new MediaExtractor();
         MediaCodec codec = null;
@@ -825,6 +828,7 @@ final class NormalizingAudioPlayer {
             boolean outputDone = false;
             StreamFormat streamFormat = null;
             VisualizationCollector collector = null;
+            VolumeNormalizer normalizer = null;
 
             while (!outputDone && !run.stopRequested.get()) {
                 if (!inputDone) {
@@ -851,16 +855,18 @@ final class NormalizingAudioPlayer {
                 if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     streamFormat = StreamFormat.from(codec.getOutputFormat());
                     collector = new VisualizationCollector(streamFormat.sampleRate, settings);
+                    normalizer = new VolumeNormalizer(streamFormat.sampleRate, profile, levelingSettings);
                 } else if (outputIndex >= 0) {
                     if (streamFormat == null) {
                         streamFormat = StreamFormat.from(codec.getOutputFormat());
                         collector = new VisualizationCollector(streamFormat.sampleRate, settings);
+                        normalizer = new VolumeNormalizer(streamFormat.sampleRate, profile, levelingSettings);
                     }
                     ByteBuffer outputBuffer = codec.getOutputBuffer(outputIndex);
                     if (outputBuffer != null && info.size > 0 && collector != null) {
                         outputBuffer.position(info.offset);
                         outputBuffer.limit(info.offset + info.size);
-                        acceptVisualizationPcm(outputBuffer.slice(), info.size, streamFormat, collector, sink);
+                        acceptVisualizationPcm(outputBuffer.slice(), info.size, streamFormat, collector, normalizer, sink);
                     }
                     outputDone = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
                     codec.releaseOutputBuffer(outputIndex, false);
@@ -889,6 +895,7 @@ final class NormalizingAudioPlayer {
             int size,
             StreamFormat format,
             VisualizationCollector collector,
+            VolumeNormalizer normalizer,
             VisualizationSink sink) throws IOException {
         source.order(ByteOrder.LITTLE_ENDIAN);
         int bytesPerSample = bytesPerSample(format.pcmEncoding);
@@ -925,6 +932,12 @@ final class NormalizingAudioPlayer {
             } else {
                 right = left;
             }
+            // Match the live playback path (processPcm): feed the collector
+            // post-leveling audio, not the raw decode, so the cached/replayed
+            // visualization matches what live analysis would have shown.
+            float gain = normalizer.nextGain(left, right, levelingStrength);
+            left = normalizer.protect(left * gain * outputLevel);
+            right = normalizer.protect(right * gain * outputLevel);
             collector.accept((left + right) * 0.5f, sink);
         }
     }

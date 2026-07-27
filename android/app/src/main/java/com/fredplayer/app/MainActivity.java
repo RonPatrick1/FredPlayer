@@ -34,6 +34,7 @@ import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -339,40 +340,55 @@ public class MainActivity extends Activity {
                 .setMultiChoiceItems(labels, checked, (dialog, which, isChecked) -> checked[which] = isChecked)
                 .setPositiveButton("Add Selected", (dialog, which) -> {
                     LinkedHashSet<String> merged = new LinkedHashSet<>(playlist);
+                    Map<String, String[]> metadataOut = new HashMap<>();
                     int added = 0;
                     for (int i = 0; i < folderNames.size(); i++) {
                         if (!checked[i]) {
                             continue;
                         }
                         for (int trackIndex : folders.get(folderNames.get(i))) {
-                            if (addServerTrack(merged, tracks, trackIndex, baseUrl)) {
+                            if (addServerTrack(merged, tracks, trackIndex, baseUrl, metadataOut)) {
                                 added++;
                             }
                         }
                     }
+                    PlaylistStore.saveTrackMetadata(this, metadataOut);
                     reportServerAdd(merged, added);
                 })
                 .setNeutralButton("Add All", (dialog, which) -> {
                     LinkedHashSet<String> merged = new LinkedHashSet<>(playlist);
+                    Map<String, String[]> metadataOut = new HashMap<>();
                     int added = 0;
                     for (int i = 0; i < tracks.length(); i++) {
-                        if (addServerTrack(merged, tracks, i, baseUrl)) {
+                        if (addServerTrack(merged, tracks, i, baseUrl, metadataOut)) {
                             added++;
                         }
                     }
+                    PlaylistStore.saveTrackMetadata(this, metadataOut);
                     reportServerAdd(merged, added);
                 })
                 .setNegativeButton("Cancel", null)
                 .show();
     }
 
-    private boolean addServerTrack(LinkedHashSet<String> merged, JSONArray tracks, int index, String baseUrl) {
+    private boolean addServerTrack(LinkedHashSet<String> merged, JSONArray tracks, int index, String baseUrl,
+                                    Map<String, String[]> metadataOut) {
         JSONObject track = tracks.optJSONObject(index);
         String path = track == null ? null : track.optString("path", null);
         if (path == null || path.isEmpty()) {
             return false;
         }
-        return merged.add(RemoteLibraryClient.buildStreamUrl(baseUrl, path));
+        String url = RemoteLibraryClient.buildStreamUrl(baseUrl, path);
+        if (!merged.add(url)) {
+            return false;
+        }
+        String title = track.optString("title", "");
+        String artist = track.optString("artist", "");
+        String album = track.optString("album", "");
+        if (!title.isEmpty() || !artist.isEmpty() || !album.isEmpty()) {
+            metadataOut.put(url, new String[]{title, artist, album});
+        }
+        return true;
     }
 
     private void reportServerAdd(LinkedHashSet<String> merged, int added) {
@@ -903,7 +919,7 @@ public class MainActivity extends Activity {
         TextView title = text("Visualization", 18, Color.rgb(245, 243, 237));
         root.addView(title, topMargin(28));
 
-        addSettingsSlider(root, "Update FPS", 5, 30, visualizationSettings.fps,
+        addSettingsSlider(root, "Update FPS", 5, 60, visualizationSettings.fps,
                 value -> value + " fps",
                 value -> updateVisualizationSettings(new VisualizationSettings(
                         value,
@@ -913,7 +929,7 @@ public class MainActivity extends Activity {
                         visualizationSettings.smoothing,
                         visualizationSettings.logScale)));
 
-        addSettingsSlider(root, "Waveform window", 30, 250, visualizationSettings.waveformMs,
+        addSettingsSlider(root, "Waveform window", 20, 90, visualizationSettings.waveformMs,
                 value -> value + " ms",
                 value -> updateVisualizationSettings(new VisualizationSettings(
                         visualizationSettings.fps,
@@ -943,7 +959,7 @@ public class MainActivity extends Activity {
                         visualizationSettings.smoothing,
                         visualizationSettings.logScale)));
 
-        addSettingsSlider(root, "FFT smoothing", 0, 90, Math.round(visualizationSettings.smoothing * 100f),
+        addSettingsSlider(root, "FFT smoothing", 0, 95, Math.round(visualizationSettings.smoothing * 100f),
                 value -> value + "%",
                 value -> updateVisualizationSettings(new VisualizationSettings(
                         visualizationSettings.fps,

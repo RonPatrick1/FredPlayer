@@ -392,7 +392,7 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         browseExecutor.execute(() -> {
             ArrayList<MediaBrowserCompat.MediaItem> items = new ArrayList<>();
             for (int i = 0; i < snapshot.size(); i++) {
-                TrackMetadata metadata = TrackMetadata.from(this, snapshot.get(i));
+                TrackMetadata metadata = resolveMetadata(snapshot.get(i));
                 MediaDescriptionCompat description = new MediaDescriptionCompat.Builder()
                         .setMediaId(TRACK_ID_PREFIX + playlistName + "#" + i)
                         .setTitle(metadata.title.isEmpty() ? "FredPlayer" : metadata.title)
@@ -559,6 +559,14 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         playTrackAt(target, false);
     }
 
+    private TrackMetadata resolveMetadata(String uri) {
+        String[] cached = PlaylistStore.loadTrackMetadata(this, uri);
+        if (cached != null) {
+            return new TrackMetadata(cached[0], cached[1], cached[2]);
+        }
+        return TrackMetadata.from(this, uri);
+    }
+
     private void playTrackAt(int nextIndex, boolean rememberPrevious) {
         if (nextIndex < 0 || nextIndex >= playlist.size() || player == null) {
             playbackRequested = false;
@@ -571,7 +579,7 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         }
         currentIndex = nextIndex;
         String item = playlist.get(nextIndex);
-        TrackMetadata metadata = TrackMetadata.from(this, item);
+        TrackMetadata metadata = resolveMetadata(item);
         currentTrackName = metadata.title;
         currentTrackArtist = metadata.artist;
         currentTrackAlbum = metadata.album;

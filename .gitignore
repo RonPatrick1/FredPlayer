@@ -25,4 +25,3 @@ apple/*.xcworkspace/xcuserdata/
 # Linux (linux/)
 linux/**/__pycache__/
 **/__pycache__/
-

@@ -19,6 +19,7 @@ final class PlayerController: ObservableObject {
     @Published private(set) var cachePreparationProgress: Double?
     @Published private(set) var cachePreparationLabel = ""
     @Published private(set) var isLoadingRemoteTrack = false
+    @Published private(set) var outputLatency: Double = 0
     @Published var playbackError: String?
     @Published var serverBaseURL = "" { didSet { saveSettings() } }
     @Published var serverToken = "" { didSet { saveSettings() } }
@@ -239,7 +240,7 @@ final class PlayerController: ObservableObject {
                 self.cachePreparationLabel = "Preparing \(track.displayTitle)"
                 if let serverPath = track.serverPath, let client = self.serverClient {
                     async let profile = client.fetchProfile(serverPath: serverPath)
-                    async let visualData = client.fetchVisual(serverPath: serverPath)
+                    async let visualData = client.fetchVisual(serverPath: serverPath, settings: visualSettings)
                     if MediaCache.loudness(forServerPath: serverPath) == nil,
                        let fetched = await profile {
                         try? MediaCache.store(Self.loudnessEntry(from: fetched), forServerPath: serverPath)
@@ -417,7 +418,7 @@ final class PlayerController: ObservableObject {
             if let visualEntry {
                 try? MediaCache.store(visualEntry, forServerPath: serverPath, settings: visualSettings)
                 let data = MediaCache.encodeServerVisual(visualEntry, settings: visualSettings)
-                Task { _ = await client.uploadVisual(data, serverPath: serverPath) }
+                Task { _ = await client.uploadVisual(data, serverPath: serverPath, settings: visualSettings) }
             }
         }
         refreshCacheStatus()
@@ -438,7 +439,7 @@ final class PlayerController: ObservableObject {
         settings: VisualCacheSettings
     ) async -> VisualCacheEntry? {
         if let cached = MediaCache.visual(forServerPath: serverPath, settings: settings) { return cached }
-        guard let data = await client.fetchVisual(serverPath: serverPath),
+        guard let data = await client.fetchVisual(serverPath: serverPath, settings: settings),
               let entry = MediaCache.serverVisual(from: data, settings: settings) else { return nil }
         try? MediaCache.store(entry, forServerPath: serverPath, settings: settings)
         return entry
@@ -490,8 +491,10 @@ final class PlayerController: ObservableObject {
                         cache.frames.count - 1,
                         max(0, Int(self.currentTime / cache.frameInterval))
                     )
-                    self.waveform = cache.frames[index].waveform
-                    self.spectrum = cache.frames[index].spectrum
+                    self.publishVisualFrame(
+                        waveform: cache.frames[index].waveform,
+                        spectrum: cache.frames[index].spectrum
+                    )
                 }
             }
         }
@@ -584,6 +587,17 @@ final class PlayerController: ObservableObject {
         } catch {
             logger.error("Audio session configuration failed: \(error.localizedDescription, privacy: .public)")
         }
+        refreshOutputLatency()
+    }
+
+    /// Unlike Android, which has to play a recorded calibration chirp to
+    /// measure Bluetooth output delay, `AVAudioSession` reports it directly —
+    /// no calibration step needed. Kept fresh on every route change so the
+    /// visualizer (delayed via `publishVisualFrame`) stays in sync with what
+    /// the listener actually hears on Bluetooth speakers/headphones, not
+    /// what was just decoded.
+    private func refreshOutputLatency() {
+        outputLatency = AVAudioSession.sharedInstance().outputLatency
     }
 
     private func observeAudioSession() {
@@ -594,6 +608,7 @@ final class PlayerController: ObservableObject {
                       let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else { return }
                 switch reason {
                 case .newDeviceAvailable, .routeConfigurationChange, .categoryChange, .override:
+                    self?.refreshOutputLatency()
                     self?.scheduleRouteRecovery()
                 default:
                     break
@@ -603,7 +618,10 @@ final class PlayerController: ObservableObject {
 
         NotificationCenter.default.publisher(for: .AVAudioEngineConfigurationChange, object: engine)
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in self?.scheduleRouteRecovery() }
+            .sink { [weak self] _ in
+                self?.refreshOutputLatency()
+                self?.scheduleRouteRecovery()
+            }
             .store(in: &audioSessionObservations)
 
         NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)
@@ -691,9 +709,27 @@ final class PlayerController: ObservableObject {
 
             Task { @MainActor [weak self] in
                 guard let self, self.currentVisualCache == nil else { return }
-                self.waveform = wave
-                self.spectrum = smoothed
+                self.publishVisualFrame(waveform: wave, spectrum: smoothed)
             }
+        }
+    }
+
+    /// Delays the visualizer's published frame by the current route's
+    /// output latency, so what's on screen lines up with what's actually
+    /// audible rather than with the moment the samples were decoded/tapped.
+    /// Negligible for built-in speakers; can be 100-200ms+ on Bluetooth.
+    private func publishVisualFrame(waveform: [Float], spectrum: [Float]) {
+        guard outputLatency > 0.001 else {
+            self.waveform = waveform
+            self.spectrum = spectrum
+            return
+        }
+        let delay = outputLatency
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self else { return }
+            self.waveform = waveform
+            self.spectrum = spectrum
         }
     }
 

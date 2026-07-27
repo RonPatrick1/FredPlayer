@@ -8,9 +8,11 @@ const test = require('node:test');
 const {
   analyzeTrack,
   androidVariantKey,
+  appleVariantKey,
   inferAndroidSettings,
   jobForTrack,
   parseAndroidVariantKey,
+  parseAppleVariantKey,
   readAndroidHeader,
   readAppleHeader,
   validAndroidVisual,
@@ -139,5 +141,43 @@ test('Android variants use a validated settings-keyed directory', async (context
   assert.equal(
     job.androidPath,
     path.join(root, 'data', 'android-visual', key, `${relativePath}.fvz`),
+  );
+});
+
+test('Apple variants use a validated settings-keyed directory', async (context) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'fredplayer-cache-apple-variant-'));
+  context.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const settings = {
+    fps: 60,
+    waveformMs: 80,
+    fftSize: 2048,
+    bars: 64,
+    logarithmic: true,
+  };
+  const key = 'fps60-wave80-fft2048-bars64-log1';
+  assert.equal(appleVariantKey(settings), key);
+  assert.deepEqual(parseAppleVariantKey(key), settings);
+  assert.equal(parseAppleVariantKey('../apple-visual'), null);
+  assert.equal(parseAppleVariantKey('fps60-wave80-fft1-bars64-log1'), null);
+
+  const relativePath = path.join('Artist', 'Track.flac');
+  const job = jobForTrack(
+    { sourcePath: path.join(root, 'music', relativePath), relativePath },
+    {
+      dataDir: path.join(root, 'data'),
+      platform: 'apple',
+      visualOnly: true,
+      profilesOnly: false,
+      analysisSeconds: 10,
+      force: false,
+      appleVariant: true,
+      android: { fps: 20, waveformMs: 90, fftSize: 512, bars: 32, logarithmic: true },
+      apple: settings,
+    },
+  );
+  assert.ok(job?.apple);
+  assert.equal(
+    job.applePath,
+    path.join(root, 'data', 'apple-visual-variant', key, `${relativePath}.fav`),
   );
 });

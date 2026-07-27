@@ -100,18 +100,22 @@ struct FredServerClient {
         } catch { return false }
     }
 
-    func fetchVisual(serverPath: String) async -> Data? {
+    func fetchVisual(serverPath: String, settings: VisualCacheSettings) async -> Data? {
         do {
             let path = encodedPath(serverPath)
-            let (data, response) = try await URLSession.shared.data(for: request(path: "api/apple-visual/\(path)"))
+            let variant = Self.appleVariantKey(settings)
+            let (data, response) = try await URLSession.shared.data(
+                for: request(path: "api/apple-visual-variant/\(variant)/\(path)")
+            )
             try validate(response)
             return data
         } catch { return nil }
     }
 
-    func uploadVisual(_ data: Data, serverPath: String) async -> Bool {
+    func uploadVisual(_ data: Data, serverPath: String, settings: VisualCacheSettings) async -> Bool {
         do {
-            var request = request(path: "api/apple-visual/\(encodedPath(serverPath))")
+            let variant = Self.appleVariantKey(settings)
+            var request = request(path: "api/apple-visual-variant/\(variant)/\(encodedPath(serverPath))")
             request.httpMethod = "PUT"
             request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
             request.httpBody = data
@@ -119,6 +123,18 @@ struct FredServerClient {
             try validate(response)
             return true
         } catch { return false }
+    }
+
+    /// Matches the server's `appleVariantKey` (server/precompute-cache.js)
+    /// exactly, including its plain-integer formatting for whole-number
+    /// fps/waveform values — Swift's `Double` interpolation would otherwise
+    /// emit "60.0" where the server writes "60", missing every precomputed
+    /// variant directory.
+    private static func appleVariantKey(_ settings: VisualCacheSettings) -> String {
+        let fps = Int(settings.fps.rounded())
+        let waveformMs = Int((settings.waveformWindow * 1_000).rounded())
+        let logFlag = settings.logarithmic ? 1 : 0
+        return "fps\(fps)-wave\(waveformMs)-fft\(settings.fftSize)-bars\(settings.bars)-log\(logFlag)"
     }
 
     func askLiam(deviceID: String, message: String) async throws -> AskLiamResponse {

@@ -65,6 +65,33 @@ function parseAndroidVariantKey(value) {
   return settings;
 }
 
+function appleVariantKey(settings) {
+  return `fps${settings.fps}-wave${settings.waveformMs}-fft${settings.fftSize}`
+    + `-bars${settings.bars}-log${settings.logarithmic ? 1 : 0}`;
+}
+
+function parseAppleVariantKey(value) {
+  const match = /^fps(\d+(?:\.\d+)?)-wave(\d+(?:\.\d+)?)-fft(\d+)-bars(\d+)-log([01])$/.exec(value || '');
+  if (!match) return null;
+  const settings = {
+    fps: Number(match[1]),
+    waveformMs: Number(match[2]),
+    fftSize: Number(match[3]),
+    bars: Number(match[4]),
+    logarithmic: match[5] === '1',
+  };
+  if (settings.fps < 1
+      || settings.fps > 120
+      || settings.waveformMs < 1
+      || settings.waveformMs > 1000
+      || settings.fftSize < 2
+      || settings.bars < 1
+      || settings.bars > 256) {
+    return null;
+  }
+  return settings;
+}
+
 // Canonical loudness-leveling settings baked into precomputed cache waveforms/
 // spectra, so they reflect post-leveling audio the same way live playback does
 // (NormalizingAudioPlayer.java applies leveling before feeding its visualizer
@@ -194,6 +221,10 @@ Options:
   --apple-fft-size N        Apple FFT size (default: 1024)
   --apple-bars N            Apple spectrum bars (default: 32)
   --apple-linear            Use a linear Apple spectrum scale
+  --apple-variant           Store Apple output under the settings-keyed
+                            data/apple-visual-variant/<settings>/ directory
+                            instead of the legacy single-slot
+                            data/apple-visual directory
   --help                    Show this help
 `;
 }
@@ -220,6 +251,7 @@ function parseArgs(argv) {
     force: false,
     nice: false,
     androidVariant: false,
+    appleVariant: false,
     android: { ...DEFAULT_ANDROID },
     apple: { ...DEFAULT_APPLE },
   };
@@ -259,6 +291,7 @@ function parseArgs(argv) {
       case '--apple-fft-size': options.apple.fftSize = parseNumber(take(i++, arg), arg, { integer: true, min: 2 }); break;
       case '--apple-bars': options.apple.bars = parseNumber(take(i++, arg), arg, { integer: true, min: 1 }); break;
       case '--apple-linear': options.apple.logarithmic = false; break;
+      case '--apple-variant': options.appleVariant = true; break;
       default: throw new Error(`Unknown option: ${arg}`);
     }
   }
@@ -919,7 +952,10 @@ function jobForTrack(track, options) {
     ? path.join(options.dataDir, 'android-visual', androidVariantKey(options.android))
     : path.join(options.dataDir, 'visual');
   const androidPath = path.join(androidDirectory, `${track.relativePath}.fvz`);
-  const applePath = path.join(options.dataDir, 'apple-visual', `${track.relativePath}.fav`);
+  const appleDirectory = options.appleVariant
+    ? path.join(options.dataDir, 'apple-visual-variant', appleVariantKey(options.apple))
+    : path.join(options.dataDir, 'apple-visual');
+  const applePath = path.join(appleDirectory, `${track.relativePath}.fav`);
   const visualEnabled = !options.profilesOnly;
   const job = {
     ...track,
@@ -993,7 +1029,10 @@ async function main(argv = process.argv.slice(2)) {
     }
     if (options.platform === 'both' || options.platform === 'apple') {
       const missing = allJobs.filter((job) => job.apple).length;
-      console.log(`Apple visuals: ${tracks.length - missing} valid; ${missing} missing`);
+      const storage = options.appleVariant
+        ? `variant ${appleVariantKey(options.apple)}`
+        : 'legacy';
+      console.log(`Apple visuals (${storage}): ${tracks.length - missing} valid; ${missing} missing`);
       console.log(`  settings: ${options.apple.fps} FPS, ${options.apple.waveformMs} ms, FFT ${options.apple.fftSize}, ${options.apple.bars} bars, ${options.apple.logarithmic ? 'log' : 'linear'}`);
     }
     if (inferred) console.log(`Android FPS/bars inferred from ${inferred.count} existing valid server files`);
@@ -1075,10 +1114,12 @@ module.exports = {
   DEFAULT_APPLE,
   analyzeTrack,
   androidVariantKey,
+  appleVariantKey,
   inferAndroidSettings,
   jobForTrack,
   parseArgs,
   parseAndroidVariantKey,
+  parseAppleVariantKey,
   runJobs,
   readAndroidHeader,
   readAppleHeader,

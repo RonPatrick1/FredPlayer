@@ -17,6 +17,7 @@ const PROFILES_DIR = path.join(DATA_DIR, 'profiles');
 const VISUAL_DIR = path.join(DATA_DIR, 'visual');
 const ANDROID_VISUAL_DIR = path.join(DATA_DIR, 'android-visual');
 const APPLE_VISUAL_DIR = path.join(DATA_DIR, 'apple-visual');
+const APPLE_VISUAL_VARIANT_DIR = path.join(DATA_DIR, 'apple-visual-variant');
 const PLAYLISTS_DIR = path.join(DATA_DIR, 'playlists');
 const PLAYLIST_NAME_RE = /^[^/\\]{1,100}$/;
 const LIAM_ASK_URL = process.env.LIAM_ASK_URL || 'http://127.0.0.1:8787/fredplayer-ask';
@@ -35,6 +36,19 @@ const AUDIO_EXTENSIONS = new Set([
 const ANDROID_60_SETTINGS = Object.freeze({
   fps: 60,
   waveformMs: 90,
+  fftSize: 2048,
+  bars: 64,
+  logarithmic: true,
+});
+
+// The Apple client's current defaults (PlayerController.swift). The legacy
+// flat apple-visual cache was baked at the older 24fps/1024-FFT/32-bar
+// settings, so it never matches these and every fetch falls back to local
+// analysis. This variant lets the precomputed cache serve the app as it's
+// actually configured today.
+const APPLE_60_SETTINGS = Object.freeze({
+  fps: 60,
+  waveformMs: 80,
   fftSize: 2048,
   bars: 64,
   logarithmic: true,
@@ -213,6 +227,16 @@ async function runAutoPrecomputePass() {
         visualOnly: true,
         androidVariant: true,
         android: { ...ANDROID_60_SETTINGS },
+      },
+    },
+    {
+      label: `Apple ${precomputeCache.appleVariantKey(APPLE_60_SETTINGS)}`,
+      options: {
+        ...baseOptions,
+        platform: 'apple',
+        visualOnly: true,
+        appleVariant: true,
+        apple: { ...APPLE_60_SETTINGS },
       },
     },
   ];
@@ -551,6 +575,97 @@ app.put('/api/apple-visual/*', express.raw({ type: '*/*', limit: '20mb' }), asyn
     res.status(500).json({ error: 'write failed' });
   }
 });
+
+// A distinct top-level prefix, not a sub-path of /api/apple-visual/* — Apple
+// track-relative paths themselves are multi-segment (Artist/Album/Song.flac),
+// so a :variant/* route nested under the existing flat prefix would collide
+// with ordinary flat requests. Mirrors why Android's variant route lives
+// under /api/android-visual/ rather than as a sub-path of /api/visual/.
+function appleHeaderMatchesSettings(header, settings) {
+  return Boolean(header)
+    && header.fps === settings.fps
+    && header.waveformMs === settings.waveformMs
+    && header.fftSize === settings.fftSize
+    && header.bars === settings.bars
+    && header.logarithmic === settings.logarithmic;
+}
+
+app.get('/api/apple-visual-variant/:variant/*', async (req, res) => {
+  const settings = precomputeCache.parseAppleVariantKey(req.params.variant);
+  if (!settings) {
+    res.status(400).json({ error: 'invalid Apple visual settings' });
+    return;
+  }
+  const variantDirectory = path.join(
+    APPLE_VISUAL_VARIANT_DIR,
+    precomputeCache.appleVariantKey(settings),
+  );
+  const filePath = resolveWithin(variantDirectory, req.params[0] + '.fav');
+  if (!filePath) {
+    res.status(400).json({ error: 'invalid path' });
+    return;
+  }
+  const variantHeader = precomputeCache.readAppleHeader(filePath);
+  if (appleHeaderMatchesSettings(variantHeader, settings)) {
+    res.type('application/octet-stream').sendFile(filePath);
+    return;
+  }
+  // A settings-keyed request may reuse the legacy flat cache if it happens
+  // to already have been written at the exact requested settings.
+  const legacyPath = resolveWithin(APPLE_VISUAL_DIR, req.params[0] + '.fav');
+  const legacyHeader = legacyPath && precomputeCache.readAppleHeader(legacyPath);
+  if (appleHeaderMatchesSettings(legacyHeader, settings)) {
+    res.type('application/octet-stream').sendFile(legacyPath);
+    return;
+  }
+  res.status(404).json({ error: 'not found' });
+});
+
+app.put(
+  '/api/apple-visual-variant/:variant/*',
+  express.raw({ type: '*/*', limit: '20mb' }),
+  async (req, res) => {
+    const settings = precomputeCache.parseAppleVariantKey(req.params.variant);
+    if (!settings) {
+      res.status(400).json({ error: 'invalid Apple visual settings' });
+      return;
+    }
+    const variantDirectory = path.join(
+      APPLE_VISUAL_VARIANT_DIR,
+      precomputeCache.appleVariantKey(settings),
+    );
+    const filePath = resolveWithin(variantDirectory, req.params[0] + '.fav');
+    if (!filePath) {
+      res.status(400).json({ error: 'invalid path' });
+      return;
+    }
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      res.status(400).json({ error: 'expected raw bytes' });
+      return;
+    }
+    const existingHeader = precomputeCache.readAppleHeader(filePath);
+    if (appleHeaderMatchesSettings(existingHeader, settings)) {
+      res.status(204).end();
+      return;
+    }
+    const tempPath = `${filePath}.upload-${crypto.randomBytes(8).toString('hex')}`;
+    try {
+      await fsp.mkdir(path.dirname(filePath), { recursive: true });
+      await fsp.writeFile(tempPath, req.body, { flag: 'wx' });
+      const header = precomputeCache.readAppleHeader(tempPath);
+      if (!appleHeaderMatchesSettings(header, settings)) {
+        await fsp.unlink(tempPath).catch(() => {});
+        res.status(400).json({ error: 'cache header does not match requested settings' });
+        return;
+      }
+      await fsp.rename(tempPath, filePath);
+      res.status(204).end();
+    } catch (err) {
+      await fsp.unlink(tempPath).catch(() => {});
+      res.status(500).json({ error: 'write failed' });
+    }
+  },
+);
 
 app.listen(PORT, '127.0.0.1', () => {
   console.log(`FredPlayer media server listening on 127.0.0.1:${PORT}`);

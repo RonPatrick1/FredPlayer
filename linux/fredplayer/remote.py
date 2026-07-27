@@ -120,21 +120,3 @@ def upload_profile(track_url: str, token: str, rms: float, peak: float) -> None:
         pass  # Best-effort — the next device just recomputes locally instead.
 
 
-def fetch_visual(track_url: str, token: str) -> bytes | None:
-    url = _api_url(track_url, "/api/visual/")
-    if url is None:
-        return None
-    try:
-        return _request(url, token)
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError):
-        return None
-
-
-def upload_visual(track_url: str, token: str, data: bytes) -> None:
-    url = _api_url(track_url, "/api/visual/")
-    if url is None:
-        return
-    try:
-        _request(url, token, method="PUT", data=data, content_type="application/octet-stream")
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError):
-        pass  # Best-effort, same as upload_profile.

@@ -29,8 +29,6 @@ from .visualization import (
     WaveformProfile,
     build_spectrum_profile,
     build_waveform_profile,
-    estimated_spectrum_cache_bytes,
-    estimated_waveform_cache_bytes,
 )
 
 
@@ -531,18 +529,17 @@ class BackgroundPrecomputer:
         with self.cache_lock:
             has_spectrum = self.spectrum_cache.get(path, visualization_settings) is not None
             has_waveform = self.waveform_cache.get(path, visualization_settings) is not None
-
-        if is_remote_track and not has_spectrum:
-            if self._fetch_remote_visual_cache(self.spectrum_cache, path, visualization_settings, ".fsp", ".spectrum", server_token):
-                with self.cache_lock:
-                    has_spectrum = self.spectrum_cache.get(path, visualization_settings) is not None
-        if is_remote_track and not has_waveform:
-            if self._fetch_remote_visual_cache(self.waveform_cache, path, visualization_settings, ".fwp", ".waveform", server_token):
-                with self.cache_lock:
-                    has_waveform = self.waveform_cache.get(path, visualization_settings) is not None
         if has_spectrum and has_waveform:
             return
 
+        # No remote fetch/upload here (unlike the loudness profile above):
+        # the server only ever stores Android's raw FVZ2 bytes at
+        # /api/visual/<path>, not the split spectrum/waveform representation
+        # this class keeps locally (length-prefixed JSON header + zlib
+        # payload) — the two are structurally incompatible, so a fetch could
+        # never produce something this cache could actually parse, and an
+        # upload would write bytes under a real-looking path that no other
+        # client could read either. Always compute locally instead.
         reporter = PercentReporter(
             "Background cache: visual",
             lambda status: self.callbacks.on_status(path, status),
@@ -560,44 +557,10 @@ class BackgroundPrecomputer:
             with self.cache_lock:
                 if self.spectrum_cache.get(path, visualization_settings) is None:
                     self.spectrum_cache.put(path, visualization_settings, spectrum)
-            if is_remote_track:
-                self._upload_remote_visual_cache(self.spectrum_cache, path, visualization_settings, ".fsp", ".spectrum", server_token)
         if waveform is not None and not self.stop_event.is_set():
             with self.cache_lock:
                 if self.waveform_cache.get(path, visualization_settings) is None:
                     self.waveform_cache.put(path, visualization_settings, waveform)
-            if is_remote_track:
-                self._upload_remote_visual_cache(self.waveform_cache, path, visualization_settings, ".fwp", ".waveform", server_token)
-
-    @staticmethod
-    def _fetch_remote_visual_cache(cache, path, settings, file_suffix, remote_key_suffix, token) -> bool:
-        """Fetches a cached spectrum/waveform blob from the server and
-        writes it to the exact local cache-file path so the existing
-        get()'s on-disk parsing/validation (header + zlib payload) can
-        read it back unchanged — same approach as the profile cache, just
-        skipping straight to file bytes instead of a JSON dict."""
-        data = remote.fetch_visual(path + remote_key_suffix, token)
-        if not data:
-            return False
-        key = cache.cache_key(path, settings)
-        if key is None:
-            return False
-        try:
-            (cache.directory / f"{key}{file_suffix}").write_bytes(data)
-        except OSError:
-            return False
-        return True
-
-    @staticmethod
-    def _upload_remote_visual_cache(cache, path, settings, file_suffix, remote_key_suffix, token) -> None:
-        key = cache.cache_key(path, settings)
-        if key is None:
-            return
-        try:
-            data = (cache.directory / f"{key}{file_suffix}").read_bytes()
-        except OSError:
-            return
-        remote.upload_visual(path + remote_key_suffix, token, data)
 
 
 class NormalizingAudioPlayer:
@@ -890,7 +853,17 @@ class NormalizingAudioPlayer:
         output_bus = output_pipeline.get_bus()
         normalizer = VolumeNormalizer(SAMPLE_RATE, profile, self.settings_snapshot()[2])
         _, _, _, visualization_settings = self.settings_snapshot()
-        spectrum_profile, waveform_profile = self._visual_profiles_for_track(path, visualization_settings, run)
+        # Non-blocking: use a precomputed spectrum/waveform only if the
+        # BackgroundPrecomputer has already produced one for this exact
+        # track+settings. Do NOT compute it here — that used to run a full
+        # decode-and-analyze pass (potentially very slow at large FFT/bar
+        # settings) synchronously before playback could start at all, which
+        # is what made tracks "just sit there" instead of playing. When
+        # nothing is cached yet, spectrum_profile/waveform_profile stay None
+        # and _process_audio's live-compute fallback (self.visualizer.accept)
+        # kicks in instead, visualizing in real time as it plays.
+        spectrum_profile = self.spectrum_cache.get(path, visualization_settings)
+        waveform_profile = self.waveform_cache.get(path, visualization_settings)
         if run.stop_event.is_set():
             decode_pipeline.set_state(Gst.State.NULL)
             output_pipeline.set_state(Gst.State.NULL)
@@ -1039,47 +1012,6 @@ class NormalizingAudioPlayer:
             offset += FRAME_BYTES
             frame_index += 1
         return bytes(out)
-
-    def _visual_profiles_for_track(
-        self,
-        path: str,
-        settings: VisualizationSettings,
-        run: PlaybackRun,
-    ) -> tuple[Optional[SpectrumProfile], Optional[WaveformProfile]]:
-        if np is None:
-            return None, None
-        cached_spectrum = self.spectrum_cache.get(path, settings)
-        cached_waveform = self.waveform_cache.get(path, settings)
-        if cached_spectrum is not None and cached_waveform is not None:
-            return cached_spectrum, cached_waveform
-
-        need_spectrum = cached_spectrum is None
-        need_waveform = cached_waveform is None
-        estimated_bytes = 0
-        if need_spectrum:
-            estimated_bytes += estimated_spectrum_cache_bytes(240.0, settings)
-        if need_waveform:
-            estimated_bytes += estimated_waveform_cache_bytes(240.0, settings)
-        estimated_mb = estimated_bytes / (1024 * 1024)
-        reporter = PercentReporter(
-            f"Preparing visual cache ({settings.update_fps:.0f} FPS, ~{estimated_mb:.1f} MB/4 min)",
-            lambda status: self.callbacks.on_status(path, status),
-        )
-        spectrum, waveform = analyze_visual_profiles(
-            path,
-            settings,
-            run.stop_event,
-            need_spectrum=need_spectrum,
-            need_waveform=need_waveform,
-            progress=reporter,
-        )
-        if spectrum is not None and not run.stop_event.is_set():
-            self.spectrum_cache.put(path, settings, spectrum)
-            cached_spectrum = spectrum
-        if waveform is not None and not run.stop_event.is_set():
-            self.waveform_cache.put(path, settings, waveform)
-            cached_waveform = waveform
-        return cached_spectrum, cached_waveform
 
     def _emit_visualization(self, frame: VisualizationFrame) -> None:
         try:

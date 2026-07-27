@@ -7,7 +7,7 @@ import gi
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
-from . import APP_NAME
+from . import APP_NAME, remote
 from .store import track_info
 
 
@@ -361,10 +361,16 @@ class MprisServer:
                 "xesam:title": GLib.Variant("s", APP_NAME),
             }
         info = track_info(path)
+        # GLib.filename_to_uri() only accepts absolute local filesystem
+        # paths — it raises GError for a remote http(s) track URL, which
+        # (uncaught) previously aborted whichever caller triggered this
+        # metadata refresh partway through. A remote path is already a
+        # valid URI, so it needs no conversion at all.
+        track_url = path if remote.is_remote(path) else GLib.filename_to_uri(path, None)
         metadata = {
             "mpris:trackid": GLib.Variant("o", self._track_id(path)),
             "xesam:title": GLib.Variant("s", info.display_title),
-            "xesam:url": GLib.Variant("s", GLib.filename_to_uri(path, None)),
+            "xesam:url": GLib.Variant("s", track_url),
         }
         artist = info.display_artist
         if artist:

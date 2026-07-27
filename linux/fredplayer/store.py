@@ -8,6 +8,7 @@ from pathlib import Path
 import struct
 import tempfile
 from typing import Iterable, Optional
+from urllib.parse import unquote
 import uuid
 import zlib
 
@@ -188,7 +189,7 @@ def track_info_for_entry(entry: "PlaylistEntry") -> TrackInfo:
         return track_info(entry.path)
     title = entry.title
     if not title:
-        tail = entry.path.rsplit("/", 1)[-1]
+        tail = unquote(entry.path.rsplit("/", 1)[-1])
         title = tail.rsplit(".", 1)[0] if "." in tail else tail
     return TrackInfo(
         path=entry.path,

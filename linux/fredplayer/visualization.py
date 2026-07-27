@@ -529,16 +529,6 @@ def _downsample_waveform_window(
     return result
 
 
-def estimated_spectrum_cache_bytes(duration_seconds: float, settings: VisualizationSettings) -> int:
-    frames = max(1, int(math.ceil(max(0.0, duration_seconds) * settings.update_fps)) + 1)
-    return frames * settings.fft_columns
-
-
-def estimated_waveform_cache_bytes(duration_seconds: float, settings: VisualizationSettings) -> int:
-    frames = max(1, int(math.ceil(max(0.0, duration_seconds) * settings.update_fps)) + 1)
-    return frames * DEFAULT_WAVEFORM_POINTS
-
-
 def _spectrum_band_ranges(
     sample_rate: int,
     fft_size: int,

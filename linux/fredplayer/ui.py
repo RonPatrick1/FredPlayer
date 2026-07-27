@@ -716,6 +716,9 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         self._seek_dragging = False
         self._playlist_selector_updating = False
         self._destroyed = False
+        self._track_list_generation = 0
+        self._liam_wait_dialog: Gtk.Dialog | None = None
+        self._save_state_debounce_id: int | None = None
 
         self.player = NormalizingAudioPlayer(
             PlayerCallbacks(
@@ -1792,6 +1795,7 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         GLib.idle_add(self._on_server_library_fetched, url, token, tracks)
 
     def _on_remote_error(self, message: str) -> bool:
+        self._dismiss_liam_wait_dialog()
         self._set_state(f"Could not reach server: {message}")
         return False
 
@@ -1882,6 +1886,16 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
 
         text_view = Gtk.TextView()
         text_view.set_wrap_mode(Gtk.WrapMode.WORD)
+
+        def _on_message_key_press(_widget: Gtk.TextView, event: Gdk.EventKey) -> bool:
+            is_enter = event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter)
+            if is_enter and not (event.state & Gdk.ModifierType.SHIFT_MASK):
+                dialog.response(Gtk.ResponseType.OK)
+                return True  # Swallow the keypress so it doesn't also insert a newline.
+            return False
+
+        text_view.connect("key-press-event", _on_message_key_press)
+
         scroller = Gtk.ScrolledWindow()
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroller.set_size_request(-1, 90)
@@ -1903,6 +1917,7 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
             return
 
         self._set_state("Asking Liam…")
+        self._show_liam_wait_dialog()
         threading.Thread(
             target=self._ask_liam_worker,
             args=(message,),
@@ -1910,15 +1925,53 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
             daemon=True,
         ).start()
 
+    def _show_liam_wait_dialog(self) -> None:
+        self._dismiss_liam_wait_dialog()
+        dialog = Gtk.Dialog(title="Ask Liam", transient_for=self, flags=Gtk.DialogFlags.MODAL)
+        dialog.add_buttons("Hide", Gtk.ResponseType.CLOSE)
+        content = dialog.get_content_area()
+        content.set_margin_top(16)
+        content.set_margin_bottom(16)
+        content.set_margin_start(16)
+        content.set_margin_end(16)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        spinner = Gtk.Spinner()
+        spinner.start()
+        row.pack_start(spinner, False, False, 0)
+        row.pack_start(Gtk.Label(label="Asking Liam… this can take a while."), False, False, 0)
+        content.add(row)
+        # Not run() — that would block this thread's main loop, and nothing
+        # would ever dismiss it once the response arrives. "Hide" only closes
+        # this indicator; it does not cancel the in-flight request.
+        dialog.connect("response", lambda d, _response: d.destroy())
+        dialog.show_all()
+        self._liam_wait_dialog = dialog
+
+    def _dismiss_liam_wait_dialog(self) -> None:
+        dialog = getattr(self, "_liam_wait_dialog", None)
+        if dialog is not None:
+            dialog.destroy()
+        self._liam_wait_dialog = None
+
     def _ask_liam_worker(self, message: str) -> None:
         try:
             response = remote.ask_liam(self.server_base_url, self.server_token, device_id(), message)
         except Exception as error:
             GLib.idle_add(self._on_remote_error, str(error))
             return
-        GLib.idle_add(self._on_liam_response, response)
+        library_by_path: dict = {}
+        if response.get("playlist"):
+            try:
+                tracks = remote.fetch_library(self.server_base_url, self.server_token)
+                library_by_path = {
+                    track.get("path"): track for track in tracks if isinstance(track, dict)
+                }
+            except Exception:
+                pass  # Best-effort — entries just fall back to filename-derived titles.
+        GLib.idle_add(self._on_liam_response, response, library_by_path)
 
-    def _on_liam_response(self, response: dict) -> bool:
+    def _on_liam_response(self, response: dict, library_by_path: dict) -> bool:
+        self._dismiss_liam_wait_dialog()
         reply = str(response.get("reply", "") or "")
         playlist = response.get("playlist")
         if not playlist:
@@ -1939,7 +1992,9 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         name = str(playlist.get("name") or "New Playlist").strip() or "New Playlist"
         track_paths = playlist.get("tracks") or []
         entries = [
-            self._playlist_entry_from_track({"path": path}, self.server_base_url)
+            self._playlist_entry_from_track(
+                library_by_path.get(path, {"path": path}), self.server_base_url
+            )
             for path in track_paths
             if isinstance(path, str) and path
         ]
@@ -2028,6 +2083,7 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         self._update_now_playing()
         self._set_state("Leveling")
         self._update_transport()
+        self._schedule_background_precompute()
         self.player.play(self.current_path)
         self._notify_media_state()
 
@@ -2076,10 +2132,11 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         return False
 
     def _on_track_error(self, path: str, error: str) -> bool:
-        if path == self.current_path:
-            self.audio_actually_playing = False
-            self._set_state(error)
-            self._update_transport()
+        if path != self.current_path:
+            return False  # Stale callback for a track we've already moved on from.
+        self.audio_actually_playing = False
+        self._set_state(error)
+        self._update_transport()
         if self.playback_requested and len(self.playlist) > 1:
             self._play_random_track()
         else:
@@ -2159,13 +2216,13 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
     def _on_output_level_changed(self, value: float) -> None:
         self.output_level = value / 100
         self.player.set_output_level(self.output_level)
-        self._save_state()
+        self._save_state_debounced()
         self._notify_media_state()
 
     def _on_leveling_strength_changed(self, value: float) -> None:
         self.leveling_strength = value / 100
         self.player.set_leveling_strength(self.leveling_strength)
-        self._save_state()
+        self._save_state_debounced()
 
     def _on_shuffle_toggled(self, button: Gtk.CheckButton) -> None:
         self.shuffle_enabled = button.get_active()
@@ -2182,8 +2239,7 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         data.update(updates)
         self.leveling_settings = LevelingSettings.from_dict(data)
         self.player.set_leveling_settings(self.leveling_settings)
-        self._save_state()
-        self._schedule_background_precompute()
+        self._save_state_debounced(also_precompute=True)
 
     def _on_visual_update_rate_changed(self, value: float) -> None:
         self._update_visualization_settings(update_fps=value)
@@ -2218,8 +2274,27 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         ).silence()
         self._last_visual_clock_render_at = 0.0
         self.visualizer_status_label.set_text(self._visualizer_default_text())
-        self._save_state()
-        self._schedule_background_precompute()
+        self._save_state_debounced(also_precompute=True)
+
+    def _save_state_debounced(self, also_precompute: bool = False) -> None:
+        # Several sliders (output level, leveling strength, leveling/visualization
+        # advanced settings) fire this on every intermediate "value-changed" tick
+        # while being dragged, not just on release. Saving state is a full
+        # synchronous JSON write of every playlist (thousands of tracks for a
+        # big one) — doing that dozens of times per second during a drag is
+        # what was actually causing "FredPlayer is not responding": debounce it
+        # so only the settled value after dragging stops gets persisted.
+        if self._save_state_debounce_id is not None:
+            GLib.source_remove(self._save_state_debounce_id)
+
+        def flush() -> bool:
+            self._save_state_debounce_id = None
+            self._save_state()
+            if also_precompute:
+                self._schedule_background_precompute()
+            return False
+
+        self._save_state_debounce_id = GLib.timeout_add(300, flush)
 
     def _save_state(self) -> None:
         self._remember_window_state(write=False)
@@ -2245,9 +2320,44 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         self._update_now_playing()
         self._update_playlist_lists()
 
+    # Tracks beyond the current one to keep precomputed ahead of playback.
+    PRECOMPUTE_LOOKAHEAD = 2
+
+    def _lookahead_paths(self, count: int) -> list[str]:
+        """Paths for the current track plus up to `count` upcoming ones —
+        not the whole playlist. Precomputing an entire multi-thousand-track
+        playlist the moment it's loaded is what caused real hangs (heavy
+        background decode/analysis for tracks that may never even get
+        played this session); only what's actually about to play benefits
+        from being ready ahead of time — a known loudness profile avoids an
+        audible ramp-up glitch at track start, and a precomputed waveform
+        allows instant seek. Peeks at shuffle_bag without consuming it —
+        actual advancement still happens through _choose_next_index()."""
+        if not self.playlist:
+            return []
+        paths = []
+        if 0 <= self.current_index < len(self.playlist):
+            paths.append(self.playlist[self.current_index].path)
+        if not self.shuffle_enabled:
+            start = self.current_index + 1 if self.current_index >= 0 else 0
+            for step in range(count):
+                index = (start + step) % len(self.playlist)
+                paths.append(self.playlist[index].path)
+        else:
+            for index in self.shuffle_bag[:count]:
+                if 0 <= index < len(self.playlist):
+                    paths.append(self.playlist[index].path)
+        seen = set()
+        unique_paths = []
+        for path in paths:
+            if path not in seen:
+                seen.add(path)
+                unique_paths.append(path)
+        return unique_paths
+
     def _schedule_background_precompute(self) -> None:
         self.precomputer.update_playlist(
-            [entry.path for entry in self.playlist],
+            self._lookahead_paths(self.PRECOMPUTE_LOOKAHEAD),
             self.leveling_settings,
             self.visualization_settings,
             self.server_base_url,
@@ -2280,6 +2390,7 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
     def _update_playlist_lists(self) -> None:
         self._clear_list_box(self.folder_list)
         self._clear_list_box(self.file_list)
+        self._track_list_generation += 1
 
         if not self.playlist:
             self._add_empty_row(self.folder_list, "No folders in playlist")
@@ -2298,12 +2409,29 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
                 "Remove",
                 lambda _button, folder=folder: self._remove_folder(folder),
             )
-
-        for entry in self.playlist:
-            self._add_track_row(entry)
-
         self.folder_list.show_all()
-        self.file_list.show_all()
+
+        # Building one real GTK widget subtree per track is expensive for
+        # playlists in the thousands (a plain Gtk.ListBox realizes every row
+        # up front, it doesn't recycle/virtualize like a TreeView). Adding
+        # rows in small batches via GLib.idle_add keeps the main loop free
+        # to paint/respond between batches instead of freezing the whole
+        # window for one big synchronous rebuild. The generation check lets
+        # a newer playlist switch cancel an in-flight batch cleanly.
+        self._populate_track_rows_incrementally(list(self.playlist), self._track_list_generation)
+
+    def _populate_track_rows_incrementally(self, remaining: list[PlaylistEntry], generation: int) -> None:
+        chunk_size = 150
+
+        def add_next_chunk() -> bool:
+            if generation != self._track_list_generation:
+                return False
+            for entry in remaining[:chunk_size]:
+                self._add_track_row(entry)
+            del remaining[:chunk_size]
+            return bool(remaining)
+
+        GLib.idle_add(add_next_chunk)
 
     def _add_track_row(self, entry: PlaylistEntry) -> None:
         info = track_info_for_entry(entry)
@@ -2340,6 +2468,7 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         button.connect("clicked", lambda _button, path=entry.path: self._remove_file(path))
         box.pack_start(button, False, False, 0)
         self.file_list.add(row)
+        row.show_all()
 
     def _add_action_row(
         self,
@@ -2388,6 +2517,9 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
 
     def _on_destroy(self, _widget: Gtk.Widget) -> None:
         self._destroyed = True
+        if self._save_state_debounce_id is not None:
+            GLib.source_remove(self._save_state_debounce_id)
+            self._save_state_debounce_id = None
         self._save_state()
         self.mpris.close()
         self.precomputer.close()

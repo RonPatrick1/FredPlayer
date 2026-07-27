@@ -7,6 +7,7 @@ const http = require('http');
 const path = require('path');
 const express = require('express');
 const mm = require('music-metadata');
+const precomputeCache = require('./precompute-cache.js');
 
 const MUSIC_DIR = path.resolve(process.env.MUSIC_DIR || '');
 const PORT = parseInt(process.env.PORT || '8790', 10);
@@ -14,6 +15,7 @@ const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 const DATA_DIR = path.join(__dirname, 'data');
 const PROFILES_DIR = path.join(DATA_DIR, 'profiles');
 const VISUAL_DIR = path.join(DATA_DIR, 'visual');
+const APPLE_VISUAL_DIR = path.join(DATA_DIR, 'apple-visual');
 const PLAYLISTS_DIR = path.join(DATA_DIR, 'playlists');
 const PLAYLIST_NAME_RE = /^[^/\\]{1,100}$/;
 const LIAM_ASK_URL = process.env.LIAM_ASK_URL || 'http://127.0.0.1:8787/fredplayer-ask';
@@ -130,9 +132,75 @@ app.get('/api/library', async (req, res) => {
 app.post('/api/rescan', (req, res) => {
   libraryPromise = buildLibraryIndex();
   libraryPromise
-    .then((tracks) => res.json({ count: tracks.length }))
+    .then((tracks) => {
+      res.json({ count: tracks.length });
+      triggerAutoPrecompute();
+    })
     .catch(() => res.status(500).json({ error: 'rescan failed' }));
 });
+
+// Fills in any missing visualization/leveling cache data for the library
+// on its own — no manual `node precompute-cache.js` run required. Triggered
+// once at startup (catches anything added while the process was down) and
+// after every /api/rescan (the library-changed signal). jobForTrack() only
+// ever selects tracks that are actually missing valid cache data, so calling
+// this liberally costs nothing for the overwhelming majority of tracks that
+// are already cached — it just confirms "nothing to do" quickly.
+let autoPrecomputeRunning = false;
+let autoPrecomputeQueued = false;
+
+async function triggerAutoPrecompute() {
+  if (autoPrecomputeRunning) {
+    autoPrecomputeQueued = true;
+    return;
+  }
+  autoPrecomputeRunning = true;
+  try {
+    do {
+      autoPrecomputeQueued = false;
+      await runAutoPrecomputePass();
+    } while (autoPrecomputeQueued);
+  } catch (err) {
+    console.error(`Auto-precompute failed: ${err.message}`);
+  } finally {
+    autoPrecomputeRunning = false;
+  }
+}
+
+async function runAutoPrecomputePass() {
+  const inferred = await precomputeCache.inferAndroidSettings(VISUAL_DIR);
+  const options = {
+    musicDir: MUSIC_DIR,
+    dataDir: DATA_DIR,
+    platform: 'both',
+    analysisSeconds: 10,
+    visualOnly: false,
+    profilesOnly: false,
+    limit: Infinity,
+    // Lower than the manual CLI's default (8) — this runs inside the live
+    // streaming process alongside real traffic, not as a supervised
+    // maintenance job, so it should stay a background citizen.
+    concurrency: 3,
+    dryRun: false,
+    force: false,
+    nice: true,
+    android: {
+      ...precomputeCache.DEFAULT_ANDROID,
+      ...(inferred ? { fps: inferred.fps, bars: inferred.bars } : {}),
+    },
+    apple: { ...precomputeCache.DEFAULT_APPLE },
+  };
+  const tracks = await precomputeCache.walkAudioFiles(MUSIC_DIR, MUSIC_DIR);
+  const jobs = tracks.map((track) => precomputeCache.jobForTrack(track, options)).filter(Boolean);
+  if (jobs.length === 0) {
+    console.log('Auto-precompute: library cache is already up to date');
+    return;
+  }
+  console.log(`Auto-precompute: ${jobs.length} track(s) need cache data, starting background pass`);
+  await precomputeCache.runJobs(jobs, options);
+}
+
+libraryPromise.then(() => triggerAutoPrecompute());
 
 app.get('/api/playlists', async (req, res) => {
   try {
@@ -318,6 +386,42 @@ app.get('/api/visual/*', async (req, res) => {
 
 app.put('/api/visual/*', express.raw({ type: '*/*', limit: '20mb' }), async (req, res) => {
   const filePath = resolveWithin(VISUAL_DIR, req.params[0] + '.fvz');
+  if (!filePath) {
+    res.status(400).json({ error: 'invalid path' });
+    return;
+  }
+  if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+    res.status(400).json({ error: 'expected raw bytes' });
+    return;
+  }
+  try {
+    await fsp.mkdir(path.dirname(filePath), { recursive: true });
+    await fsp.writeFile(filePath, req.body);
+    res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: 'write failed' });
+  }
+});
+
+// Apple uses a settings-aware compact format that is intentionally kept out
+// of the Android/Linux .fvz namespace. This prevents either client family
+// from treating another platform's bytes as a corrupt cache entry.
+app.get('/api/apple-visual/*', async (req, res) => {
+  const filePath = resolveWithin(APPLE_VISUAL_DIR, req.params[0] + '.fav');
+  if (!filePath) {
+    res.status(400).json({ error: 'invalid path' });
+    return;
+  }
+  try {
+    const contents = await fsp.readFile(filePath);
+    res.type('application/octet-stream').send(contents);
+  } catch (err) {
+    res.status(404).json({ error: 'not found' });
+  }
+});
+
+app.put('/api/apple-visual/*', express.raw({ type: '*/*', limit: '20mb' }), async (req, res) => {
+  const filePath = resolveWithin(APPLE_VISUAL_DIR, req.params[0] + '.fav');
   if (!filePath) {
     res.status(400).json({ error: 'invalid path' });
     return;

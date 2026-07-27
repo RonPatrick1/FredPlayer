@@ -5,7 +5,9 @@
   "description": "Streams FredPlayer's library and stores shared leveling/visualization cache data.",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "precompute-cache": "node precompute-cache.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

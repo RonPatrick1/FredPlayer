@@ -34,6 +34,9 @@ struct VisualCacheSettings {
 
 enum MediaCache {
     private static let manager = FileManager.default
+    private static let serverVisualMagic: UInt32 = 0x46415631 // FAV1
+    private static let serverVisualVersion: UInt32 = 1
+    private static let serverVisualWaveformPoints = 128
 
     static func fileIdentity(for url: URL) -> String {
         let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
@@ -51,8 +54,107 @@ enum MediaCache {
         read(LoudnessCacheEntry.self, from: loudnessURL(for: url))
     }
 
+    /// Converts the shared `{rms, peak}` response from `/api/profile/*` into
+    /// Apple's existing loudness model.
+    static func serverLoudness(
+        from data: Data,
+        analyzedSeconds: Double = 10
+    ) -> LoudnessCacheEntry? {
+        guard
+            let profile = try? JSONDecoder().decode(ServerLoudnessProfile.self, from: data),
+            profile.rms.isFinite,
+            profile.peak.isFinite,
+            profile.rms >= 0,
+            profile.peak >= 0
+        else { return nil }
+        return LoudnessCacheEntry(
+            meanDB: Float(20 * log10(max(profile.rms, 0.000_001))),
+            peak: Float(profile.peak),
+            analyzedSeconds: max(0, analyzedSeconds),
+            created: Date()
+        )
+    }
+
+    static func storeServerLoudness(
+        _ data: Data,
+        for url: URL,
+        analyzedSeconds: Double = 10
+    ) throws -> Bool {
+        guard let entry = serverLoudness(from: data, analyzedSeconds: analyzedSeconds) else {
+            return false
+        }
+        try store(entry, for: url)
+        return true
+    }
+
     static func visual(for url: URL, settings: VisualCacheSettings) -> VisualCacheEntry? {
         read(VisualCacheEntry.self, from: visualURL(for: url, settings: settings))
+    }
+
+    /// Decodes the compact format returned by `/api/apple-visual/*`.
+    /// Server frames are quantized on disk and expanded to the existing
+    /// in-memory cache model here, keeping playback code format-agnostic.
+    static func serverVisual(
+        from data: Data,
+        settings: VisualCacheSettings
+    ) -> VisualCacheEntry? {
+        var reader = ServerVisualReader(data: data)
+        guard
+            reader.readUInt32() == serverVisualMagic,
+            reader.readUInt32() == serverVisualVersion,
+            let fps = reader.readDouble(),
+            let waveformMilliseconds = reader.readDouble(),
+            let fftSize = reader.readUInt32(),
+            let waveformPoints = reader.readUInt32(),
+            let bars = reader.readUInt32(),
+            let flags = reader.readUInt32(),
+            let frameCount = reader.readUInt32(),
+            let frameInterval = reader.readDouble(),
+            let createdSeconds = reader.readDouble(),
+            abs(fps - settings.fps) < 0.001,
+            abs(waveformMilliseconds / 1_000 - settings.waveformWindow) < 0.000_001,
+            fftSize == UInt32(settings.fftSize),
+            waveformPoints == UInt32(serverVisualWaveformPoints),
+            bars == UInt32(settings.bars),
+            (flags & 1 != 0) == settings.logarithmic,
+            frameCount > 0,
+            frameInterval > 0,
+            Int(frameCount) <= Int.max / max(1, serverVisualWaveformPoints + settings.bars),
+            reader.remaining == Int(frameCount) * (serverVisualWaveformPoints + settings.bars)
+        else { return nil }
+
+        var frames: [VisualCacheFrame] = []
+        frames.reserveCapacity(Int(frameCount))
+        for _ in 0..<Int(frameCount) {
+            var waveform: [Float] = []
+            waveform.reserveCapacity(serverVisualWaveformPoints)
+            for _ in 0..<serverVisualWaveformPoints {
+                guard let byte = reader.readByte() else { return nil }
+                waveform.append(Float(Int8(bitPattern: byte)) / 127)
+            }
+            var spectrum: [Float] = []
+            spectrum.reserveCapacity(settings.bars)
+            for _ in 0..<settings.bars {
+                guard let byte = reader.readByte() else { return nil }
+                spectrum.append(Float(byte) / 255)
+            }
+            frames.append(VisualCacheFrame(waveform: waveform, spectrum: spectrum))
+        }
+        return VisualCacheEntry(
+            frameInterval: frameInterval,
+            frames: frames,
+            created: Date(timeIntervalSince1970: createdSeconds)
+        )
+    }
+
+    static func storeServerVisual(
+        _ data: Data,
+        for url: URL,
+        settings: VisualCacheSettings
+    ) throws -> Bool {
+        guard let entry = serverVisual(from: data, settings: settings) else { return false }
+        try store(entry, for: url, settings: settings)
+        return true
     }
 
     static func analyzeLoudness(url: URL, seconds: Double?) throws -> LoudnessCacheEntry {
@@ -226,4 +328,40 @@ enum MediaCache {
             try? manager.removeItem(at: url)
         }
     }
+}
+
+private struct ServerVisualReader {
+    let data: Data
+    private(set) var offset = 0
+
+    var remaining: Int { data.count - offset }
+
+    mutating func readByte() -> UInt8? {
+        guard offset < data.count else { return nil }
+        defer { offset += 1 }
+        return data[data.startIndex + offset]
+    }
+
+    mutating func readUInt32() -> UInt32? {
+        guard
+            let byte0 = readByte(),
+            let byte1 = readByte(),
+            let byte2 = readByte(),
+            let byte3 = readByte()
+        else { return nil }
+        return UInt32(byte0) << 24
+            | UInt32(byte1) << 16
+            | UInt32(byte2) << 8
+            | UInt32(byte3)
+    }
+
+    mutating func readDouble() -> Double? {
+        guard let high = readUInt32(), let low = readUInt32() else { return nil }
+        return Double(bitPattern: UInt64(high) << 32 | UInt64(low))
+    }
+}
+
+private struct ServerLoudnessProfile: Decodable {
+    let rms: Double
+    let peak: Double
 }

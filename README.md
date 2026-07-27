@@ -4,7 +4,8 @@ Shuffled sleep-music player with real-time loudness leveling and visualization,
 across three clients sharing one media server.
 
 - `server/` — shared Node.js media server (library browsing, streaming, profile
-  and visualization sync, Ask Liam AI chat).
+  and platform-specific visualization sync, offline cache precompute, Ask Liam
+  AI chat).
 - `android/` — Android client (Java), including Android Auto support.
 - `linux/` — Ubuntu/GTK desktop client (Python), including MPRIS integration.
 - `apple/` — iOS/macOS client (Swift), including CarPlay support.
@@ -26,6 +27,10 @@ shared server.
   Bringing Apple to parity means adding a Swift equivalent of
   `RemoteLibraryClient`/`remote.py` (`/api/library`, `/stream/*`,
   `/api/profile/*`, `/api/visual/*`).
+  The server now has a separate `/api/apple-visual/*`/`data/apple-visual/`
+  namespace, an offline generator, and a matching Swift format decoder ready
+  for that client integration; it does not make Apple's local-only audio engine
+  stream remote tracks by itself.
 - **`apple/` was imported byte-for-byte, unmodified**, from the Mac Mini's
   working copy — intentional, so the Apple-side development thread starts
   from exactly what was already there.

@@ -17,9 +17,11 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.DocumentsContract;
+import android.view.DisplayCutout;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageButton;
@@ -45,6 +47,7 @@ public class MainActivity extends Activity {
     private static final int REQUEST_PICK_AUDIO = 1001;
     private static final int REQUEST_NOTIFICATIONS = 1002;
     private static final int REQUEST_PICK_FOLDER = 1003;
+    private static final int REQUEST_AUDIO_CALIBRATION = 1004;
     private static final int MAX_FOLDER_DEPTH = 12;
 
     private final ArrayList<String> playlist = new ArrayList<>();
@@ -54,6 +57,7 @@ public class MainActivity extends Activity {
     private boolean playing;
     private boolean showingSettings;
     private boolean userSeeking;
+    private boolean metadataRefreshStarted;
 
     private TextView nowPlayingText;
     private TextView playlistText;
@@ -71,8 +75,19 @@ public class MainActivity extends Activity {
     private LinearLayout playlistFoldersContainer;
     private LinearLayout playlistFilesContainer;
     private VisualizerView visualizerView;
+    private TextView bluetoothRouteText;
+    private TextView bluetoothDelayText;
+    private SeekBar bluetoothDelaySlider;
+    private Button bluetoothCalibrateButton;
+    private LinearLayout bluetoothSavedListContainer;
+    private String bluetoothSavedListSignature;
     private LevelingSettings levelingSettings;
     private VisualizationSettings visualizationSettings;
+    private String outputRouteKey = "";
+    private String outputRouteName = "No active output";
+    private boolean outputRouteBluetooth;
+    private boolean outputDelayCalibrating;
+    private int outputVisualDelayMs;
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
         @Override
@@ -106,6 +121,23 @@ public class MainActivity extends Activity {
             int cacheProgressTotal = intent.getIntExtra(SleepMusicService.EXTRA_CACHE_PROGRESS_TOTAL, 0);
             long positionMs = intent.getLongExtra(SleepMusicService.EXTRA_POSITION_MS, 0L);
             long durationMs = intent.getLongExtra(SleepMusicService.EXTRA_DURATION_MS, 0L);
+            outputRouteKey = intent.getStringExtra(SleepMusicService.EXTRA_OUTPUT_ROUTE_KEY);
+            if (outputRouteKey == null) {
+                outputRouteKey = "";
+            }
+            outputRouteName = intent.getStringExtra(SleepMusicService.EXTRA_OUTPUT_ROUTE_NAME);
+            if (outputRouteName == null || outputRouteName.isEmpty()) {
+                outputRouteName = "No active output";
+            }
+            outputRouteBluetooth = intent.getBooleanExtra(
+                    SleepMusicService.EXTRA_OUTPUT_ROUTE_BLUETOOTH,
+                    false);
+            outputVisualDelayMs = intent.getIntExtra(
+                    SleepMusicService.EXTRA_OUTPUT_VISUAL_DELAY_MS,
+                    0);
+            outputDelayCalibrating = intent.getBooleanExtra(
+                    SleepMusicService.EXTRA_OUTPUT_DELAY_CALIBRATING,
+                    false);
 
             updatePlayButtonIcon();
             if (nowPlayingText != null) {
@@ -118,6 +150,7 @@ public class MainActivity extends Activity {
                 playlistText.setText(playlistSummary(count));
             }
             updateTrackProgress(positionMs, durationMs);
+            updateBluetoothDelayControls();
             if (cacheCount >= 0) {
                 updateCacheText(
                         cacheCount,
@@ -176,6 +209,7 @@ public class MainActivity extends Activity {
             sendPlaylistToService(false);
             sendVisualizationSettingsToService();
         }
+        refreshRemoteMetadataIfNeeded();
     }
 
     @Override
@@ -198,6 +232,25 @@ public class MainActivity extends Activity {
             addPickedAudioFiles(data);
         } else if (requestCode == REQUEST_PICK_FOLDER) {
             addPickedFolder(data);
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(
+            int requestCode,
+            String[] permissions,
+            int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQUEST_AUDIO_CALIBRATION) {
+            return;
+        }
+        if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            sendServiceCommand(SleepMusicService.ACTION_CALIBRATE_OUTPUT_DELAY);
+        } else {
+            Toast.makeText(
+                    this,
+                    "Microphone permission is only needed while calibrating",
+                    Toast.LENGTH_LONG).show();
         }
     }
 
@@ -297,9 +350,11 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             try {
                 JSONArray tracks = RemoteLibraryClient.fetchLibrary(url, token);
+                PlaylistStore.saveTrackMetadata(this, serverMetadata(tracks, url));
                 runOnUiThread(() -> {
                     PlaylistStore.saveServerBaseUrl(this, url);
                     PlaylistStore.saveServerToken(this, token);
+                    updatePlaylistEditor();
                     if (tracks.length() == 0) {
                         Toast.makeText(this, "Server library is empty", Toast.LENGTH_SHORT).show();
                         return;
@@ -379,24 +434,77 @@ public class MainActivity extends Activity {
             return false;
         }
         String url = RemoteLibraryClient.buildStreamUrl(baseUrl, path);
-        if (!merged.add(url)) {
-            return false;
-        }
         String title = track.optString("title", "");
         String artist = track.optString("artist", "");
         String album = track.optString("album", "");
         if (!title.isEmpty() || !artist.isEmpty() || !album.isEmpty()) {
             metadataOut.put(url, new String[]{title, artist, album});
         }
-        return true;
+        return merged.add(url);
     }
 
     private void reportServerAdd(LinkedHashSet<String> merged, int added) {
         if (added == 0) {
-            Toast.makeText(this, "No songs selected", Toast.LENGTH_SHORT).show();
+            updatePlaylistEditor();
+            Toast.makeText(this, "No new songs were added", Toast.LENGTH_SHORT).show();
             return;
         }
         saveMergedPlaylist(merged, "Added " + added + " songs from server");
+    }
+
+    private Map<String, String[]> serverMetadata(JSONArray tracks, String baseUrl) {
+        Map<String, String[]> metadata = new HashMap<>();
+        for (int i = 0; i < tracks.length(); i++) {
+            JSONObject track = tracks.optJSONObject(i);
+            String path = track == null ? "" : track.optString("path", "");
+            if (path.isEmpty()) {
+                continue;
+            }
+            String title = track.optString("title", "");
+            String artist = track.optString("artist", "");
+            String album = track.optString("album", "");
+            if (!title.isEmpty() || !artist.isEmpty() || !album.isEmpty()) {
+                metadata.put(
+                        RemoteLibraryClient.buildStreamUrl(baseUrl, path),
+                        new String[]{title, artist, album});
+            }
+        }
+        return metadata;
+    }
+
+    private void refreshRemoteMetadataIfNeeded() {
+        if (metadataRefreshStarted) {
+            return;
+        }
+        Map<String, String[]> cached = PlaylistStore.loadAllTrackMetadata(this);
+        boolean missing = false;
+        for (ArrayList<String> tracks : playlists.values()) {
+            for (String item : tracks) {
+                if (RemoteLibraryClient.isRemote(item) && !cached.containsKey(item)) {
+                    missing = true;
+                    break;
+                }
+            }
+            if (missing) {
+                break;
+            }
+        }
+        String baseUrl = PlaylistStore.loadServerBaseUrl(this);
+        if (!missing || baseUrl.isEmpty()) {
+            return;
+        }
+
+        metadataRefreshStarted = true;
+        String token = PlaylistStore.loadServerToken(this);
+        new Thread(() -> {
+            try {
+                JSONArray tracks = RemoteLibraryClient.fetchLibrary(baseUrl, token);
+                PlaylistStore.saveTrackMetadata(this, serverMetadata(tracks, baseUrl));
+                runOnUiThread(this::updatePlaylistEditor);
+            } catch (Exception ignored) {
+                // Playback metadata still falls back to the filename when the server is unavailable.
+            }
+        }, "FredPlayerMetadataRefresh").start();
     }
 
     private void openAskLiamDialog() {
@@ -512,6 +620,7 @@ public class MainActivity extends Activity {
         playlists.put(localName, urls);
         PlaylistStore.savePlaylists(this, playlists);
         switchPlaylist(localName);
+        refreshRemoteMetadataIfNeeded();
         new AlertDialog.Builder(this)
                 .setTitle("Liam")
                 .setMessage("Created \"" + localName + "\" (" + urls.size() + " songs) — just on this device.")
@@ -541,6 +650,7 @@ public class MainActivity extends Activity {
         ScrollView scrollView = new ScrollView(this);
         scrollView.setFillViewport(true);
         scrollView.setBackgroundColor(Color.rgb(17, 19, 21));
+        applySystemBarInsets(scrollView);
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -625,9 +735,11 @@ public class MainActivity extends Activity {
 
         visualizerView = new VisualizerView(this);
         visualizerView.setSmoothing(visualizationSettings.smoothing);
+        visualizerView.setMinimumHeight(dp(168));
         LinearLayout.LayoutParams visualizerParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(168));
+                0,
+                1f);
         visualizerParams.topMargin = dp(18);
         root.addView(visualizerView, visualizerParams);
 
@@ -657,18 +769,98 @@ public class MainActivity extends Activity {
         skipButton.setOnClickListener(view -> sendServiceCommand(SleepMusicService.ACTION_SKIP));
         mainButtons.addView(skipButton, transportButtonParams(false));
 
-        ImageButton stopButton = transportButton(android.R.drawable.ic_menu_close_clear_cancel, "Stop");
+        ImageButton stopButton = transportButton(R.drawable.ic_stop, "Stop");
         stopButton.setOnClickListener(view -> sendServiceCommand(SleepMusicService.ACTION_STOP));
         mainButtons.addView(stopButton, transportButtonParams(false));
 
+        return scrollView;
+    }
+
+    private void showPlayerScreen() {
+        showingSettings = false;
+        setContentView(buildContentView());
+        updatePlaylistText();
+        sendServiceCommand(SleepMusicService.ACTION_REQUEST_STATE);
+    }
+
+    private void showSettingsScreen() {
+        showingSettings = true;
+        setContentView(buildSettingsView());
+        sendServiceCommand(SleepMusicService.ACTION_REQUEST_STATE);
+    }
+
+    private View buildSettingsView() {
+        ScrollView scrollView = new ScrollView(this);
+        scrollView.setFillViewport(true);
+        scrollView.setBackgroundColor(Color.rgb(17, 19, 21));
+        applySystemBarInsets(scrollView);
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(dp(20), dp(24), dp(20), dp(32));
+        scrollView.addView(root, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        root.addView(header, matchWrap());
+
+        Button backButton = button("Back");
+        backButton.setOnClickListener(view -> showPlayerScreen());
+        header.addView(backButton, new LinearLayout.LayoutParams(
+                dp(92),
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        TextView title = text("Settings", 28, Color.rgb(245, 243, 237));
+        title.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        header.addView(title, new LinearLayout.LayoutParams(
+                0,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                1f));
+
+        TextView playlistTitle = text("Playlist & library", 20, Color.rgb(245, 243, 237));
+        root.addView(playlistTitle, topMargin(30));
+        addPlaylistManagementControls(root);
+
+        TextView playbackTitle = text("Playback", 20, Color.rgb(245, 243, 237));
+        root.addView(playbackTitle, topMargin(30));
+        addPrimarySettingsControls(root);
+        addAdvancedLevelingControls(root);
+        addVisualizationControls(root);
+
+        cacheText = text("", 13, Color.rgb(183, 182, 173));
+        root.addView(cacheText, topMargin(22));
+        NormalizingAudioPlayer.CacheStats stats = NormalizingAudioPlayer.profileCacheStats(this);
+        NormalizingAudioPlayer.CacheStats visualStats = NormalizingAudioPlayer.visualCacheStats(this);
+        updateCacheText(
+                stats.count,
+                stats.pruneAbove,
+                stats.keep,
+                stats.approximateBytes,
+                visualStats.count,
+                visualStats.pruneAbove,
+                visualStats.keep,
+                visualStats.approximateBytes,
+                0,
+                0);
+
+        TextView editorTitle = text("Playlist editor", 20, Color.rgb(245, 243, 237));
+        root.addView(editorTitle, topMargin(30));
+        addPlaylistEditor(root);
+        return scrollView;
+    }
+
+    private void addPlaylistManagementControls(LinearLayout root) {
         Button playlistsButton = button("Choose or manage playlists");
         playlistsButton.setOnClickListener(view -> showPlaylistMenu());
-        root.addView(playlistsButton, topMargin(18));
+        root.addView(playlistsButton, topMargin(12));
 
         LinearLayout addButtons = new LinearLayout(this);
         addButtons.setOrientation(LinearLayout.HORIZONTAL);
         addButtons.setGravity(Gravity.CENTER);
-        root.addView(addButtons, topMargin(18));
+        root.addView(addButtons, topMargin(10));
 
         Button addButton = button("Add files");
         addButton.setOnClickListener(view -> openAudioPicker());
@@ -698,76 +890,6 @@ public class MainActivity extends Activity {
         Button shuffleButton = button("Shuffle list");
         shuffleButton.setOnClickListener(view -> shufflePlaylist());
         root.addView(shuffleButton, topMargin(10));
-
-        addPlaylistEditor(root);
-
-        return scrollView;
-    }
-
-    private void showPlayerScreen() {
-        showingSettings = false;
-        setContentView(buildContentView());
-        updatePlaylistText();
-        sendServiceCommand(SleepMusicService.ACTION_REQUEST_STATE);
-    }
-
-    private void showSettingsScreen() {
-        showingSettings = true;
-        setContentView(buildSettingsView());
-    }
-
-    private View buildSettingsView() {
-        ScrollView scrollView = new ScrollView(this);
-        scrollView.setFillViewport(true);
-        scrollView.setBackgroundColor(Color.rgb(17, 19, 21));
-
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(20), dp(24), dp(20), dp(32));
-        scrollView.addView(root, new ScrollView.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        LinearLayout header = new LinearLayout(this);
-        header.setOrientation(LinearLayout.HORIZONTAL);
-        header.setGravity(Gravity.CENTER_VERTICAL);
-        root.addView(header, matchWrap());
-
-        Button backButton = button("Back");
-        backButton.setOnClickListener(view -> showPlayerScreen());
-        header.addView(backButton, new LinearLayout.LayoutParams(
-                dp(92),
-                ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        TextView title = text("Settings", 28, Color.rgb(245, 243, 237));
-        title.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
-        header.addView(title, new LinearLayout.LayoutParams(
-                0,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                1f));
-
-        TextView playbackTitle = text("Playback", 20, Color.rgb(245, 243, 237));
-        root.addView(playbackTitle, topMargin(30));
-        addPrimarySettingsControls(root);
-        addAdvancedLevelingControls(root);
-        addVisualizationControls(root);
-
-        cacheText = text("", 13, Color.rgb(183, 182, 173));
-        root.addView(cacheText, topMargin(22));
-        NormalizingAudioPlayer.CacheStats stats = NormalizingAudioPlayer.profileCacheStats(this);
-        NormalizingAudioPlayer.CacheStats visualStats = NormalizingAudioPlayer.visualCacheStats(this);
-        updateCacheText(
-                stats.count,
-                stats.pruneAbove,
-                stats.keep,
-                stats.approximateBytes,
-                visualStats.count,
-                visualStats.pruneAbove,
-                visualStats.keep,
-                visualStats.approximateBytes,
-                0,
-                0);
-        return scrollView;
     }
 
     private void addPrimarySettingsControls(LinearLayout root) {
@@ -981,6 +1103,206 @@ public class MainActivity extends Activity {
             scaleButton.setText(scaleButtonText());
         });
         root.addView(scaleButton, topMargin(10));
+
+        addBluetoothDelayControls(root);
+    }
+
+    private void addBluetoothDelayControls(LinearLayout root) {
+        TextView title = text("Bluetooth synchronization", 18, Color.rgb(245, 243, 237));
+        root.addView(title, topMargin(28));
+
+        if (AudioOutputRoute.needsManualCalibration(this)) {
+            bluetoothRouteText = text("", 14, Color.rgb(183, 182, 173));
+            root.addView(bluetoothRouteText, topMargin(10));
+
+            bluetoothDelayText = text("", 14, Color.rgb(245, 243, 237));
+            root.addView(bluetoothDelayText, topMargin(12));
+            bluetoothDelaySlider = new SeekBar(this);
+            bluetoothDelaySlider.setMin(0);
+            bluetoothDelaySlider.setMax(1500);
+            bluetoothDelaySlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                @Override
+                public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                    bluetoothDelayText.setText("Visualization delay: " + progress + " ms");
+                    if (fromUser) {
+                        outputVisualDelayMs = progress;
+                        sendOutputVisualDelay(progress);
+                    }
+                }
+
+                @Override
+                public void onStartTrackingTouch(SeekBar seekBar) {
+                }
+
+                @Override
+                public void onStopTrackingTouch(SeekBar seekBar) {
+                }
+            });
+            root.addView(bluetoothDelaySlider, matchWrap());
+
+            bluetoothCalibrateButton = button("Calibrate with microphone");
+            bluetoothCalibrateButton.setOnClickListener(view -> confirmBluetoothCalibration());
+            root.addView(bluetoothCalibrateButton, topMargin(10));
+
+            TextView privacy = text(
+                    "Calibration plays a short chirp and measures it locally. No recording or timing data is uploaded.",
+                    13,
+                    Color.rgb(183, 182, 173));
+            root.addView(privacy, topMargin(8));
+        } else {
+            bluetoothRouteText = null;
+            bluetoothDelayText = null;
+            bluetoothDelaySlider = null;
+            bluetoothCalibrateButton = null;
+            TextView automatic = text(
+                    "Android supplies Bluetooth latency on this device, so manual calibration is not needed.",
+                    14,
+                    Color.rgb(183, 182, 173));
+            root.addView(automatic, topMargin(10));
+        }
+
+        TextView savedTitle = text("Saved speaker calibrations", 15, Color.rgb(245, 243, 237));
+        root.addView(savedTitle, topMargin(20));
+        bluetoothSavedListContainer = new LinearLayout(this);
+        bluetoothSavedListContainer.setOrientation(LinearLayout.VERTICAL);
+        root.addView(bluetoothSavedListContainer, matchWrap());
+        bluetoothSavedListSignature = null;
+        updateBluetoothDelayControls();
+    }
+
+    private void updateBluetoothDelayControls() {
+        if (bluetoothRouteText != null) {
+            bluetoothRouteText.setText("Current output: " + outputRouteName);
+        }
+        if (bluetoothDelaySlider != null) {
+            int delay = Math.max(0, Math.min(1500, outputVisualDelayMs));
+            bluetoothDelaySlider.setEnabled(outputRouteBluetooth && !outputDelayCalibrating);
+            if (!bluetoothDelaySlider.isPressed()) {
+                bluetoothDelaySlider.setProgress(delay);
+            }
+        }
+        if (bluetoothDelayText != null) {
+            bluetoothDelayText.setText("Visualization delay: " + outputVisualDelayMs + " ms");
+        }
+        if (bluetoothCalibrateButton != null) {
+            bluetoothCalibrateButton.setEnabled(!outputDelayCalibrating);
+            bluetoothCalibrateButton.setText(
+                    outputDelayCalibrating ? "Calibrating…" : "Calibrate with microphone");
+        }
+        updateSavedBluetoothDelayList();
+    }
+
+    private void updateSavedBluetoothDelayList() {
+        if (bluetoothSavedListContainer == null) {
+            return;
+        }
+        ArrayList<PlaylistStore.BluetoothVisualDelayEntry> entries =
+                PlaylistStore.loadBluetoothVisualDelayEntries(this);
+        StringBuilder signatureBuilder = new StringBuilder();
+        for (PlaylistStore.BluetoothVisualDelayEntry entry : entries) {
+            signatureBuilder.append(entry.key)
+                    .append('\u0000')
+                    .append(entry.label)
+                    .append('\u0000')
+                    .append(entry.delayMs)
+                    .append('\u0001');
+        }
+        String signature = signatureBuilder.toString();
+        if (signature.equals(bluetoothSavedListSignature)) {
+            return;
+        }
+        bluetoothSavedListSignature = signature;
+        bluetoothSavedListContainer.removeAllViews();
+        if (entries.isEmpty()) {
+            bluetoothSavedListContainer.addView(
+                    text("No saved speaker calibrations", 13, Color.rgb(183, 182, 173)),
+                    topMargin(8));
+            return;
+        }
+
+        for (PlaylistStore.BluetoothVisualDelayEntry entry : entries) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            bluetoothSavedListContainer.addView(row, topMargin(8));
+
+            TextView details = text(
+                    entry.label + " · " + entry.delayMs + " ms",
+                    14,
+                    Color.rgb(245, 243, 237));
+            row.addView(details, new LinearLayout.LayoutParams(
+                    0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    1f));
+
+            Button clear = button("Clear");
+            clear.setOnClickListener(view -> confirmClearBluetoothCalibration(entry));
+            row.addView(clear, new LinearLayout.LayoutParams(
+                    dp(92),
+                    ViewGroup.LayoutParams.WRAP_CONTENT));
+        }
+
+        Button clearAll = button("Clear all speaker calibrations");
+        clearAll.setOnClickListener(view -> confirmClearAllBluetoothCalibrations());
+        bluetoothSavedListContainer.addView(clearAll, topMargin(12));
+    }
+
+    private void sendOutputVisualDelay(int delayMs) {
+        Intent intent = new Intent(this, SleepMusicService.class);
+        intent.setAction(SleepMusicService.ACTION_SET_OUTPUT_VISUAL_DELAY);
+        intent.putExtra(SleepMusicService.EXTRA_OUTPUT_ROUTE_KEY, outputRouteKey);
+        intent.putExtra(SleepMusicService.EXTRA_OUTPUT_ROUTE_NAME, outputRouteName);
+        intent.putExtra(SleepMusicService.EXTRA_OUTPUT_VISUAL_DELAY_MS, delayMs);
+        startServiceCompat(intent);
+    }
+
+    private void confirmClearBluetoothCalibration(
+            PlaylistStore.BluetoothVisualDelayEntry entry) {
+        new AlertDialog.Builder(this)
+                .setTitle("Clear " + entry.label + "?")
+                .setMessage("FredPlayer will stop applying its saved " + entry.delayMs
+                        + " ms Bluetooth adjustment for this speaker.")
+                .setPositiveButton("Clear", (dialog, which) ->
+                        clearBluetoothCalibration(entry.key))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void confirmClearAllBluetoothCalibrations() {
+        new AlertDialog.Builder(this)
+                .setTitle("Clear all speaker calibrations?")
+                .setMessage("All locally saved Bluetooth synchronization adjustments will be removed.")
+                .setPositiveButton("Clear all", (dialog, which) ->
+                        clearBluetoothCalibration(""))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void clearBluetoothCalibration(String routeKey) {
+        Intent intent = new Intent(this, SleepMusicService.class);
+        intent.setAction(SleepMusicService.ACTION_CLEAR_OUTPUT_VISUAL_DELAY);
+        intent.putExtra(SleepMusicService.EXTRA_OUTPUT_ROUTE_KEY, routeKey);
+        startServiceCompat(intent);
+    }
+
+    private void confirmBluetoothCalibration() {
+        new AlertDialog.Builder(this)
+                .setTitle("Calibrate Bluetooth delay?")
+                .setMessage("Music will pause while FredPlayer plays a short chirp through the selected Bluetooth speaker and listens for it with this device's microphone.")
+                .setPositiveButton("Calibrate", (dialog, which) -> requestBluetoothCalibration())
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void requestBluetoothCalibration() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED) {
+            sendServiceCommand(SleepMusicService.ACTION_CALIBRATE_OUTPUT_DELAY);
+            return;
+        }
+        requestPermissions(
+                new String[]{Manifest.permission.RECORD_AUDIO},
+                REQUEST_AUDIO_CALIBRATION);
     }
 
     private void addPlaylistEditor(LinearLayout root) {
@@ -1297,9 +1619,28 @@ public class MainActivity extends Activity {
             addActionRow(playlistFoldersContainer, label, "Remove", view -> removePlaylistFolder(folderKey));
         }
 
+        Map<String, String[]> metadata = PlaylistStore.loadAllTrackMetadata(this);
         for (String item : new ArrayList<>(playlist)) {
-            addActionRow(playlistFilesContainer, PlaylistStore.displayName(this, item), "Remove", view -> removePlaylistFile(item));
+            addActionRow(playlistFilesContainer, playlistTrackLabel(item, metadata.get(item)), "Remove",
+                    view -> removePlaylistFile(item));
         }
+    }
+
+    private String playlistTrackLabel(String uriString, String[] metadata) {
+        if (metadata == null) {
+            return PlaylistStore.displayName(this, uriString);
+        }
+        String title = metadata.length > 0 ? metadata[0].trim() : "";
+        String artist = metadata.length > 1 ? metadata[1].trim() : "";
+        String album = metadata.length > 2 ? metadata[2].trim() : "";
+        if (title.isEmpty()) {
+            title = PlaylistStore.displayName(this, uriString);
+        }
+        String detail = artist;
+        if (!album.isEmpty()) {
+            detail = detail.isEmpty() ? album : detail + " — " + album;
+        }
+        return detail.isEmpty() ? title : title + "\n" + detail;
     }
 
     private void addActionRow(LinearLayout parent, String label, String action, View.OnClickListener listener) {
@@ -1465,7 +1806,7 @@ public class MainActivity extends Activity {
             return;
         }
         String progress = progressTotal > 0
-                ? ", preparing " + Math.min(progressDone, progressTotal) + "/" + progressTotal
+                ? ", syncing next " + Math.min(progressDone, progressTotal) + "/" + progressTotal
                 : "";
         cacheText.setText("Loudness cache: " + count
                 + " tracks, prunes above " + pruneAbove
@@ -1635,6 +1976,40 @@ public class MainActivity extends Activity {
         button.setTextSize(16);
         button.setMinHeight(dp(48));
         return button;
+    }
+
+    private void applySystemBarInsets(View view) {
+        view.setOnApplyWindowInsetsListener((target, windowInsets) -> {
+            int left;
+            int top;
+            int right;
+            int bottom;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                android.graphics.Insets safeInsets = windowInsets.getInsets(
+                        WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                left = safeInsets.left;
+                top = safeInsets.top;
+                right = safeInsets.right;
+                bottom = safeInsets.bottom;
+            } else {
+                left = windowInsets.getSystemWindowInsetLeft();
+                top = windowInsets.getSystemWindowInsetTop();
+                right = windowInsets.getSystemWindowInsetRight();
+                bottom = windowInsets.getSystemWindowInsetBottom();
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    DisplayCutout cutout = windowInsets.getDisplayCutout();
+                    if (cutout != null) {
+                        left = Math.max(left, cutout.getSafeInsetLeft());
+                        top = Math.max(top, cutout.getSafeInsetTop());
+                        right = Math.max(right, cutout.getSafeInsetRight());
+                        bottom = Math.max(bottom, cutout.getSafeInsetBottom());
+                    }
+                }
+            }
+            target.setPadding(left, top, right, bottom);
+            return windowInsets;
+        });
+        view.requestApplyInsets();
     }
 
     private ImageButton transportButton(int iconResId, String description) {

@@ -38,6 +38,33 @@ const DEFAULT_APPLE = Object.freeze({
   logarithmic: true,
 });
 
+function androidVariantKey(settings) {
+  return `fps${settings.fps}-wave${settings.waveformMs}-fft${settings.fftSize}`
+    + `-bars${settings.bars}-log${settings.logarithmic ? 1 : 0}`;
+}
+
+function parseAndroidVariantKey(value) {
+  const match = /^fps(\d+)-wave(\d+)-fft(\d+)-bars(\d+)-log([01])$/.exec(value || '');
+  if (!match) return null;
+  const settings = {
+    fps: Number(match[1]),
+    waveformMs: Number(match[2]),
+    fftSize: Number(match[3]),
+    bars: Number(match[4]),
+    logarithmic: match[5] === '1',
+  };
+  if (settings.fps < 5
+      || settings.fps > 60
+      || settings.waveformMs < 20
+      || settings.waveformMs > 90
+      || ![512, 1024, 2048].includes(settings.fftSize)
+      || settings.bars < 16
+      || settings.bars > 64) {
+    return null;
+  }
+  return settings;
+}
+
 // Canonical loudness-leveling settings baked into precomputed cache waveforms/
 // spectra, so they reflect post-leveling audio the same way live playback does
 // (NormalizingAudioPlayer.java applies leveling before feeding its visualizer
@@ -159,6 +186,9 @@ Options:
   --android-fft-size N      Android FFT size (default: 512)
   --android-bars N          Override observed/default Android bar count
   --android-linear          Use a linear Android spectrum scale
+  --android-variant         Store Android output under the settings-keyed
+                            data/android-visual/<settings>/ directory instead
+                            of the legacy single-slot data/visual directory
   --apple-fps N             Apple FPS (default: 24)
   --apple-waveform-ms N     Apple waveform window (default: 80)
   --apple-fft-size N        Apple FFT size (default: 1024)
@@ -189,6 +219,7 @@ function parseArgs(argv) {
     dryRun: false,
     force: false,
     nice: false,
+    androidVariant: false,
     android: { ...DEFAULT_ANDROID },
     apple: { ...DEFAULT_APPLE },
   };
@@ -222,6 +253,7 @@ function parseArgs(argv) {
       case '--android-fft-size': options.android.fftSize = parseNumber(take(i++, arg), arg, { integer: true, min: 2 }); break;
       case '--android-bars': options.android.bars = parseNumber(take(i++, arg), arg, { integer: true, min: 1 }); break;
       case '--android-linear': options.android.logarithmic = false; break;
+      case '--android-variant': options.androidVariant = true; break;
       case '--apple-fps': options.apple.fps = parseNumber(take(i++, arg), arg, { min: 1 }); break;
       case '--apple-waveform-ms': options.apple.waveformMs = parseNumber(take(i++, arg), arg, { min: 1 }); break;
       case '--apple-fft-size': options.apple.fftSize = parseNumber(take(i++, arg), arg, { integer: true, min: 2 }); break;
@@ -883,7 +915,10 @@ async function analyzeTrack(job, options, abortSignal) {
 
 function jobForTrack(track, options) {
   const profilePath = path.join(options.dataDir, 'profiles', `${track.relativePath}.json`);
-  const androidPath = path.join(options.dataDir, 'visual', `${track.relativePath}.fvz`);
+  const androidDirectory = options.androidVariant
+    ? path.join(options.dataDir, 'android-visual', androidVariantKey(options.android))
+    : path.join(options.dataDir, 'visual');
+  const androidPath = path.join(androidDirectory, `${track.relativePath}.fvz`);
   const applePath = path.join(options.dataDir, 'apple-visual', `${track.relativePath}.fav`);
   const visualEnabled = !options.profilesOnly;
   const job = {
@@ -950,7 +985,10 @@ async function main(argv = process.argv.slice(2)) {
   if (!options.profilesOnly) {
     if (options.platform === 'both' || options.platform === 'android') {
       const missing = allJobs.filter((job) => job.android).length;
-      console.log(`Android visuals: ${tracks.length - missing} valid; ${missing} missing`);
+      const storage = options.androidVariant
+        ? `variant ${androidVariantKey(options.android)}`
+        : 'legacy';
+      console.log(`Android visuals (${storage}): ${tracks.length - missing} valid; ${missing} missing`);
       console.log(`  settings: ${options.android.fps} FPS, ${options.android.waveformMs} ms, FFT ${options.android.fftSize}, ${options.android.bars} bars, ${options.android.logarithmic ? 'log' : 'linear'}`);
     }
     if (options.platform === 'both' || options.platform === 'apple') {
@@ -1036,9 +1074,11 @@ module.exports = {
   DEFAULT_ANDROID,
   DEFAULT_APPLE,
   analyzeTrack,
+  androidVariantKey,
   inferAndroidSettings,
   jobForTrack,
   parseArgs,
+  parseAndroidVariantKey,
   runJobs,
   readAndroidHeader,
   readAppleHeader,

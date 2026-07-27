@@ -33,3 +33,17 @@ unsigned byte per spectrum bar. `MediaCache.serverVisual(from:settings:)`
 validates and expands those bytes into Apple's existing `VisualCacheEntry`.
 The matching `MediaCache.serverLoudness(from:)` helper converts the shared
 `{rms, peak}` JSON into Apple's dB-based cache entry.
+
+## Android visualization variants
+
+Older Android builds continue to use `/api/visual/*` and `data/visual/`. Newer
+builds request their exact settings from
+`/api/android-visual/<settings>/*`; the corresponding files live under
+`data/android-visual/<settings>/`. The canonical key includes FPS, waveform
+window, FFT size, bar count, and logarithmic/linear scale. This allows 30- and
+60-FPS data to coexist without either device overwriting the other.
+
+At startup the server fills the common 60-FPS variant used by the Android
+devices (`fps60-wave90-fft2048-bars64-log1`). Android now syncs only its next
+two tracks in the background and fetches the current track on demand instead
+of downloading the full library to every device.

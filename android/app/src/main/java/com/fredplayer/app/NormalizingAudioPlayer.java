@@ -5,13 +5,18 @@ import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
+import android.media.AudioRouting;
+import android.media.AudioTimestamp;
 import android.media.AudioTrack;
 import android.media.MediaCodec;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
+import android.util.Log;
 
 import org.json.JSONObject;
 
@@ -33,6 +38,7 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -42,6 +48,8 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class NormalizingAudioPlayer {
+    private static final String TAG = "FredPlayerAudio";
+
     interface Callback {
         void onTrackStarted();
 
@@ -65,6 +73,7 @@ final class NormalizingAudioPlayer {
     private static final int VISUAL_CACHE_PRUNE_ABOVE = 5000;
     private static final int VISUAL_CACHE_KEEP = 4500;
     private static final int VISUAL_WAVEFORM_POINTS = 96;
+    private static final int VISUAL_HEADER_BYTES = 24;
     private static final int VISUAL_HEADER_FRAME_COUNT_OFFSET = 20;
     private static final String REMOTE_STREAM_SEGMENT = "/stream/";
     private static final int REMOTE_CONNECT_TIMEOUT_MS = 4000;
@@ -79,6 +88,7 @@ final class NormalizingAudioPlayer {
     private volatile Thread worker;
     private volatile Thread cacheWorker;
     private volatile AudioTrack activeTrack;
+    private volatile VisualizationClock activeVisualizationClock;
     private volatile boolean paused;
     private volatile boolean released;
     private volatile long currentBasePositionMs;
@@ -111,6 +121,23 @@ final class NormalizingAudioPlayer {
     void setVisualizationSettings(VisualizationSettings visualizationSettings) {
         if (visualizationSettings != null) {
             this.visualizationSettings = visualizationSettings;
+        }
+    }
+
+    OutputRouteInfo getOutputRouteInfo() {
+        VisualizationClock clock = activeVisualizationClock;
+        return clock == null ? OutputRouteInfo.none() : clock.routeInfo();
+    }
+
+    boolean setCurrentOutputVisualDelayMs(int delayMs) {
+        VisualizationClock clock = activeVisualizationClock;
+        return clock != null && clock.setRouteDelayMs(delayMs);
+    }
+
+    void refreshOutputVisualDelay() {
+        VisualizationClock clock = activeVisualizationClock;
+        if (clock != null) {
+            clock.refreshRouteDelay();
         }
     }
 
@@ -159,7 +186,7 @@ final class NormalizingAudioPlayer {
     }
 
     void warmLoudnessCache(List<String> uriStrings) {
-        if (uriStrings == null || uriStrings.isEmpty() || released) {
+        if (released) {
             callback.onCacheProgress(0, 0);
             return;
         }
@@ -167,6 +194,10 @@ final class NormalizingAudioPlayer {
         PlaybackRun previousRun = cacheRun;
         if (previousRun != null) {
             previousRun.stopRequested.set(true);
+        }
+        if (uriStrings == null || uriStrings.isEmpty()) {
+            callback.onCacheProgress(0, 0);
+            return;
         }
 
         ArrayList<String> tracks = new ArrayList<>(uriStrings);
@@ -247,6 +278,7 @@ final class NormalizingAudioPlayer {
         MediaExtractor extractor = new MediaExtractor();
         MediaCodec codec = null;
         AudioTrack audioTrack = null;
+        VisualizationPipeline visualization = null;
         boolean completed = false;
         boolean notifyFinished = false;
         try {
@@ -283,8 +315,6 @@ final class NormalizingAudioPlayer {
             boolean outputDone = false;
             StreamFormat streamFormat = null;
             VolumeNormalizer normalizer = null;
-            VisualizationCollector visualizationCollector = null;
-            VisualCachePlayback visualCachePlayback = null;
             long framesWritten = 0;
             int frameSizeBytes = 0;
 
@@ -320,20 +350,13 @@ final class NormalizingAudioPlayer {
                     currentBasePositionMs = run.startPositionMs;
                     frameSizeBytes = streamFormat.outputChannels * 2;
                     normalizer = new VolumeNormalizer(streamFormat.sampleRate, trackProfile, levelingSettings);
-                    VisualCache visualCache = readVisualCache(uri, visualizationSettings);
-                    if (visualCache == null) {
-                        visualizationCollector = new VisualizationCollector(streamFormat.sampleRate, visualizationSettings);
-                    } else {
-                        visualCachePlayback = new VisualCachePlayback(
-                                visualCache,
-                                streamFormat.sampleRate,
-                                run.startPositionMs);
-                    }
+                    visualization = createVisualizationPipeline(uri, audioTrack, streamFormat.sampleRate, run);
                     if (run.startPaused) {
                         audioTrack.pause();
                         paused = true;
                     }
                     callback.onTrackStarted();
+                    visualization.start();
                 } else if (outputIndex >= 0) {
                     if (streamFormat == null) {
                         streamFormat = StreamFormat.from(codec.getOutputFormat());
@@ -343,20 +366,13 @@ final class NormalizingAudioPlayer {
                         currentBasePositionMs = run.startPositionMs;
                         frameSizeBytes = streamFormat.outputChannels * 2;
                         normalizer = new VolumeNormalizer(streamFormat.sampleRate, trackProfile, levelingSettings);
-                        VisualCache visualCache = readVisualCache(uri, visualizationSettings);
-                        if (visualCache == null) {
-                            visualizationCollector = new VisualizationCollector(streamFormat.sampleRate, visualizationSettings);
-                        } else {
-                            visualCachePlayback = new VisualCachePlayback(
-                                    visualCache,
-                                    streamFormat.sampleRate,
-                                    run.startPositionMs);
-                        }
+                        visualization = createVisualizationPipeline(uri, audioTrack, streamFormat.sampleRate, run);
                         if (run.startPaused) {
                             audioTrack.pause();
                             paused = true;
                         }
                         callback.onTrackStarted();
+                        visualization.start();
                     }
                     ByteBuffer outputBuffer = codec.getOutputBuffer(outputIndex);
                     if (outputBuffer != null && info.size > 0 && normalizer != null) {
@@ -384,12 +400,10 @@ final class NormalizingAudioPlayer {
                                     pcmSize,
                                     streamFormat,
                                     normalizer,
-                                    visualizationCollector);
+                                    visualization == null ? null : visualization.collector,
+                                    visualization == null ? null : visualization.sink);
                             int written = writeFully(audioTrack, pcm, run);
                             framesWritten += written / frameSizeBytes;
-                            if (visualCachePlayback != null) {
-                                visualCachePlayback.emitUntil(framesWritten, callback);
-                            }
                         }
                     }
                     outputDone = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
@@ -410,6 +424,12 @@ final class NormalizingAudioPlayer {
             }
         } finally {
             notifyFinished = completed && !released && activeRun == run;
+            if (visualization != null) {
+                visualization.stop();
+                if (activeVisualizationClock == visualization.clock) {
+                    activeVisualizationClock = null;
+                }
+            }
             if (codec != null) {
                 try {
                     codec.stop();
@@ -447,6 +467,29 @@ final class NormalizingAudioPlayer {
         }
     }
 
+    private VisualizationPipeline createVisualizationPipeline(
+            Uri uri,
+            AudioTrack audioTrack,
+            int sampleRate,
+            PlaybackRun run) {
+        VisualizationSettings settings = visualizationSettings;
+        VisualCache visualCache = readVisualCache(uri, settings);
+        VisualizationCollector collector = null;
+        VisualizationSink sink = null;
+        VisualizationFrameSource source;
+        if (visualCache == null) {
+            LiveVisualPlayback livePlayback = new LiveVisualPlayback(settings.fps, sampleRate);
+            collector = new VisualizationCollector(sampleRate, settings);
+            sink = livePlayback;
+            source = livePlayback;
+        } else {
+            source = new VisualCachePlayback(visualCache, sampleRate, run.startPositionMs);
+        }
+        VisualizationClock clock = new VisualizationClock(context, audioTrack, run, source, callback);
+        activeVisualizationClock = clock;
+        return new VisualizationPipeline(collector, sink, clock);
+    }
+
     private void runCacheWarmup(ArrayList<String> tracks, PlaybackRun run) {
         int total = tracks.size();
         int done = 0;
@@ -464,13 +507,17 @@ final class NormalizingAudioPlayer {
                         profile = obtainProfile(uri, run, Math.round(levelingSettings.analysisSeconds * ONE_SECOND_US));
                     }
                     File visualFile = visualCacheFile(uri, visualSettings);
+                    if (visualFile.isFile()
+                            && !visualCacheFileMatches(visualFile, visualSettings)) {
+                        visualFile.delete();
+                    }
                     if (!run.stopRequested.get() && !visualFile.exists() && isRemote(uri)) {
-                        fetchRemoteVisualQuietly(uri, visualFile);
+                        fetchRemoteVisualQuietly(uri, visualFile, visualSettings);
                     }
                     if (!run.stopRequested.get() && !visualFile.exists()) {
                         writeVisualCache(uri, visualFile, visualSettings, run, profile);
                         if (!run.stopRequested.get() && visualFile.exists() && isRemote(uri)) {
-                            uploadRemoteVisualQuietly(uri, visualFile);
+                            uploadRemoteVisualQuietly(uri, visualFile, visualSettings);
                         }
                     }
                 } catch (Exception ignored) {
@@ -711,8 +758,11 @@ final class NormalizingAudioPlayer {
 
     private VisualCache readVisualCache(Uri uri, VisualizationSettings settings) {
         File file = visualCacheFile(uri, settings);
+        if (file.isFile() && !visualCacheFileMatches(file, settings)) {
+            file.delete();
+        }
         if (!file.isFile() && isRemote(uri)) {
-            fetchRemoteVisualQuietly(uri, file);
+            fetchRemoteVisualQuietly(uri, file, settings);
         }
         if (!file.isFile()) {
             return null;
@@ -731,12 +781,15 @@ final class NormalizingAudioPlayer {
                     || waveformPoints != VISUAL_WAVEFORM_POINTS
                     || bars != settings.fftBars
                     || frameCount <= 0) {
+                file.delete();
                 return null;
             }
 
             int frameSize = waveformPoints + bars;
             long byteCount = (long) frameCount * frameSize;
-            if (byteCount > Integer.MAX_VALUE) {
+            if (byteCount > Integer.MAX_VALUE
+                    || file.length() != VISUAL_HEADER_BYTES + byteCount) {
+                file.delete();
                 return null;
             }
 
@@ -1127,8 +1180,39 @@ final class NormalizingAudioPlayer {
         }
     }
 
-    private void fetchRemoteVisualQuietly(Uri uri, File destination) {
-        String url = remoteApiUrl("/api/visual/", uri);
+    private boolean visualCacheFileMatches(File file, VisualizationSettings settings) {
+        if (!file.isFile() || file.length() < VISUAL_HEADER_BYTES) {
+            return false;
+        }
+        try (DataInputStream input = new DataInputStream(
+                new BufferedInputStream(new FileInputStream(file)))) {
+            int magic = input.readInt();
+            int version = input.readInt();
+            int fps = input.readInt();
+            int waveformPoints = input.readInt();
+            int bars = input.readInt();
+            int frameCount = input.readInt();
+            long payloadBytes = (long) frameCount * (waveformPoints + bars);
+            return magic == VISUAL_CACHE_MAGIC
+                    && version == VISUAL_CACHE_VERSION
+                    && fps == settings.fps
+                    && waveformPoints == VISUAL_WAVEFORM_POINTS
+                    && bars == settings.fftBars
+                    && frameCount > 0
+                    && payloadBytes <= Integer.MAX_VALUE
+                    && file.length() == VISUAL_HEADER_BYTES + payloadBytes;
+        } catch (IOException | RuntimeException ignored) {
+            return false;
+        }
+    }
+
+    private void fetchRemoteVisualQuietly(
+            Uri uri,
+            File destination,
+            VisualizationSettings settings) {
+        String url = remoteApiUrl(
+                "/api/android-visual/" + settings.remoteCacheKey() + "/",
+                uri);
         if (url == null) {
             return;
         }
@@ -1150,6 +1234,9 @@ final class NormalizingAudioPlayer {
                         output.write(chunk, 0, read);
                     }
                 }
+                if (!visualCacheFileMatches(destination, settings)) {
+                    destination.delete();
+                }
             } finally {
                 connection.disconnect();
             }
@@ -1158,8 +1245,13 @@ final class NormalizingAudioPlayer {
         }
     }
 
-    private void uploadRemoteVisualQuietly(Uri uri, File source) {
-        String url = remoteApiUrl("/api/visual/", uri);
+    private void uploadRemoteVisualQuietly(
+            Uri uri,
+            File source,
+            VisualizationSettings settings) {
+        String url = remoteApiUrl(
+                "/api/android-visual/" + settings.remoteCacheKey() + "/",
+                uri);
         if (url == null) {
             return;
         }
@@ -1227,12 +1319,10 @@ final class NormalizingAudioPlayer {
             int size,
             StreamFormat format,
             VolumeNormalizer normalizer,
-            VisualizationCollector visualizationCollector) throws IOException {
+            VisualizationCollector visualizationCollector,
+            VisualizationSink visualizationSink) throws IOException {
         source.order(ByteOrder.LITTLE_ENDIAN);
         normalizer.updateSettings(levelingSettings);
-        if (visualizationCollector != null) {
-            visualizationCollector.updateSettings(visualizationSettings);
-        }
         int bytesPerSample = bytesPerSample(format.pcmEncoding);
         int inputFrameSize = bytesPerSample * format.inputChannels;
         int frames = size / inputFrameSize;
@@ -1278,8 +1368,8 @@ final class NormalizingAudioPlayer {
             if (format.outputChannels == 2) {
                 out.putShort(floatToShort(right));
             }
-            if (visualizationCollector != null) {
-                visualizationCollector.accept((left + right) * 0.5f, callback::onVisualization);
+            if (visualizationCollector != null && visualizationSink != null) {
+                visualizationCollector.accept((left + right) * 0.5f, visualizationSink);
             }
         }
         return output;
@@ -1395,6 +1485,24 @@ final class NormalizingAudioPlayer {
         }
     }
 
+    static final class OutputRouteInfo {
+        final String key;
+        final String label;
+        final boolean bluetooth;
+        final int visualDelayMs;
+
+        private OutputRouteInfo(String key, String label, boolean bluetooth, int visualDelayMs) {
+            this.key = key;
+            this.label = label;
+            this.bluetooth = bluetooth;
+            this.visualDelayMs = visualDelayMs;
+        }
+
+        static OutputRouteInfo none() {
+            return new OutputRouteInfo("", "No active output", false, 0);
+        }
+    }
+
     private static final class CacheEntry {
         final String key;
         final long timestamp;
@@ -1407,6 +1515,229 @@ final class NormalizingAudioPlayer {
 
     private interface VisualizationSink {
         void onVisualization(byte[] waveform, byte[] spectrum) throws IOException;
+    }
+
+    private interface VisualizationFrameSource {
+        int fps();
+
+        void emitAt(long framesPlayed, Callback callback);
+    }
+
+    private static final class VisualizationPipeline {
+        final VisualizationCollector collector;
+        final VisualizationSink sink;
+        final VisualizationClock clock;
+
+        private VisualizationPipeline(
+                VisualizationCollector collector,
+                VisualizationSink sink,
+                VisualizationClock clock) {
+            this.collector = collector;
+            this.sink = sink;
+            this.clock = clock;
+        }
+
+        void start() {
+            clock.start();
+        }
+
+        void stop() {
+            clock.stop();
+        }
+    }
+
+    private static final class VisualizationClock implements Runnable {
+        private static final long TIMESTAMP_WARMUP_POLL_NS = 100_000_000L;
+        private static final long TIMESTAMP_STABLE_REFRESH_NS = 10_000_000_000L;
+        private static final long TIMESTAMP_FALLBACK_NS = 2_000_000_000L;
+
+        private final Context context;
+        private final AudioTrack audioTrack;
+        private final PlaybackRun run;
+        private final VisualizationFrameSource source;
+        private final Callback callback;
+        private final boolean manualCalibrationNeeded;
+        private final AtomicBoolean stopped = new AtomicBoolean(false);
+        private final Thread thread;
+        private final Handler routingHandler = new Handler(Looper.getMainLooper());
+        private final AudioRouting.OnRoutingChangedListener routingListener =
+                router -> timestampInvalidated = true;
+        private final AudioTimestamp timestamp = new AudioTimestamp();
+        private volatile boolean timestampInvalidated = true;
+        private boolean timestampValid;
+        private boolean timestampLockLogged;
+        private long timestampFramePosition;
+        private long timestampNanoTime;
+        private long nextTimestampPollNs;
+        private long timestampUnavailableSinceNs;
+        private long lastPresentedFrames = -1L;
+        private int lastPlayState = -1;
+        private volatile String routeKey = "";
+        private volatile String routeLabel = "No active output";
+        private volatile boolean bluetoothRoute;
+        private volatile int routeDelayMs;
+
+        private VisualizationClock(
+                Context context,
+                AudioTrack audioTrack,
+                PlaybackRun run,
+                VisualizationFrameSource source,
+                Callback callback) {
+            this.context = context.getApplicationContext();
+            this.audioTrack = audioTrack;
+            this.run = run;
+            this.source = source;
+            this.callback = callback;
+            manualCalibrationNeeded = AudioOutputRoute.needsManualCalibration(this.context);
+            thread = new Thread(this, "FredPlayerVisualClock");
+        }
+
+        void start() {
+            try {
+                audioTrack.addOnRoutingChangedListener(routingListener, routingHandler);
+            } catch (RuntimeException ignored) {
+            }
+            thread.start();
+        }
+
+        void stop() {
+            stopped.set(true);
+            try {
+                audioTrack.removeOnRoutingChangedListener(routingListener);
+            } catch (RuntimeException ignored) {
+            }
+            thread.interrupt();
+            if (thread != Thread.currentThread()) {
+                try {
+                    thread.join(500L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+
+        @Override
+        public void run() {
+            long intervalMs = Math.max(8L, 1000L / Math.max(1, source.fps()));
+            while (!stopped.get() && !run.stopRequested.get()) {
+                try {
+                    long framesPresented = presentedFramesAt(System.nanoTime());
+                    if (framesPresented >= 0L) {
+                        long delayFrames = (long) routeDelayMs * audioTrack.getSampleRate() / 1000L;
+                        source.emitAt(Math.max(0L, framesPresented - delayFrames), callback);
+                    }
+                } catch (RuntimeException ignored) {
+                }
+                try {
+                    Thread.sleep(intervalMs);
+                } catch (InterruptedException e) {
+                    if (stopped.get() || run.stopRequested.get()) {
+                        return;
+                    }
+                }
+            }
+        }
+
+        private long presentedFramesAt(long nowNs) {
+            int playState = audioTrack.getPlayState();
+            if (playState != lastPlayState) {
+                lastPlayState = playState;
+                if (playState == AudioTrack.PLAYSTATE_PLAYING) {
+                    timestampInvalidated = true;
+                }
+            }
+
+            if (timestampInvalidated) {
+                timestampInvalidated = false;
+                timestampValid = false;
+                timestampLockLogged = false;
+                nextTimestampPollNs = 0L;
+                timestampUnavailableSinceNs = nowNs;
+                refreshRouteDelay();
+            }
+
+            if (playState != AudioTrack.PLAYSTATE_PLAYING) {
+                return lastPresentedFrames;
+            }
+
+            if (nowNs >= nextTimestampPollNs) {
+                boolean available = audioTrack.getTimestamp(timestamp);
+                if (available && timestamp.nanoTime > 0L) {
+                    timestampFramePosition = Math.max(0L, timestamp.framePosition);
+                    timestampNanoTime = timestamp.nanoTime;
+                    timestampValid = true;
+                    nextTimestampPollNs = nowNs + TIMESTAMP_STABLE_REFRESH_NS;
+                    if (routeKey.isEmpty()) {
+                        refreshRouteDelay();
+                    }
+                } else {
+                    nextTimestampPollNs = nowNs + TIMESTAMP_WARMUP_POLL_NS;
+                }
+            }
+
+            if (timestampValid) {
+                long elapsedNs = nowNs - timestampNanoTime;
+                long elapsedFrames = elapsedNs * audioTrack.getSampleRate() / 1_000_000_000L;
+                long presented = Math.max(0L, timestampFramePosition + elapsedFrames);
+                if (lastPresentedFrames >= 0L) {
+                    presented = Math.max(lastPresentedFrames, presented);
+                }
+                lastPresentedFrames = presented;
+                if (!timestampLockLogged) {
+                    long playbackHead = audioTrack.getPlaybackHeadPosition() & 0xFFFFFFFFL;
+                    long delayFrames = Math.max(0L, playbackHead - presented);
+                    long delayMs = delayFrames * 1000L / Math.max(1, audioTrack.getSampleRate());
+                    Log.i(TAG, "Visualization presentation clock locked; downstream delay="
+                            + delayMs + " ms, saved route compensation=" + routeDelayMs + " ms");
+                    timestampLockLogged = true;
+                }
+                return presented;
+            }
+
+            if (nowNs - timestampUnavailableSinceNs >= TIMESTAMP_FALLBACK_NS) {
+                long playbackHead = audioTrack.getPlaybackHeadPosition() & 0xFFFFFFFFL;
+                lastPresentedFrames = Math.max(lastPresentedFrames, playbackHead);
+                return lastPresentedFrames;
+            }
+            return -1L;
+        }
+
+        OutputRouteInfo routeInfo() {
+            return new OutputRouteInfo(routeKey, routeLabel, bluetoothRoute, routeDelayMs);
+        }
+
+        boolean setRouteDelayMs(int delayMs) {
+            String key = routeKey;
+            if (!manualCalibrationNeeded || !bluetoothRoute || key.isEmpty()) {
+                return false;
+            }
+            int safeDelay = Math.max(0, Math.min(1500, delayMs));
+            PlaylistStore.saveBluetoothVisualDelay(
+                    context,
+                    key,
+                    routeLabel,
+                    safeDelay);
+            routeDelayMs = safeDelay;
+            return true;
+        }
+
+        void refreshRouteDelay() {
+            try {
+                android.media.AudioDeviceInfo device = audioTrack.getRoutedDevice();
+                if (device == null) {
+                    return;
+                }
+                boolean bluetooth = AudioOutputRoute.isBluetooth(device);
+                String key = bluetooth ? AudioOutputRoute.key(device) : "";
+                routeKey = key;
+                routeLabel = AudioOutputRoute.label(device);
+                bluetoothRoute = bluetooth;
+                routeDelayMs = bluetooth && manualCalibrationNeeded
+                        ? PlaylistStore.loadBluetoothVisualDelay(context, key)
+                        : 0;
+            } catch (RuntimeException ignored) {
+            }
+        }
     }
 
     private static final class VisualCache {
@@ -1427,34 +1758,107 @@ final class NormalizingAudioPlayer {
         }
     }
 
-    private static final class VisualCachePlayback {
+    private static final class VisualCachePlayback implements VisualizationFrameSource {
         private final VisualCache cache;
         private final int sampleRate;
         private final long baseFrames;
-        private int nextFrame;
+        private int lastFrame = -1;
 
         private VisualCachePlayback(VisualCache cache, int sampleRate, long startPositionMs) {
             this.cache = cache;
             this.sampleRate = Math.max(1, sampleRate);
             baseFrames = Math.max(0L, startPositionMs) * this.sampleRate / 1000L;
-            nextFrame = (int) Math.min(
-                    cache.frameCount,
-                    baseFrames * cache.fps / this.sampleRate);
         }
 
-        void emitUntil(long framesWritten, Callback callback) {
-            int targetFrame = (int) Math.min(
-                    cache.frameCount,
-                    (baseFrames + framesWritten) * cache.fps / sampleRate);
-            while (nextFrame < targetFrame) {
-                int offset = nextFrame * cache.frameSize;
-                byte[] waveform = new byte[cache.waveformPoints];
-                byte[] spectrum = new byte[cache.bars];
-                System.arraycopy(cache.frames, offset, waveform, 0, waveform.length);
-                System.arraycopy(cache.frames, offset + waveform.length, spectrum, 0, spectrum.length);
-                callback.onVisualization(waveform, spectrum);
-                nextFrame++;
+        @Override
+        public int fps() {
+            return cache.fps;
+        }
+
+        @Override
+        public void emitAt(long framesPlayed, Callback callback) {
+            long dueFrameCount = (baseFrames + Math.max(0L, framesPlayed))
+                    * cache.fps / sampleRate;
+            if (dueFrameCount <= 0L) {
+                return;
             }
+            int targetFrame = (int) Math.min(cache.frameCount - 1L, dueFrameCount - 1L);
+            if (targetFrame <= lastFrame) {
+                return;
+            }
+            int offset = targetFrame * cache.frameSize;
+            byte[] waveform = new byte[cache.waveformPoints];
+            byte[] spectrum = new byte[cache.bars];
+            System.arraycopy(cache.frames, offset, waveform, 0, waveform.length);
+            System.arraycopy(cache.frames, offset + waveform.length, spectrum, 0, spectrum.length);
+            lastFrame = targetFrame;
+            callback.onVisualization(waveform, spectrum);
+        }
+    }
+
+    private static final class LiveVisualPlayback
+            implements VisualizationSink, VisualizationFrameSource {
+        private final int visualFps;
+        private final int sampleRate;
+        private final int maxBufferedFrames;
+        private final ArrayDeque<VisualFrame> frames = new ArrayDeque<>();
+        private long firstFrameIndex;
+        private long lastEmittedFrame = -1L;
+
+        private LiveVisualPlayback(int visualFps, int sampleRate) {
+            this.visualFps = Math.max(1, visualFps);
+            this.sampleRate = Math.max(1, sampleRate);
+            maxBufferedFrames = Math.max(120, this.visualFps * 10);
+        }
+
+        @Override
+        public synchronized void onVisualization(byte[] waveform, byte[] spectrum) {
+            frames.addLast(new VisualFrame(waveform, spectrum));
+            while (frames.size() > maxBufferedFrames) {
+                frames.removeFirst();
+                firstFrameIndex++;
+            }
+        }
+
+        @Override
+        public int fps() {
+            return visualFps;
+        }
+
+        @Override
+        public void emitAt(long framesPlayed, Callback callback) {
+            VisualFrame frame;
+            long frameIndex;
+            synchronized (this) {
+                long dueFrameCount = Math.max(0L, framesPlayed) * visualFps / sampleRate;
+                if (dueFrameCount <= 0L || frames.isEmpty()) {
+                    return;
+                }
+                long targetFrame = dueFrameCount - 1L;
+                while (firstFrameIndex < targetFrame && frames.size() > 1) {
+                    frames.removeFirst();
+                    firstFrameIndex++;
+                }
+                frameIndex = firstFrameIndex;
+                if (frameIndex == lastEmittedFrame || frameIndex > targetFrame) {
+                    return;
+                }
+                frame = frames.peekFirst();
+                lastEmittedFrame = frameIndex;
+            }
+            if (frame != null) {
+                callback.onVisualization(frame.waveform, frame.spectrum);
+            }
+        }
+    }
+
+    private static final class VisualFrame {
+        final byte[] waveform;
+        final byte[] spectrum;
+
+        private VisualFrame(byte[] waveform, byte[] spectrum) {
+            this.waveform = waveform;
+            this.spectrum = spectrum;
         }
     }
 

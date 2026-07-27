@@ -40,6 +40,14 @@ final class VisualizationSettings {
                 DEFAULT_LOG_SCALE);
     }
 
+    String remoteCacheKey() {
+        return "fps" + fps
+                + "-wave" + waveformMs
+                + "-fft" + fftSize
+                + "-bars" + fftBars
+                + "-log" + (logScale ? 1 : 0);
+    }
+
     private static int nearestFftSize(int value) {
         if (value <= 768) {
             return 512;

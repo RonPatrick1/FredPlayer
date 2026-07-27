@@ -1,11 +1,13 @@
 package com.fredplayer.app;
 
+import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
@@ -21,6 +23,7 @@ import android.support.v4.media.MediaDescriptionCompat;
 import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
+import android.util.Log;
 
 import androidx.media.MediaBrowserServiceCompat;
 
@@ -48,6 +51,10 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
     public static final String ACTION_SET_LEVELING_STRENGTH = "com.fredplayer.app.SET_LEVELING_STRENGTH";
     public static final String ACTION_SET_LEVELING_SETTINGS = "com.fredplayer.app.SET_LEVELING_SETTINGS";
     public static final String ACTION_SET_VISUALIZATION_SETTINGS = "com.fredplayer.app.SET_VISUALIZATION_SETTINGS";
+    public static final String ACTION_SET_OUTPUT_VISUAL_DELAY = "com.fredplayer.app.SET_OUTPUT_VISUAL_DELAY";
+    public static final String ACTION_CALIBRATE_OUTPUT_DELAY = "com.fredplayer.app.CALIBRATE_OUTPUT_DELAY";
+    public static final String ACTION_CLEAR_OUTPUT_VISUAL_DELAY =
+            "com.fredplayer.app.CLEAR_OUTPUT_VISUAL_DELAY";
     public static final String ACTION_REQUEST_STATE = "com.fredplayer.app.REQUEST_STATE";
     public static final String ACTION_STATE_CHANGED = "com.fredplayer.app.STATE_CHANGED";
     public static final String ACTION_VISUALIZATION_CHANGED = "com.fredplayer.app.VISUALIZATION_CHANGED";
@@ -77,6 +84,11 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
     public static final String EXTRA_VISUAL_FFT_BARS = "visual_fft_bars";
     public static final String EXTRA_VISUAL_SMOOTHING = "visual_smoothing";
     public static final String EXTRA_VISUAL_LOG_SCALE = "visual_log_scale";
+    public static final String EXTRA_OUTPUT_VISUAL_DELAY_MS = "output_visual_delay_ms";
+    public static final String EXTRA_OUTPUT_ROUTE_NAME = "output_route_name";
+    public static final String EXTRA_OUTPUT_ROUTE_KEY = "output_route_key";
+    public static final String EXTRA_OUTPUT_ROUTE_BLUETOOTH = "output_route_bluetooth";
+    public static final String EXTRA_OUTPUT_DELAY_CALIBRATING = "output_delay_calibrating";
     public static final String EXTRA_WAVEFORM = "waveform";
     public static final String EXTRA_SPECTRUM = "spectrum";
     public static final String EXTRA_CACHE_COUNT = "cache_count";
@@ -92,6 +104,7 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
 
     private static final String CHANNEL_ID = "fred_player_playback";
     private static final int NOTIFICATION_ID = 41;
+    private static final int CACHE_LOOKAHEAD_TRACKS = 2;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Random random = new Random();
@@ -103,6 +116,7 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
     private AudioFocusRequest focusRequest;
     private MediaSessionCompat mediaSession;
     private ExecutorService browseExecutor;
+    private ExecutorService calibrationExecutor;
     private String activePlaylistName = PlaylistStore.DEFAULT_PLAYLIST_NAME;
     private boolean shuffleEnabled = true;
     private int currentIndex = -1;
@@ -115,6 +129,10 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
     private String message = "Paused";
     private int cacheProgressDone;
     private int cacheProgressTotal;
+    private boolean outputDelayCalibrating;
+    private String lastCalibratedRouteKey = "";
+    private String lastCalibratedRouteName = "";
+    private int lastCalibratedDelayMs;
     private final Runnable progressPublisher = new Runnable() {
         @Override
         public void run() {
@@ -129,6 +147,7 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
     public void onCreate() {
         super.onCreate();
         browseExecutor = Executors.newSingleThreadExecutor();
+        calibrationExecutor = Executors.newSingleThreadExecutor();
         LinkedHashMap<String, ArrayList<String>> playlists = PlaylistStore.loadPlaylists(this);
         activePlaylistName = PlaylistStore.loadActivePlaylistName(this, playlists);
         ArrayList<String> activeTracks = playlists.get(activePlaylistName);
@@ -198,7 +217,7 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         player.setLevelingSettings(PlaylistStore.loadLevelingSettings(this));
         player.setVisualizationSettings(PlaylistStore.loadVisualizationSettings(this));
         if (!playlist.isEmpty()) {
-            player.warmLoudnessCache(playlist);
+            warmCacheLookahead();
         }
 
         startForegroundCompat();
@@ -230,7 +249,7 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
             playlist.addAll(incoming);
             currentIndex = currentItem == null ? -1 : playlist.indexOf(currentItem);
             refillShuffleBag();
-            player.warmLoudnessCache(playlist);
+            warmCacheLookahead();
 
             if (playlist.isEmpty()) {
                 playbackRequested = false;
@@ -328,8 +347,57 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
             PlaylistStore.saveVisualizationSettings(this, settings);
             player.setVisualizationSettings(settings);
             if (!playlist.isEmpty()) {
-                player.warmLoudnessCache(playlist);
+                warmCacheLookahead();
             }
+            publishState();
+        } else if (ACTION_SET_OUTPUT_VISUAL_DELAY.equals(action)) {
+            if (!AudioOutputRoute.needsManualCalibration(this)) {
+                message = "Android handles Bluetooth latency on this device";
+                publishState();
+                return START_STICKY;
+            }
+            int delayMs = intent.getIntExtra(EXTRA_OUTPUT_VISUAL_DELAY_MS, 0);
+            String routeKey = intent.getStringExtra(EXTRA_OUTPUT_ROUTE_KEY);
+            String routeName = intent.getStringExtra(EXTRA_OUTPUT_ROUTE_NAME);
+            boolean saved = player.setCurrentOutputVisualDelayMs(delayMs);
+            if (!saved && routeKey != null && !routeKey.isEmpty()) {
+                PlaylistStore.saveBluetoothVisualDelay(
+                        this,
+                        routeKey,
+                        routeName,
+                        delayMs);
+                player.refreshOutputVisualDelay();
+                lastCalibratedRouteKey = routeKey;
+                lastCalibratedRouteName = routeName == null || routeName.isEmpty()
+                        ? routeKey
+                        : routeName;
+                lastCalibratedDelayMs = Math.max(0, Math.min(1500, delayMs));
+                saved = true;
+            }
+            if (!saved) {
+                message = "Play through a Bluetooth output first";
+            }
+            publishState();
+        } else if (ACTION_CALIBRATE_OUTPUT_DELAY.equals(action)) {
+            startOutputDelayCalibration();
+        } else if (ACTION_CLEAR_OUTPUT_VISUAL_DELAY.equals(action)) {
+            String routeKey = intent.getStringExtra(EXTRA_OUTPUT_ROUTE_KEY);
+            if (routeKey == null || routeKey.isEmpty()) {
+                PlaylistStore.clearAllBluetoothVisualDelays(this);
+                lastCalibratedRouteKey = "";
+                lastCalibratedRouteName = "";
+                lastCalibratedDelayMs = 0;
+                message = "All Bluetooth calibrations cleared";
+            } else {
+                PlaylistStore.clearBluetoothVisualDelay(this, routeKey);
+                if (routeKey.equals(lastCalibratedRouteKey)) {
+                    lastCalibratedRouteKey = "";
+                    lastCalibratedRouteName = "";
+                    lastCalibratedDelayMs = 0;
+                }
+                message = "Bluetooth calibration cleared";
+            }
+            player.refreshOutputVisualDelay();
             publishState();
         }
         return START_STICKY;
@@ -341,6 +409,10 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         if (browseExecutor != null) {
             browseExecutor.shutdownNow();
             browseExecutor = null;
+        }
+        if (calibrationExecutor != null) {
+            calibrationExecutor.shutdownNow();
+            calibrationExecutor = null;
         }
         if (player != null) {
             player.release();
@@ -520,7 +592,7 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         currentIndex = -1;
         previousIndex = -1;
         shuffleBag.clear();
-        player.warmLoudnessCache(playlist);
+        warmCacheLookahead();
     }
 
     private void playRandomTrack() {
@@ -587,6 +659,44 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         message = "Leveling";
         publishState();
         player.play(Uri.parse(item));
+        warmCacheLookahead();
+    }
+
+    private void warmCacheLookahead() {
+        if (player == null || playlist.isEmpty()) {
+            if (player != null) {
+                player.warmLoudnessCache(Collections.emptyList());
+            }
+            return;
+        }
+
+        ArrayList<String> upcoming = new ArrayList<>();
+        if (currentIndex < 0) {
+            for (int index = 0;
+                 index < playlist.size() && upcoming.size() < CACHE_LOOKAHEAD_TRACKS;
+                 index++) {
+                upcoming.add(playlist.get(index));
+            }
+        } else if (shuffleEnabled) {
+            if (shuffleBag.isEmpty()) {
+                refillShuffleBag();
+            }
+            for (int index : shuffleBag) {
+                if (index != currentIndex && index >= 0 && index < playlist.size()) {
+                    upcoming.add(playlist.get(index));
+                    if (upcoming.size() >= CACHE_LOOKAHEAD_TRACKS) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            for (int offset = 1;
+                 offset <= CACHE_LOOKAHEAD_TRACKS && offset < playlist.size();
+                 offset++) {
+                upcoming.add(playlist.get((currentIndex + offset) % playlist.size()));
+            }
+        }
+        player.warmLoudnessCache(upcoming);
     }
 
     private void seekTo(long requestedPositionMs) {
@@ -602,6 +712,85 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         message = "Seeking";
         publishState();
         player.play(Uri.parse(playlist.get(currentIndex)), position, startPaused);
+    }
+
+    private void startOutputDelayCalibration() {
+        if (outputDelayCalibrating) {
+            return;
+        }
+        if (!AudioOutputRoute.needsManualCalibration(this)) {
+            message = "Android handles Bluetooth latency on this device";
+            publishState();
+            return;
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            message = "Microphone permission is needed for calibration";
+            publishState();
+            return;
+        }
+        if (calibrationExecutor == null || !requestAudioFocus()) {
+            message = "Audio focus unavailable";
+            publishState();
+            return;
+        }
+
+        final boolean resumeAfterCalibration = playbackRequested && player != null;
+        if (player != null) {
+            player.pause();
+        }
+        playbackRequested = false;
+        audioActuallyPlaying = false;
+        outputDelayCalibrating = true;
+        message = "Calibrating Bluetooth delay";
+        startForegroundCompat(true);
+        publishState();
+
+        calibrationExecutor.execute(() -> {
+            BluetoothDelayCalibrator.Result result = null;
+            String error = null;
+            try {
+                result = BluetoothDelayCalibrator.calibrate(this);
+            } catch (Exception e) {
+                error = e.getMessage();
+                if (error == null || error.trim().isEmpty()) {
+                    error = "Bluetooth delay calibration failed";
+                }
+            }
+            BluetoothDelayCalibrator.Result finalResult = result;
+            String finalError = error;
+            mainHandler.post(() -> {
+                if (finalResult != null) {
+                    PlaylistStore.saveBluetoothVisualDelay(
+                            this,
+                            finalResult.routeKey,
+                            finalResult.routeLabel,
+                            finalResult.delayMs);
+                    lastCalibratedRouteKey = finalResult.routeKey;
+                    lastCalibratedRouteName = finalResult.routeLabel;
+                    lastCalibratedDelayMs = finalResult.delayMs;
+                    Log.i("FredPlayerAudio", "Bluetooth calibration for "
+                            + finalResult.routeLabel + ": " + finalResult.delayMs
+                            + " ms, confidence=" + finalResult.confidence);
+                    if (player != null) {
+                        player.refreshOutputVisualDelay();
+                    }
+                    message = "Bluetooth delay calibrated: " + finalResult.delayMs + " ms";
+                } else {
+                    message = finalError;
+                }
+                outputDelayCalibrating = false;
+                startForegroundCompat(false);
+                if (resumeAfterCalibration && player != null) {
+                    playbackRequested = true;
+                    audioActuallyPlaying = true;
+                    player.resume();
+                } else {
+                    abandonAudioFocus();
+                }
+                publishState();
+            });
+        });
     }
 
     private int chooseNextIndex() {
@@ -686,6 +875,7 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         state.putExtra(EXTRA_VISUAL_CACHE_BYTES, visualStats.approximateBytes);
         state.putExtra(EXTRA_CACHE_PROGRESS_DONE, cacheProgressDone);
         state.putExtra(EXTRA_CACHE_PROGRESS_TOTAL, cacheProgressTotal);
+        putOutputRouteState(state);
         sendBroadcast(state);
     }
 
@@ -701,7 +891,21 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         state.putExtra(EXTRA_PLAYLIST_COUNT, playlist.size());
         state.putExtra(EXTRA_POSITION_MS, player == null ? 0L : player.getCurrentPositionMs());
         state.putExtra(EXTRA_DURATION_MS, player == null ? 0L : player.getDurationMs());
+        putOutputRouteState(state);
         sendBroadcast(state);
+    }
+
+    private void putOutputRouteState(Intent state) {
+        NormalizingAudioPlayer.OutputRouteInfo route = player == null
+                ? NormalizingAudioPlayer.OutputRouteInfo.none()
+                : player.getOutputRouteInfo();
+        boolean useCalibrated = route.key.isEmpty() && !lastCalibratedRouteKey.isEmpty();
+        state.putExtra(EXTRA_OUTPUT_ROUTE_KEY, useCalibrated ? lastCalibratedRouteKey : route.key);
+        state.putExtra(EXTRA_OUTPUT_ROUTE_NAME, useCalibrated ? lastCalibratedRouteName : route.label);
+        state.putExtra(EXTRA_OUTPUT_ROUTE_BLUETOOTH, useCalibrated || route.bluetooth);
+        state.putExtra(EXTRA_OUTPUT_VISUAL_DELAY_MS,
+                useCalibrated ? lastCalibratedDelayMs : route.visualDelayMs);
+        state.putExtra(EXTRA_OUTPUT_DELAY_CALIBRATING, outputDelayCalibrating);
     }
 
     private void publishVisualization(byte[] waveform, byte[] spectrum) {
@@ -869,9 +1073,17 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
     }
 
     private void startForegroundCompat() {
+        startForegroundCompat(false);
+    }
+
+    private void startForegroundCompat(boolean microphone) {
         Notification notification = buildNotification();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+            int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK;
+            if (microphone && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+            }
+            startForeground(NOTIFICATION_ID, notification, type);
         } else {
             startForeground(NOTIFICATION_ID, notification);
         }
@@ -915,7 +1127,7 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
                         playbackRequested ? "Pause" : "Play",
                         toggleIntent)
                 .addAction(android.R.drawable.ic_media_next, "Skip", skipIntent)
-                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopIntent)
+                .addAction(R.drawable.ic_stop, "Stop", stopIntent)
                 .setSubText(status)
                 .setStyle(style);
         return builder.build();

@@ -15,6 +15,7 @@ const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 const DATA_DIR = path.join(__dirname, 'data');
 const PROFILES_DIR = path.join(DATA_DIR, 'profiles');
 const VISUAL_DIR = path.join(DATA_DIR, 'visual');
+const ANDROID_VISUAL_DIR = path.join(DATA_DIR, 'android-visual');
 const APPLE_VISUAL_DIR = path.join(DATA_DIR, 'apple-visual');
 const PLAYLISTS_DIR = path.join(DATA_DIR, 'playlists');
 const PLAYLIST_NAME_RE = /^[^/\\]{1,100}$/;
@@ -27,6 +28,17 @@ const LIAM_ASK_TIMEOUT_MS = 550000;
 const AUDIO_EXTENSIONS = new Set([
   '.mp3', '.flac', '.m4a', '.wav', '.ogg', '.aac', '.wma', '.opus', '.alac',
 ]);
+
+// Both current Android devices use these settings. The 30-FPS legacy cache
+// remains available as a fallback; this second settings-keyed variant makes
+// true 60-FPS playback possible without asking a phone to analyze the track.
+const ANDROID_60_SETTINGS = Object.freeze({
+  fps: 60,
+  waveformMs: 90,
+  fftSize: 2048,
+  bars: 64,
+  logarithmic: true,
+});
 
 if (!MUSIC_DIR) {
   console.error('MUSIC_DIR is not set. Configure it in server/.env');
@@ -169,7 +181,7 @@ async function triggerAutoPrecompute() {
 
 async function runAutoPrecomputePass() {
   const inferred = await precomputeCache.inferAndroidSettings(VISUAL_DIR);
-  const options = {
+  const baseOptions = {
     musicDir: MUSIC_DIR,
     dataDir: DATA_DIR,
     platform: 'both',
@@ -191,13 +203,30 @@ async function runAutoPrecomputePass() {
     apple: { ...precomputeCache.DEFAULT_APPLE },
   };
   const tracks = await precomputeCache.walkAudioFiles(MUSIC_DIR, MUSIC_DIR);
-  const jobs = tracks.map((track) => precomputeCache.jobForTrack(track, options)).filter(Boolean);
-  if (jobs.length === 0) {
-    console.log('Auto-precompute: library cache is already up to date');
-    return;
+  const passes = [
+    { label: 'legacy/Apple/profile', options: baseOptions },
+    {
+      label: `Android ${precomputeCache.androidVariantKey(ANDROID_60_SETTINGS)}`,
+      options: {
+        ...baseOptions,
+        platform: 'android',
+        visualOnly: true,
+        androidVariant: true,
+        android: { ...ANDROID_60_SETTINGS },
+      },
+    },
+  ];
+  let totalJobs = 0;
+  for (const pass of passes) {
+    const jobs = tracks
+      .map((track) => precomputeCache.jobForTrack(track, pass.options))
+      .filter(Boolean);
+    totalJobs += jobs.length;
+    if (jobs.length === 0) continue;
+    console.log(`Auto-precompute (${pass.label}): ${jobs.length} track(s) need cache data`);
+    await precomputeCache.runJobs(jobs, pass.options);
   }
-  console.log(`Auto-precompute: ${jobs.length} track(s) need cache data, starting background pass`);
-  await precomputeCache.runJobs(jobs, options);
+  if (totalJobs === 0) console.log('Auto-precompute: library cache is already up to date');
 }
 
 libraryPromise.then(() => triggerAutoPrecompute());
@@ -369,6 +398,90 @@ app.put('/api/profile/*', express.json({ limit: '64kb' }), async (req, res) => {
     res.status(500).json({ error: 'write failed' });
   }
 });
+
+app.get('/api/android-visual/:variant/*', async (req, res) => {
+  const settings = precomputeCache.parseAndroidVariantKey(req.params.variant);
+  if (!settings) {
+    res.status(400).json({ error: 'invalid Android visual settings' });
+    return;
+  }
+  const variantDirectory = path.join(
+    ANDROID_VISUAL_DIR,
+    precomputeCache.androidVariantKey(settings),
+  );
+  const filePath = resolveWithin(variantDirectory, req.params[0] + '.fvz');
+  if (!filePath) {
+    res.status(400).json({ error: 'invalid path' });
+    return;
+  }
+  const variantHeader = precomputeCache.readAndroidHeader(filePath);
+  if (variantHeader
+      && variantHeader.fps === settings.fps
+      && variantHeader.bars === settings.bars) {
+    res.type('application/octet-stream').sendFile(filePath);
+    return;
+  }
+  // A settings-keyed 30-FPS request may reuse the original cache. Its v2
+  // header records the two playback-critical dimensions (FPS and bars), so
+  // only fall back when those values match the requested variant.
+  const legacyPath = resolveWithin(VISUAL_DIR, req.params[0] + '.fvz');
+  const legacyHeader = legacyPath && precomputeCache.readAndroidHeader(legacyPath);
+  if (legacyHeader
+      && legacyHeader.fps === settings.fps
+      && legacyHeader.bars === settings.bars) {
+    res.type('application/octet-stream').sendFile(legacyPath);
+    return;
+  }
+  res.status(404).json({ error: 'not found' });
+});
+
+app.put(
+  '/api/android-visual/:variant/*',
+  express.raw({ type: '*/*', limit: '20mb' }),
+  async (req, res) => {
+    const settings = precomputeCache.parseAndroidVariantKey(req.params.variant);
+    if (!settings) {
+      res.status(400).json({ error: 'invalid Android visual settings' });
+      return;
+    }
+    const variantDirectory = path.join(
+      ANDROID_VISUAL_DIR,
+      precomputeCache.androidVariantKey(settings),
+    );
+    const filePath = resolveWithin(variantDirectory, req.params[0] + '.fvz');
+    if (!filePath) {
+      res.status(400).json({ error: 'invalid path' });
+      return;
+    }
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      res.status(400).json({ error: 'expected raw bytes' });
+      return;
+    }
+    const existingHeader = precomputeCache.readAndroidHeader(filePath);
+    if (existingHeader
+        && existingHeader.fps === settings.fps
+        && existingHeader.bars === settings.bars) {
+      res.status(204).end();
+      return;
+    }
+    const tempPath = `${filePath}.upload-${crypto.randomBytes(8).toString('hex')}`;
+    try {
+      await fsp.mkdir(path.dirname(filePath), { recursive: true });
+      await fsp.writeFile(tempPath, req.body, { flag: 'wx' });
+      const header = precomputeCache.readAndroidHeader(tempPath);
+      if (!header || header.fps !== settings.fps || header.bars !== settings.bars) {
+        await fsp.unlink(tempPath).catch(() => {});
+        res.status(400).json({ error: 'cache header does not match requested settings' });
+        return;
+      }
+      await fsp.rename(tempPath, filePath);
+      res.status(204).end();
+    } catch (err) {
+      await fsp.unlink(tempPath).catch(() => {});
+      res.status(500).json({ error: 'write failed' });
+    }
+  },
+);
 
 app.get('/api/visual/*', async (req, res) => {
   const filePath = resolveWithin(VISUAL_DIR, req.params[0] + '.fvz');

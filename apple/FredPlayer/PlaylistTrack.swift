@@ -7,6 +7,7 @@ struct PlaylistTrack: Codable, Identifiable, Equatable {
     let title: String?
     let artist: String?
     let album: String?
+    let serverPath: String?
 
     init(
         id: UUID = UUID(),
@@ -14,7 +15,8 @@ struct PlaylistTrack: Codable, Identifiable, Equatable {
         bookmark: Data,
         title: String? = nil,
         artist: String? = nil,
-        album: String? = nil
+        album: String? = nil,
+        serverPath: String? = nil
     ) {
         self.id = id
         self.filename = filename
@@ -22,7 +24,10 @@ struct PlaylistTrack: Codable, Identifiable, Equatable {
         self.title = title
         self.artist = artist
         self.album = album
+        self.serverPath = serverPath
     }
+
+    var isRemote: Bool { serverPath != nil }
 
     var displayTitle: String { title?.nonEmpty ?? filename }
 

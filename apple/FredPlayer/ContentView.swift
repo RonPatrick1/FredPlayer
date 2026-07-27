@@ -5,16 +5,20 @@ import OSLog
 struct ContentView: View {
     @EnvironmentObject private var player: PlayerController
     @State private var isImporterPresented = false
+    @State private var isMusicSourcePresented = false
     @State private var isCopiedLibraryPresented = false
     @State private var isClearConfirmationPresented = false
+    @State private var isServerSettingsPresented = false
+    @State private var isServerLibraryPresented = false
+    @State private var isAskLiamPresented = false
+    @State private var isPlaylistManagerPresented = false
     private let logger = Logger(subsystem: "com.example.FredPlayer", category: "Import")
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 16) {
                 playlistContent
-                copiedLibraryButton
-                importButton
+                addMusicButton
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 PlayerPanel()
@@ -24,17 +28,48 @@ struct ContentView: View {
                 CopiedMusicPicker()
                     .environmentObject(player)
             }
+            .sheet(isPresented: $isServerSettingsPresented) {
+                ServerSettingsView().environmentObject(player)
+            }
+            .sheet(isPresented: $isServerLibraryPresented) {
+                ServerLibraryPicker().environmentObject(player)
+            }
+            .sheet(isPresented: $isAskLiamPresented) {
+                AskLiamView().environmentObject(player)
+            }
+            .sheet(isPresented: $isPlaylistManagerPresented) {
+                PlaylistManagerView().environmentObject(player)
+            }
             .navigationTitle("FredPlayer")
             .toolbar {
-                if !player.playlist.tracks.isEmpty {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Menu {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        isPlaylistManagerPresented = true
+                    } label: {
+                        Label(player.playlist.activePlaylistName, systemImage: "music.note.list")
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Button("Server Settings…", systemImage: "server.rack") {
+                            isServerSettingsPresented = true
+                        }
+                        Button("Browse Server Library…", systemImage: "music.note.house") {
+                            isServerLibraryPresented = true
+                        }
+                        .disabled(player.serverClient == nil)
+                        Button("Ask Liam…", systemImage: "bubble.left.and.text.bubble.right") {
+                            isAskLiamPresented = true
+                        }
+                        .disabled(player.serverClient == nil)
+                        if !player.playlist.tracks.isEmpty {
+                            Divider()
                             Button("Clear Playlist", role: .destructive) {
                                 isClearConfirmationPresented = true
                             }
-                        } label: {
-                            Image(systemName: "ellipsis.circle")
                         }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
                     }
                 }
             }
@@ -48,15 +83,44 @@ struct ContentView: View {
                     player.playlist.clearPlaylist()
                 }
             }
+            .confirmationDialog(
+                "Choose a music source",
+                isPresented: $isMusicSourcePresented,
+                titleVisibility: .visible
+            ) {
+                Button("FredPlayer Library", systemImage: "internaldrive") {
+                    player.playlist.scanCopiedMusic()
+                    isCopiedLibraryPresented = true
+                }
+                Button("Choose from Files", systemImage: "folder") {
+                    isImporterPresented = true
+                }
+                Button("Fred Server", systemImage: "server.rack") {
+                    isServerLibraryPresented = true
+                }
+                .disabled(player.serverClient == nil)
+                Button("Cancel", role: .cancel) {}
+            }
             .overlay {
-                if player.playlist.isAddingCopiedMusic {
+                if player.playlist.isAddingCopiedMusic || player.isLoadingRemoteTrack {
                     ZStack {
                         Color.black.opacity(0.2).ignoresSafeArea()
-                        ProgressView("Adding tracks…")
+                        ProgressView(player.isLoadingRemoteTrack ? "Downloading track…" : "Adding tracks…")
                             .padding()
                             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                     }
                 }
+            }
+            .alert(
+                "Playback Error",
+                isPresented: Binding(
+                    get: { player.playbackError != nil },
+                    set: { if !$0 { player.playbackError = nil } }
+                )
+            ) {
+                Button("OK") { player.playbackError = nil }
+            } message: {
+                Text(player.playbackError ?? "")
             }
             .alert(
                 "Playlist Updated",
@@ -120,20 +184,12 @@ struct ContentView: View {
         }
     }
 
-    private var importButton: some View {
-        Button("Import Audio Files", systemImage: "plus") {
-            isImporterPresented = true
+    private var addMusicButton: some View {
+        Button("Add Music", systemImage: "plus") {
+            isMusicSourcePresented = true
         }
         .buttonStyle(.borderedProminent)
         .padding(.bottom)
-    }
-
-    private var copiedLibraryButton: some View {
-        Button("Browse Copied Music", systemImage: "internaldrive") {
-            player.playlist.scanCopiedMusic()
-            isCopiedLibraryPresented = true
-        }
-        .buttonStyle(.bordered)
     }
 }
 
@@ -190,12 +246,24 @@ private struct CopiedMusicPicker: View {
                     }
                 }
             }
-            .navigationTitle("Copied Music")
+            .navigationTitle("FredPlayer Library")
+            .safeAreaInset(edge: .bottom) {
+                Button("Add \(selectedIDs.count) Tracks") {
+                    player.playlist.addCopiedMusic(ids: selectedIDs)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .frame(maxWidth: .infinity)
+                .disabled(selectedIDs.isEmpty)
+                .padding()
+                .background(.bar)
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                 }
-                ToolbarItemGroup(placement: .confirmationAction) {
+                ToolbarItem(placement: .confirmationAction) {
                     Button(selectedIDs.count == player.playlist.copiedLibrary.count ? "Deselect All" : "Select All") {
                         if selectedIDs.count == player.playlist.copiedLibrary.count {
                             selectedIDs.removeAll()
@@ -203,11 +271,6 @@ private struct CopiedMusicPicker: View {
                             selectedIDs = Set(player.playlist.copiedLibrary.map(\.id))
                         }
                     }
-                    Button("Add \(selectedIDs.count)") {
-                        player.playlist.addCopiedMusic(ids: selectedIDs)
-                        dismiss()
-                    }
-                    .disabled(selectedIDs.isEmpty)
                 }
             }
         }

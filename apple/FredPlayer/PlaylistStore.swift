@@ -3,15 +3,33 @@ import Combine
 import OSLog
 import AVFoundation
 
+struct MusicPlaylist: Codable, Identifiable, Equatable {
+    let id: UUID
+    var name: String
+    var tracks: [PlaylistTrack]
+}
+
+private struct PlaylistLibraryState: Codable {
+    let activePlaylistID: UUID
+    let playlists: [MusicPlaylist]
+}
+
 @MainActor
 final class PlaylistStore: ObservableObject {
     @Published private(set) var tracks: [PlaylistTrack] = []
+    @Published private(set) var playlists: [MusicPlaylist] = []
+    @Published private(set) var activePlaylistID = UUID()
     @Published private(set) var copiedLibrary: [LocalMusicFile] = []
     @Published private(set) var isAddingCopiedMusic = false
     @Published var operationMessage: String?
 
     private let logger = Logger(subsystem: "com.example.FredPlayer", category: "Playlist")
     private let defaultsKey = "playlist.v1"
+    private let libraryDefaultsKey = "playlist.library.v2"
+
+    var activePlaylistName: String {
+        playlists.first(where: { $0.id == activePlaylistID })?.name ?? "Playlist"
+    }
 
     init() {
         restore()
@@ -45,15 +63,14 @@ final class PlaylistStore: ObservableObject {
 
     func scanCopiedMusic() {
         let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let classicalURL = documentsURL.appendingPathComponent("Classical", isDirectory: true)
         let keys: [URLResourceKey] = [.isRegularFileKey]
 
         guard let enumerator = FileManager.default.enumerator(
-            at: classicalURL,
+            at: documentsURL,
             includingPropertiesForKeys: keys,
             options: [.skipsHiddenFiles]
         ) else {
-            logger.error("Copied music folder not found: \(classicalURL.path, privacy: .public)")
+            logger.error("FredPlayer documents folder could not be scanned: \(documentsURL.path, privacy: .public)")
             return
         }
 
@@ -109,6 +126,26 @@ final class PlaylistStore: ObservableObject {
         }
     }
 
+    @discardableResult
+    func addServerTracks(_ serverTracks: [ServerLibraryTrack]) -> Int {
+        var existingPaths = Set(tracks.compactMap(\.serverPath))
+        var added = 0
+        for track in serverTracks where !existingPaths.contains(track.path) {
+            tracks.append(PlaylistTrack(
+                filename: (track.path as NSString).lastPathComponent,
+                bookmark: Data(),
+                title: track.title,
+                artist: track.artist,
+                album: track.album,
+                serverPath: track.path
+            ))
+            existingPaths.insert(track.path)
+            added += 1
+        }
+        save()
+        return added
+    }
+
     private func performAddCopiedMusic(ids: Set<LocalMusicFile.ID>) -> Int {
         let existingPaths = Set(tracks.compactMap {
             resolveBookmark(for: $0, logSuccess: false)?.standardizedFileURL.path
@@ -145,6 +182,63 @@ final class PlaylistStore: ObservableObject {
         save()
     }
 
+    func selectPlaylist(id: MusicPlaylist.ID) {
+        guard id != activePlaylistID,
+              let playlist = playlists.first(where: { $0.id == id }) else { return }
+        activePlaylistID = id
+        tracks = playlist.tracks
+        save()
+    }
+
+    @discardableResult
+    func createPlaylist(name: String) -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !playlists.contains(where: { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }) else {
+            return false
+        }
+        let playlist = MusicPlaylist(id: UUID(), name: trimmed, tracks: [])
+        playlists.append(playlist)
+        activePlaylistID = playlist.id
+        tracks = []
+        save()
+        return true
+    }
+
+    func deletePlaylists(at offsets: IndexSet) {
+        let deletedIDs = Set(offsets.map { playlists[$0].id })
+        playlists.remove(atOffsets: offsets)
+        if playlists.isEmpty {
+            let replacement = MusicPlaylist(id: UUID(), name: "Playlist", tracks: [])
+            playlists = [replacement]
+        }
+        if deletedIDs.contains(activePlaylistID) {
+            activePlaylistID = playlists[0].id
+            tracks = playlists[0].tracks
+        }
+        save()
+    }
+
+    @discardableResult
+    func renamePlaylist(id: MusicPlaylist.ID, name: String) -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !playlists.contains(where: {
+                  $0.id != id && $0.name.caseInsensitiveCompare(trimmed) == .orderedSame
+              }),
+              let index = playlists.firstIndex(where: { $0.id == id }) else {
+            return false
+        }
+        playlists[index].name = trimmed
+        save()
+        return true
+    }
+
+    func deletePlaylist(id: MusicPlaylist.ID) {
+        guard let index = playlists.firstIndex(where: { $0.id == id }) else { return }
+        deletePlaylists(at: IndexSet(integer: index))
+    }
+
     func clearPlaylist() {
         tracks.removeAll()
         save()
@@ -152,7 +246,8 @@ final class PlaylistStore: ObservableObject {
     }
 
     func resolvedURL(for track: PlaylistTrack) -> URL? {
-        resolveBookmark(for: track, logSuccess: true)
+        guard !track.isRemote else { return nil }
+        return resolveBookmark(for: track, logSuccess: true)
     }
 
     private func resolveBookmark(for track: PlaylistTrack, logSuccess: Bool) -> URL? {
@@ -176,12 +271,30 @@ final class PlaylistStore: ObservableObject {
     }
 
     private func restore() {
+        if let data = UserDefaults.standard.data(forKey: libraryDefaultsKey),
+           let state = try? JSONDecoder().decode(PlaylistLibraryState.self, from: data),
+           !state.playlists.isEmpty {
+            playlists = state.playlists
+            activePlaylistID = state.playlists.contains(where: { $0.id == state.activePlaylistID })
+                ? state.activePlaylistID
+                : state.playlists[0].id
+            tracks = playlists.first(where: { $0.id == activePlaylistID })?.tracks ?? []
+            logger.info("Restored \(self.playlists.count) playlists")
+            return
+        }
         guard let data = UserDefaults.standard.data(forKey: defaultsKey) else {
+            let playlist = MusicPlaylist(id: UUID(), name: "Playlist", tracks: [])
+            playlists = [playlist]
+            activePlaylistID = playlist.id
             logger.info("No saved playlist found")
             return
         }
         do {
             tracks = try JSONDecoder().decode([PlaylistTrack].self, from: data)
+            let playlist = MusicPlaylist(id: UUID(), name: "Playlist", tracks: tracks)
+            playlists = [playlist]
+            activePlaylistID = playlist.id
+            save()
             logger.info("Restored playlist with \(self.tracks.count) tracks")
         } catch {
             logger.error("Playlist restore failed: \(error.localizedDescription, privacy: .public)")
@@ -190,7 +303,14 @@ final class PlaylistStore: ObservableObject {
 
     private func save() {
         do {
-            UserDefaults.standard.set(try JSONEncoder().encode(tracks), forKey: defaultsKey)
+            if let index = playlists.firstIndex(where: { $0.id == activePlaylistID }) {
+                playlists[index].tracks = tracks
+            }
+            let state = PlaylistLibraryState(
+                activePlaylistID: activePlaylistID,
+                playlists: playlists
+            )
+            UserDefaults.standard.set(try JSONEncoder().encode(state), forKey: libraryDefaultsKey)
         } catch {
             logger.error("Playlist save failed: \(error.localizedDescription, privacy: .public)")
         }
@@ -206,7 +326,8 @@ final class PlaylistStore: ObservableObject {
                 bookmark: bookmark,
                 title: track.title,
                 artist: track.artist,
-                album: track.album
+                album: track.album,
+                serverPath: track.serverPath
             )
             save()
         } catch {

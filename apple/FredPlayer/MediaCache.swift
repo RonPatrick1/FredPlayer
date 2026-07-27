@@ -54,6 +54,10 @@ enum MediaCache {
         read(LoudnessCacheEntry.self, from: loudnessURL(for: url))
     }
 
+    static func loudness(forServerPath path: String) -> LoudnessCacheEntry? {
+        read(LoudnessCacheEntry.self, from: loudnessURL(forKey: remoteKey(path)))
+    }
+
     /// Converts the shared `{rms, peak}` response from `/api/profile/*` into
     /// Apple's existing loudness model.
     static func serverLoudness(
@@ -89,6 +93,10 @@ enum MediaCache {
 
     static func visual(for url: URL, settings: VisualCacheSettings) -> VisualCacheEntry? {
         read(VisualCacheEntry.self, from: visualURL(for: url, settings: settings))
+    }
+
+    static func visual(forServerPath path: String, settings: VisualCacheSettings) -> VisualCacheEntry? {
+        read(VisualCacheEntry.self, from: visualURL(forKey: remoteKey(path), settings: settings))
     }
 
     /// Decodes the compact format returned by `/api/apple-visual/*`.
@@ -155,6 +163,38 @@ enum MediaCache {
         guard let entry = serverVisual(from: data, settings: settings) else { return false }
         try store(entry, for: url, settings: settings)
         return true
+    }
+
+    /// Encodes into the same compact `FAV1` format the server's own
+    /// precompute writer produces, so a locally-analyzed track can be shared
+    /// with this user's other Apple devices, not just re-read by this one.
+    static func encodeServerVisual(_ entry: VisualCacheEntry, settings: VisualCacheSettings) -> Data {
+        var writer = ServerVisualWriter()
+        writer.writeUInt32(serverVisualMagic)
+        writer.writeUInt32(serverVisualVersion)
+        writer.writeDouble(settings.fps)
+        writer.writeDouble(settings.waveformWindow * 1_000)
+        writer.writeUInt32(UInt32(settings.fftSize))
+        writer.writeUInt32(UInt32(serverVisualWaveformPoints))
+        writer.writeUInt32(UInt32(settings.bars))
+        writer.writeUInt32(settings.logarithmic ? 1 : 0)
+        writer.writeUInt32(UInt32(entry.frames.count))
+        writer.writeDouble(entry.frameInterval)
+        writer.writeDouble(entry.created.timeIntervalSince1970)
+        for frame in entry.frames {
+            for point in 0..<serverVisualWaveformPoints {
+                let sample = point < frame.waveform.count ? frame.waveform[point] : 0
+                let clamped = max(-1, min(1, sample))
+                let quantized = Int8(clamping: Int((clamped * 127).rounded()))
+                writer.writeByte(UInt8(bitPattern: quantized))
+            }
+            for bar in 0..<settings.bars {
+                let value = bar < frame.spectrum.count ? frame.spectrum[bar] : 0
+                let clamped = max(0, min(1, value))
+                writer.writeByte(UInt8(clamping: Int((clamped * 255).rounded())))
+            }
+        }
+        return writer.data
     }
 
     static func analyzeLoudness(url: URL, seconds: Double?) throws -> LoudnessCacheEntry {
@@ -250,12 +290,26 @@ enum MediaCache {
         prune(directory: loudnessDirectory, above: 5_000, keeping: 4_000)
     }
 
+    static func store(_ entry: LoudnessCacheEntry, forServerPath path: String) throws {
+        try write(entry, to: loudnessURL(forKey: remoteKey(path)))
+        prune(directory: loudnessDirectory, above: 5_000, keeping: 4_000)
+    }
+
     static func store(
         _ entry: VisualCacheEntry,
         for url: URL,
         settings: VisualCacheSettings
     ) throws {
         try write(entry, to: visualURL(for: url, settings: settings))
+        prune(directory: visualDirectory, above: 5_000, keeping: 4_500)
+    }
+
+    static func store(
+        _ entry: VisualCacheEntry,
+        forServerPath path: String,
+        settings: VisualCacheSettings
+    ) throws {
+        try write(entry, to: visualURL(forKey: remoteKey(path), settings: settings))
         prune(directory: visualDirectory, above: 5_000, keeping: 4_500)
     }
 
@@ -280,15 +334,29 @@ enum MediaCache {
     }
 
     private static func loudnessURL(for url: URL) -> URL {
-        loudnessDirectory.appendingPathComponent(fileIdentity(for: url) + ".cache")
+        loudnessURL(forKey: fileIdentity(for: url))
+    }
+
+    private static func loudnessURL(forKey key: String) -> URL {
+        loudnessDirectory.appendingPathComponent(key + ".cache")
     }
 
     private static func visualURL(for url: URL, settings: VisualCacheSettings) -> URL {
-        let raw = fileIdentity(for: url) + "|" + settings.identity
+        visualURL(forKey: fileIdentity(for: url), settings: settings)
+    }
+
+    private static func visualURL(forKey key: String, settings: VisualCacheSettings) -> URL {
+        let raw = key + "|" + settings.identity
         let key = SHA256.hash(data: Data(raw.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
         return visualDirectory.appendingPathComponent(key + ".cache")
+    }
+
+    private static func remoteKey(_ path: String) -> String {
+        SHA256.hash(data: Data("remote|\(path)".utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     private static func read<T: Decodable>(_ type: T.Type, from url: URL) -> T? {
@@ -358,6 +426,27 @@ private struct ServerVisualReader {
     mutating func readDouble() -> Double? {
         guard let high = readUInt32(), let low = readUInt32() else { return nil }
         return Double(bitPattern: UInt64(high) << 32 | UInt64(low))
+    }
+}
+
+private struct ServerVisualWriter {
+    var data = Data()
+
+    mutating func writeByte(_ byte: UInt8) {
+        data.append(byte)
+    }
+
+    mutating func writeUInt32(_ value: UInt32) {
+        writeByte(UInt8((value >> 24) & 0xff))
+        writeByte(UInt8((value >> 16) & 0xff))
+        writeByte(UInt8((value >> 8) & 0xff))
+        writeByte(UInt8(value & 0xff))
+    }
+
+    mutating func writeDouble(_ value: Double) {
+        let bits = value.bitPattern
+        writeUInt32(UInt32((bits >> 32) & 0xffff_ffff))
+        writeUInt32(UInt32(bits & 0xffff_ffff))
     }
 }
 

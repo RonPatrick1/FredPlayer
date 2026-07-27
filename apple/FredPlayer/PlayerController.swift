@@ -18,6 +18,11 @@ final class PlayerController: ObservableObject {
     @Published private(set) var cacheBytes: Int64 = 0
     @Published private(set) var cachePreparationProgress: Double?
     @Published private(set) var cachePreparationLabel = ""
+    @Published private(set) var isLoadingRemoteTrack = false
+    @Published var playbackError: String?
+    @Published var serverBaseURL = "" { didSet { saveSettings() } }
+    @Published var serverToken = "" { didSet { saveSettings() } }
+    @Published private(set) var deviceID = ""
     @Published var shuffleEnabled = true {
         didSet { saveSettings() }
     }
@@ -57,11 +62,11 @@ final class PlayerController: ObservableObject {
             saveSettings()
         }
     }
-    @Published var visualizationFPS = 24.0 { didSet { saveSettings() } }
+    @Published var visualizationFPS = 60.0 { didSet { saveSettings() } }
     @Published var waveformWindow = 0.08 { didSet { saveSettings() } }
-    @Published var fftSize = 1024 { didSet { saveSettings() } }
-    @Published var fftBarCount = 32 { didSet { saveSettings() } }
-    @Published var fftSmoothing: Float = 0.72 { didSet { saveSettings() } }
+    @Published var fftSize = 2048 { didSet { saveSettings() } }
+    @Published var fftBarCount = 64 { didSet { saveSettings() } }
+    @Published var fftSmoothing: Float = 0 { didSet { saveSettings() } }
     @Published var logarithmicFFT = true { didSet { saveSettings() } }
     @Published var startupScanSeconds = 10.0 { didSet { saveSettings() } }
 
@@ -71,6 +76,12 @@ final class PlayerController: ObservableObject {
         playlist.tracks.first { $0.id == currentTrackID }
     }
 
+    var serverClient: FredServerClient? {
+        let value = serverBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, let url = URL(string: value), url.scheme != nil else { return nil }
+        return FredServerClient(baseURL: url, token: serverToken)
+    }
+
     private let engine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
     private let logger = Logger(subsystem: "com.example.FredPlayer", category: "Playback")
@@ -78,6 +89,7 @@ final class PlayerController: ObservableObject {
     private var securityScopedURL: URL?
     private var didAccessSecurityScope = false
     private var playlistObservation: AnyCancellable?
+    private var audioSessionObservations = Set<AnyCancellable>()
     private var progressTimer: Timer?
     private var shuffleBag: [PlaylistTrack.ID] = []
     private var history: [PlaylistTrack.ID] = []
@@ -87,6 +99,10 @@ final class PlayerController: ObservableObject {
     private var currentLevelingGain: Float = 1
     private var currentVisualCache: VisualCacheEntry?
     private var cachePreparationTask: Task<Void, Never>?
+    private var playbackTask: Task<Void, Never>?
+    private var routeRecoveryTask: Task<Void, Never>?
+    private var shouldResumeAfterInterruption = false
+    private var playbackRequestID = UUID()
     private let settings = UserDefaults.standard
     private var isRestoringSettings = false
 
@@ -96,6 +112,8 @@ final class PlayerController: ObservableObject {
         engine.connect(playerNode, to: engine.mainMixerNode, format: nil)
         playerNode.volume = 1
         engine.mainMixerNode.outputVolume = outputLevel
+        configureAudioSession()
+        observeAudioSession()
         installVisualizationTap()
         engine.prepare()
         startProgressTimer()
@@ -113,6 +131,8 @@ final class PlayerController: ObservableObject {
 
     deinit {
         cachePreparationTask?.cancel()
+        playbackTask?.cancel()
+        routeRecoveryTask?.cancel()
         progressTimer?.invalidate()
         engine.mainMixerNode.removeTap(onBus: 0)
     }
@@ -149,6 +169,10 @@ final class PlayerController: ObservableObject {
     }
 
     func stop() {
+        playbackRequestID = UUID()
+        playbackTask?.cancel()
+        playbackTask = nil
+        isLoadingRemoteTrack = false
         playerNode.stop()
         audioFile = nil
         releaseSecurityScope()
@@ -202,41 +226,49 @@ final class PlayerController: ObservableObject {
 
     func prepareCaches() {
         guard cachePreparationTask == nil else { return }
-        let work = playlist.tracks.compactMap { track -> (String, URL)? in
-            guard let url = playlist.resolvedURL(for: track) else { return nil }
-            return (track.displayTitle, url)
-        }
+        let work = playlist.tracks
         guard !work.isEmpty else { return }
         let visualSettings = makeVisualCacheSettings()
         cachePreparationProgress = 0
         cachePreparationLabel = "Preparing caches…"
 
         cachePreparationTask = Task { [weak self] in
-            for (index, item) in work.enumerated() {
+            guard let self else { return }
+            for (index, track) in work.enumerated() {
                 guard !Task.isCancelled else { break }
-                cachePreparationLabel = "Preparing \(item.0)"
-                let url = item.1
-                await Task.detached(priority: .utility) {
-                    let accessed = url.startAccessingSecurityScopedResource()
-                    defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-                    if MediaCache.loudness(for: url) == nil,
-                       let entry = try? MediaCache.analyzeLoudness(url: url, seconds: nil) {
-                        try? MediaCache.store(entry, for: url)
+                self.cachePreparationLabel = "Preparing \(track.displayTitle)"
+                if let serverPath = track.serverPath, let client = self.serverClient {
+                    async let profile = client.fetchProfile(serverPath: serverPath)
+                    async let visualData = client.fetchVisual(serverPath: serverPath)
+                    if MediaCache.loudness(forServerPath: serverPath) == nil,
+                       let fetched = await profile {
+                        try? MediaCache.store(Self.loudnessEntry(from: fetched), forServerPath: serverPath)
                     }
-                    if MediaCache.visual(for: url, settings: visualSettings) == nil,
-                       let entry = try? MediaCache.analyzeVisuals(
-                        url: url,
-                        settings: visualSettings
-                       ) {
-                        try? MediaCache.store(entry, for: url, settings: visualSettings)
+                    if MediaCache.visual(forServerPath: serverPath, settings: visualSettings) == nil,
+                       let data = await visualData,
+                       let entry = MediaCache.serverVisual(from: data, settings: visualSettings) {
+                        try? MediaCache.store(entry, forServerPath: serverPath, settings: visualSettings)
                     }
-                }.value
-                cachePreparationProgress = Double(index + 1) / Double(work.count)
-                refreshCacheStatus()
+                } else if let url = self.playlist.resolvedURL(for: track) {
+                    await Task.detached(priority: .utility) {
+                        let accessed = url.startAccessingSecurityScopedResource()
+                        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                        if MediaCache.loudness(for: url) == nil,
+                           let entry = try? MediaCache.analyzeLoudness(url: url, seconds: nil) {
+                            try? MediaCache.store(entry, for: url)
+                        }
+                        if MediaCache.visual(for: url, settings: visualSettings) == nil,
+                           let entry = try? MediaCache.analyzeVisuals(url: url, settings: visualSettings) {
+                            try? MediaCache.store(entry, for: url, settings: visualSettings)
+                        }
+                    }.value
+                }
+                self.cachePreparationProgress = Double(index + 1) / Double(work.count)
+                self.refreshCacheStatus()
             }
-            cachePreparationProgress = nil
-            cachePreparationLabel = ""
-            cachePreparationTask = nil
+            self.cachePreparationProgress = nil
+            self.cachePreparationLabel = ""
+            self.cachePreparationTask = nil
         }
     }
 
@@ -267,25 +299,58 @@ final class PlayerController: ObservableObject {
     }
 
     private func play(trackID: PlaylistTrack.ID, recordHistory: Bool) {
-        guard
-            let track = playlist.tracks.first(where: { $0.id == trackID }),
-            let url = playlist.resolvedURL(for: track)
-        else { return }
-
+        guard let track = playlist.tracks.first(where: { $0.id == trackID }) else { return }
+        let requestID = UUID()
+        playbackRequestID = requestID
+        playbackTask?.cancel()
         playerNode.stop()
         releaseSecurityScope()
-        securityScopedURL = url
-        didAccessSecurityScope = url.startAccessingSecurityScopedResource()
+        isPlaying = false
+        isLoadingRemoteTrack = track.isRemote
+        playbackError = nil
+
+        playbackTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let prepared = try await preparePlayback(for: track)
+                try Task.checkCancellation()
+                beginPlayback(
+                    track: track,
+                    url: prepared.url,
+                    loudness: prepared.loudness,
+                    visual: prepared.visual,
+                    recordHistory: recordHistory
+                )
+            } catch is CancellationError {
+                // A newer play request or Stop superseded this one.
+            } catch {
+                playbackError = error.localizedDescription
+                logger.error("Playback preparation failed for \(track.filename, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+            if playbackRequestID == requestID {
+                isLoadingRemoteTrack = false
+                playbackTask = nil
+            }
+        }
+    }
+
+    private func beginPlayback(
+        track: PlaylistTrack,
+        url: URL,
+        loudness: LoudnessCacheEntry?,
+        visual: VisualCacheEntry?,
+        recordHistory: Bool
+    ) {
+        if !track.isRemote {
+            securityScopedURL = url
+            didAccessSecurityScope = url.startAccessingSecurityScopedResource()
+        }
 
         do {
             let file = try AVAudioFile(forReading: url)
             audioFile = file
-            let loudness = initialLoudness(for: url)
             currentLevelingGain = initialGain(for: loudness)
-            currentVisualCache = MediaCache.visual(
-                for: url,
-                settings: makeVisualCacheSettings()
-            )
+            currentVisualCache = visual
             duration = Double(file.length) / file.processingFormat.sampleRate
             currentTime = 0
             try startEngineIfNeeded()
@@ -314,9 +379,86 @@ final class PlayerController: ObservableObject {
         updateNowPlayingInfo()
     }
 
+    private func preparePlayback(
+        for track: PlaylistTrack
+    ) async throws -> (url: URL, loudness: LoudnessCacheEntry?, visual: VisualCacheEntry?) {
+        let visualSettings = makeVisualCacheSettings()
+        guard let serverPath = track.serverPath else {
+            guard let url = playlist.resolvedURL(for: track) else { throw CocoaError(.fileNoSuchFile) }
+            return (
+                url,
+                initialLoudness(for: url),
+                MediaCache.visual(for: url, settings: visualSettings)
+            )
+        }
+        guard let client = serverClient else { throw FredServerError.invalidBaseURL }
+
+        async let downloaded = RemoteTrackCache.download(serverPath: serverPath, client: client)
+        async let profile = remoteLoudness(serverPath: serverPath, client: client)
+        async let visual = remoteVisual(serverPath: serverPath, client: client, settings: visualSettings)
+        let url = try await downloaded
+        var loudness = await profile
+        var visualEntry = await visual
+
+        if loudness == nil {
+            loudness = await Task.detached(priority: .utility) {
+                try? MediaCache.analyzeLoudness(url: url, seconds: nil)
+            }.value
+            if let loudness {
+                try? MediaCache.store(loudness, forServerPath: serverPath)
+                let wire = Self.profile(from: loudness)
+                Task { _ = await client.uploadProfile(wire, serverPath: serverPath) }
+            }
+        }
+        if visualEntry == nil {
+            visualEntry = await Task.detached(priority: .utility) {
+                try? MediaCache.analyzeVisuals(url: url, settings: visualSettings)
+            }.value
+            if let visualEntry {
+                try? MediaCache.store(visualEntry, forServerPath: serverPath, settings: visualSettings)
+                let data = MediaCache.encodeServerVisual(visualEntry, settings: visualSettings)
+                Task { _ = await client.uploadVisual(data, serverPath: serverPath) }
+            }
+        }
+        refreshCacheStatus()
+        return (url, loudness, visualEntry)
+    }
+
+    private func remoteLoudness(serverPath: String, client: FredServerClient) async -> LoudnessCacheEntry? {
+        if let cached = MediaCache.loudness(forServerPath: serverPath) { return cached }
+        guard let profile = await client.fetchProfile(serverPath: serverPath) else { return nil }
+        let entry = Self.loudnessEntry(from: profile)
+        try? MediaCache.store(entry, forServerPath: serverPath)
+        return entry
+    }
+
+    private func remoteVisual(
+        serverPath: String,
+        client: FredServerClient,
+        settings: VisualCacheSettings
+    ) async -> VisualCacheEntry? {
+        if let cached = MediaCache.visual(forServerPath: serverPath, settings: settings) { return cached }
+        guard let data = await client.fetchVisual(serverPath: serverPath),
+              let entry = MediaCache.serverVisual(from: data, settings: settings) else { return nil }
+        try? MediaCache.store(entry, forServerPath: serverPath, settings: settings)
+        return entry
+    }
+
+    static func profile(from entry: LoudnessCacheEntry) -> TrackProfile {
+        TrackProfile(rms: pow(10, entry.meanDB / 20), peak: entry.peak)
+    }
+
+    static func loudnessEntry(from profile: TrackProfile) -> LoudnessCacheEntry {
+        LoudnessCacheEntry(
+            meanDB: 20 * log10(max(profile.rms, 0.000_001)),
+            peak: profile.peak,
+            analyzedSeconds: 0,
+            created: Date()
+        )
+    }
+
     private func startEngineIfNeeded() throws {
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playback, mode: .default)
         try session.setActive(true)
         if !engine.isRunning { try engine.start() }
         let outputs = session.currentRoute.outputs
@@ -351,7 +493,6 @@ final class PlayerController: ObservableObject {
                     self.waveform = cache.frames[index].waveform
                     self.spectrum = cache.frames[index].spectrum
                 }
-                self.updateNowPlayingInfo()
             }
         }
     }
@@ -359,55 +500,153 @@ final class PlayerController: ObservableObject {
     private func configureRemoteCommands() {
         let commandCenter = MPRemoteCommandCenter.shared()
 
+        commandCenter.playCommand.isEnabled = true
         commandCenter.playCommand.addTarget { [weak self] _ in
-            guard let self else { return .commandFailed }
-            if !self.isPlaying { self.togglePlayback() }
+            guard self != nil else { return .commandFailed }
+            Task { @MainActor [weak self] in
+                guard let self, !self.isPlaying else { return }
+                self.togglePlayback()
+            }
             return .success
         }
+        commandCenter.pauseCommand.isEnabled = true
         commandCenter.pauseCommand.addTarget { [weak self] _ in
-            guard let self else { return .commandFailed }
-            if self.isPlaying { self.togglePlayback() }
+            guard self != nil else { return .commandFailed }
+            Task { @MainActor [weak self] in
+                guard let self, self.isPlaying else { return }
+                self.togglePlayback()
+            }
             return .success
         }
+        commandCenter.togglePlayPauseCommand.isEnabled = true
         commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
-            guard let self else { return .commandFailed }
-            self.togglePlayback()
+            guard self != nil else { return .commandFailed }
+            Task { @MainActor [weak self] in self?.togglePlayback() }
             return .success
         }
+        commandCenter.nextTrackCommand.isEnabled = true
         commandCenter.nextTrackCommand.addTarget { [weak self] _ in
-            guard let self else { return .commandFailed }
-            self.next()
+            guard self != nil else { return .commandFailed }
+            Task { @MainActor [weak self] in self?.next() }
             return .success
         }
+        commandCenter.previousTrackCommand.isEnabled = true
         commandCenter.previousTrackCommand.addTarget { [weak self] _ in
-            guard let self else { return .commandFailed }
-            self.previous()
+            guard self != nil else { return .commandFailed }
+            Task { @MainActor [weak self] in self?.previous() }
             return .success
         }
+        commandCenter.changePlaybackPositionCommand.isEnabled = true
         commandCenter.changePlaybackPositionCommand.addTarget { [weak self] event in
-            guard let self, let event = event as? MPChangePlaybackPositionCommandEvent else {
+            guard self != nil, let event = event as? MPChangePlaybackPositionCommandEvent else {
                 return .commandFailed
             }
-            self.seek(to: event.positionTime)
+            Task { @MainActor [weak self] in self?.seek(to: event.positionTime) }
             return .success
         }
+
+        commandCenter.skipForwardCommand.isEnabled = false
+        commandCenter.skipBackwardCommand.isEnabled = false
+        commandCenter.seekForwardCommand.isEnabled = false
+        commandCenter.seekBackwardCommand.isEnabled = false
+        commandCenter.changePlaybackRateCommand.isEnabled = false
+        commandCenter.likeCommand.isEnabled = false
+        commandCenter.dislikeCommand.isEnabled = false
+        commandCenter.bookmarkCommand.isEnabled = false
     }
 
     private func updateNowPlayingInfo() {
-        guard currentTrackID != nil else {
+        guard let currentTrackID, let track = currentTrack else {
             MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
             return
         }
         var info: [String: Any] = [
+            MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
+            MPNowPlayingInfoPropertyExternalContentIdentifier: currentTrackID.uuidString,
             MPMediaItemPropertyPlaybackDuration: duration,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: currentTime,
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
-            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
+            MPNowPlayingInfoPropertyPlaybackQueueCount: playlist.tracks.count
         ]
-        info[MPMediaItemPropertyTitle] = currentTrack?.displayTitle
-        info[MPMediaItemPropertyArtist] = currentTrack?.artist
-        info[MPMediaItemPropertyAlbumTitle] = currentTrack?.album
+        if let index = playlist.tracks.firstIndex(where: { $0.id == currentTrackID }) {
+            info[MPNowPlayingInfoPropertyPlaybackQueueIndex] = index
+        }
+        info[MPMediaItemPropertyTitle] = track.displayTitle
+        info[MPMediaItemPropertyArtist] = track.artist
+        info[MPMediaItemPropertyAlbumTitle] = track.album
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    private func configureAudioSession() {
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+        } catch {
+            logger.error("Audio session configuration failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func observeAudioSession() {
+        NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in
+                guard let reasonValue = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                      let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else { return }
+                switch reason {
+                case .newDeviceAvailable, .routeConfigurationChange, .categoryChange, .override:
+                    self?.scheduleRouteRecovery()
+                default:
+                    break
+                }
+            }
+            .store(in: &audioSessionObservations)
+
+        NotificationCenter.default.publisher(for: .AVAudioEngineConfigurationChange, object: engine)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.scheduleRouteRecovery() }
+            .store(in: &audioSessionObservations)
+
+        NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in self?.handleAudioInterruption(notification) }
+            .store(in: &audioSessionObservations)
+    }
+
+    private func scheduleRouteRecovery() {
+        guard isPlaying, audioFile != nil else { return }
+        routeRecoveryTask?.cancel()
+        let resumeTime = currentTime
+        routeRecoveryTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled, let self, self.isPlaying else { return }
+            self.seek(to: resumeTime)
+            self.logger.info("Playback recovered after audio route change")
+        }
+    }
+
+    private func handleAudioInterruption(_ notification: Notification) {
+        guard let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue) else { return }
+        switch type {
+        case .began:
+            shouldResumeAfterInterruption = isPlaying
+            if isPlaying {
+                playerNode.pause()
+                isPlaying = false
+                updateNowPlayingInfo()
+            }
+        case .ended:
+            let optionsValue = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+            guard shouldResumeAfterInterruption, options.contains(.shouldResume) else {
+                shouldResumeAfterInterruption = false
+                return
+            }
+            shouldResumeAfterInterruption = false
+            togglePlayback()
+        @unknown default:
+            break
+        }
     }
 
     private func updateDynamics() {
@@ -545,13 +784,15 @@ final class PlayerController: ObservableObject {
             "player.attackTime": 0.02,
             "player.releaseTime": 0.5,
             "player.outputCeiling": -1.0,
-            "player.visualizationFPS": 24.0,
+            "player.visualizationFPS": 60.0,
             "player.waveformWindow": 0.08,
-            "player.fftSize": 1024,
-            "player.fftBarCount": 32,
-            "player.fftSmoothing": 0.72,
+            "player.fftSize": 2048,
+            "player.fftBarCount": 64,
+            "player.fftSmoothing": 0.0,
             "player.logarithmicFFT": true,
-            "player.startupScanSeconds": 10.0
+            "player.startupScanSeconds": 10.0,
+            "server.baseURL": "",
+            "server.token": ""
         ])
         shuffleEnabled = settings.bool(forKey: "player.shuffleEnabled")
         outputLevel = settings.float(forKey: "player.outputLevel")
@@ -567,6 +808,15 @@ final class PlayerController: ObservableObject {
         fftSmoothing = settings.float(forKey: "player.fftSmoothing")
         logarithmicFFT = settings.bool(forKey: "player.logarithmicFFT")
         startupScanSeconds = settings.double(forKey: "player.startupScanSeconds")
+        serverBaseURL = settings.string(forKey: "server.baseURL") ?? ""
+        serverToken = settings.string(forKey: "server.token") ?? ""
+        if let savedID = settings.string(forKey: "server.deviceID"), !savedID.isEmpty {
+            deviceID = savedID.replacingOccurrences(of: "-", with: "").lowercased()
+            settings.set(deviceID, forKey: "server.deviceID")
+        } else {
+            deviceID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+            settings.set(deviceID, forKey: "server.deviceID")
+        }
     }
 
     private func saveSettings() {
@@ -585,5 +835,8 @@ final class PlayerController: ObservableObject {
         settings.set(fftSmoothing, forKey: "player.fftSmoothing")
         settings.set(logarithmicFFT, forKey: "player.logarithmicFFT")
         settings.set(startupScanSeconds, forKey: "player.startupScanSeconds")
+        settings.set(serverBaseURL, forKey: "server.baseURL")
+        settings.set(serverToken, forKey: "server.token")
+        settings.set(deviceID, forKey: "server.deviceID")
     }
 }

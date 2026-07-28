@@ -1089,6 +1089,10 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         clear.connect("clicked", lambda _button: self._clear_playlist())
         library_buttons.pack_start(clear, False, False, 0)
 
+        shared_playlists = Gtk.Button(label="Shared playlists")
+        shared_playlists.connect("clicked", lambda _button: self._open_shared_playlists())
+        playlist_panel.pack_start(shared_playlists, False, False, 0)
+
         self.shuffle_toggle = Gtk.CheckButton(label="Shuffle playback")
         self.shuffle_toggle.set_active(self.shuffle_enabled)
         self.shuffle_toggle.connect("toggled", self._on_shuffle_toggled)
@@ -1533,7 +1537,9 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
             buttons=Gtk.ButtonsType.CANCEL,
             text=f'Delete playlist "{name}"?',
         )
-        dialog.format_secondary_text("The audio files will remain on disk.")
+        dialog.format_secondary_text(
+            "The audio files and any shared server copy will remain. Only this device copy is deleted."
+        )
         dialog.add_button("Delete", Gtk.ResponseType.OK)
         try:
             if dialog.run() != Gtk.ResponseType.OK:
@@ -1868,6 +1874,170 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
 
         entries = [self._playlist_entry_from_track(tracks[index], base_url) for index in selected_indices]
         self._merge_playlist_entries(entries, f"Added {len(entries)} songs from server")
+
+    def _open_shared_playlists(self) -> None:
+        if not self.server_base_url:
+            self._set_state('Set up a server URL first via "Add from server"')
+            return
+        self._set_state("Fetching shared playlists…")
+        threading.Thread(
+            target=self._fetch_shared_playlists_worker,
+            name="FredPlayerSharedPlaylists",
+            daemon=True,
+        ).start()
+
+    def _fetch_shared_playlists_worker(self) -> None:
+        try:
+            summaries = remote.fetch_playlists(self.server_base_url, self.server_token)
+            library = remote.fetch_library(self.server_base_url, self.server_token)
+        except Exception as error:
+            GLib.idle_add(self._on_remote_error, str(error))
+            return
+        GLib.idle_add(self._show_shared_playlists, summaries, library)
+
+    def _show_shared_playlists(self, summaries: list[dict], library: list[dict]) -> bool:
+        dialog = Gtk.Dialog(
+            title="Shared playlists",
+            transient_for=self,
+            flags=Gtk.DialogFlags.MODAL,
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            "Share current", Gtk.ResponseType.APPLY,
+            "Download", Gtk.ResponseType.OK,
+        )
+        content = dialog.get_content_area()
+        content.set_spacing(8)
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+
+        if summaries:
+            content.add(Gtk.Label(
+                label="Choose a server playlist to download as a local copy.",
+                xalign=0.0,
+            ))
+            selector = Gtk.ComboBoxText()
+            for summary in summaries:
+                name = str(summary.get("name", ""))
+                count = int(summary.get("count", 0))
+                selector.append(name, f"{name}  •  {count} {'song' if count == 1 else 'songs'}")
+            selector.set_active(0)
+            content.add(selector)
+        else:
+            selector = None
+            content.add(Gtk.Label(
+                label="No playlists have been shared yet. Share the current playlist to publish a server copy.",
+                xalign=0.0,
+                wrap=True,
+            ))
+            dialog.set_response_sensitive(Gtk.ResponseType.OK, False)
+
+        note = Gtk.Label(
+            label="Deleting a downloaded playlist only removes the device copy; the shared server copy remains.",
+            xalign=0.0,
+            wrap=True,
+        )
+        note.get_style_context().add_class("muted")
+        content.add(note)
+        dialog.show_all()
+        try:
+            response = dialog.run()
+            selected_name = selector.get_active_id() if selector is not None else None
+        finally:
+            dialog.destroy()
+
+        if response == Gtk.ResponseType.APPLY:
+            self._confirm_share_current_playlist(summaries)
+        elif response == Gtk.ResponseType.OK and selected_name:
+            self._download_shared_playlist(selected_name, library)
+        return False
+
+    def _confirm_share_current_playlist(self, summaries: list[dict]) -> None:
+        if not self.playlist:
+            self._set_state("Add songs before sharing this playlist")
+            return
+        paths = [remote.server_path(self.server_base_url, entry.path) for entry in self.playlist]
+        if any(path is None for path in paths):
+            self._set_state(
+                "Every song must come from this Fred Server; local files and songs from another server cannot be shared"
+            )
+            return
+
+        replaces_existing = any(
+            str(summary.get("name", "")).casefold() == self.active_playlist_name.casefold()
+            for summary in summaries
+        )
+        if replaces_existing:
+            dialog = Gtk.MessageDialog(
+                transient_for=self,
+                flags=Gtk.DialogFlags.MODAL,
+                message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.CANCEL,
+                text=f'Update shared playlist "{self.active_playlist_name}"?',
+            )
+            dialog.format_secondary_text("This replaces the existing server copy with the current playlist.")
+            dialog.add_button("Update shared copy", Gtk.ResponseType.OK)
+            try:
+                if dialog.run() != Gtk.ResponseType.OK:
+                    return
+            finally:
+                dialog.destroy()
+        self._share_current_playlist([path for path in paths if path is not None])
+
+    def _share_current_playlist(self, paths: list[str]) -> None:
+        name = self.active_playlist_name
+        self._set_state(f'Sharing playlist "{name}"…')
+        threading.Thread(
+            target=self._share_playlist_worker,
+            args=(name, paths),
+            name="FredPlayerSharePlaylist",
+            daemon=True,
+        ).start()
+
+    def _share_playlist_worker(self, name: str, paths: list[str]) -> None:
+        try:
+            remote.share_playlist(self.server_base_url, self.server_token, name, paths)
+        except Exception as error:
+            GLib.idle_add(self._on_remote_error, str(error))
+            return
+        GLib.idle_add(
+            self._set_state,
+            f'Shared "{name}". Other devices can download it; deleting this copy will not remove it from the server.',
+        )
+
+    def _download_shared_playlist(self, name: str, library: list[dict]) -> None:
+        self._set_state(f'Downloading shared playlist "{name}"…')
+        threading.Thread(
+            target=self._download_shared_playlist_worker,
+            args=(name, library),
+            name="FredPlayerDownloadPlaylist",
+            daemon=True,
+        ).start()
+
+    def _download_shared_playlist_worker(self, name: str, library: list[dict]) -> None:
+        try:
+            paths = remote.fetch_playlist_tracks(self.server_base_url, self.server_token, name)
+            library_by_path = {str(track.get("path", "")): track for track in library}
+            tracks = [library_by_path[path] for path in paths if path in library_by_path]
+            if not tracks or len(tracks) != len(paths):
+                raise IOError("the shared copy contains songs that are no longer in the server library")
+        except Exception as error:
+            GLib.idle_add(self._on_remote_error, str(error))
+            return
+        GLib.idle_add(self._install_shared_playlist, name, tracks)
+
+    def _install_shared_playlist(self, name: str, tracks: list[dict]) -> bool:
+        local_name = self._unique_playlist_name(name)
+        entries = [self._playlist_entry_from_track(track, self.server_base_url) for track in tracks]
+        self._sync_active_playlist()
+        self.named_playlists[local_name] = entries
+        self._switch_playlist(
+            local_name,
+            f'Saved "{local_name}" locally. Changes and deletion will not affect the shared server copy.',
+        )
+        return False
 
     def _open_ask_liam_dialog(self) -> None:
         if not self.server_base_url:

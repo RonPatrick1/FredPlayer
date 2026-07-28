@@ -31,6 +31,12 @@ final class PlaylistStore: ObservableObject {
         playlists.first(where: { $0.id == activePlaylistID })?.name ?? "Playlist"
     }
 
+    var activeServerPaths: [String]? {
+        guard !tracks.isEmpty else { return nil }
+        let paths = tracks.compactMap(\.serverPath)
+        return paths.count == tracks.count ? paths : nil
+    }
+
     init() {
         restore()
     }
@@ -144,6 +150,42 @@ final class PlaylistStore: ObservableObject {
         }
         save()
         return added
+    }
+
+    @discardableResult
+    func installSharedPlaylist(name: String, serverTracks: [ServerLibraryTrack]) -> String {
+        let localName = uniquePlaylistName(name)
+        let localTracks = serverTracks.map {
+            PlaylistTrack(
+                filename: ($0.path as NSString).lastPathComponent,
+                bookmark: Data(),
+                title: $0.title,
+                artist: $0.artist,
+                album: $0.album,
+                serverPath: $0.path
+            )
+        }
+        let playlist = MusicPlaylist(id: UUID(), name: localName, tracks: localTracks)
+        playlists.append(playlist)
+        activePlaylistID = playlist.id
+        tracks = localTracks
+        save()
+        return localName
+    }
+
+    private func uniquePlaylistName(_ requestedName: String) -> String {
+        let trimmed = requestedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = trimmed.isEmpty ? "Shared Playlist" : trimmed
+        if !playlists.contains(where: { $0.name.caseInsensitiveCompare(base) == .orderedSame }) {
+            return base
+        }
+        for suffix in 2..<1_000 {
+            let candidate = "\(base) (\(suffix))"
+            if !playlists.contains(where: { $0.name.caseInsensitiveCompare(candidate) == .orderedSame }) {
+                return candidate
+            }
+        }
+        return "\(base) (\(UUID().uuidString.prefix(8)))"
     }
 
     private func performAddCopiedMusic(ids: Set<LocalMusicFile.ID>) -> Int {

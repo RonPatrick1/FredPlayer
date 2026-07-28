@@ -472,6 +472,195 @@ public class MainActivity extends Activity {
         return metadata;
     }
 
+    private void openSharedPlaylists() {
+        String baseUrl = PlaylistStore.loadServerBaseUrl(this);
+        String token = PlaylistStore.loadServerToken(this);
+        if (baseUrl.isEmpty()) {
+            Toast.makeText(
+                    this,
+                    "Set up the Fred Server first with Add from server",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        Toast.makeText(this, "Fetching shared playlists…", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            try {
+                JSONArray summaries = RemoteLibraryClient.fetchPlaylists(baseUrl, token);
+                JSONArray library = RemoteLibraryClient.fetchLibrary(baseUrl, token);
+                PlaylistStore.saveTrackMetadata(this, serverMetadata(library, baseUrl));
+                runOnUiThread(() -> showSharedPlaylists(summaries, library, baseUrl, token));
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(
+                        this,
+                        "Could not load shared playlists: " + e.getMessage(),
+                        Toast.LENGTH_LONG).show());
+            }
+        }, "FredPlayerSharedPlaylists").start();
+    }
+
+    private void showSharedPlaylists(
+            JSONArray summaries,
+            JSONArray library,
+            String baseUrl,
+            String token) {
+        String[] labels = new String[summaries.length()];
+        for (int i = 0; i < summaries.length(); i++) {
+            JSONObject summary = summaries.optJSONObject(i);
+            String name = summary == null ? "" : summary.optString("name", "");
+            int count = summary == null ? 0 : summary.optInt("count", 0);
+            labels[i] = name + "  •  " + count + (count == 1 ? " song" : " songs");
+        }
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+                .setTitle("Shared playlists")
+                .setPositiveButton("Share current", (dialog, which) ->
+                        confirmShareCurrentPlaylist(summaries, baseUrl, token))
+                .setNegativeButton("Close", null);
+        if (labels.length == 0) {
+            builder.setMessage("No playlists have been shared yet. Share the current playlist to publish a server copy.");
+        } else {
+            builder.setItems(labels, (dialog, which) -> {
+                JSONObject summary = summaries.optJSONObject(which);
+                if (summary != null) {
+                    downloadSharedPlaylist(summary.optString("name", ""), library, baseUrl, token);
+                }
+            });
+        }
+        builder.show();
+    }
+
+    private void confirmShareCurrentPlaylist(JSONArray summaries, String baseUrl, String token) {
+        persistActivePlaylist();
+        if (playlist.isEmpty()) {
+            Toast.makeText(this, "Add songs before sharing this playlist", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        JSONArray serverPaths = new JSONArray();
+        for (String item : playlist) {
+            String path = RemoteLibraryClient.serverPath(baseUrl, item);
+            if (path == null) {
+                new AlertDialog.Builder(this)
+                        .setTitle("Can’t share this playlist")
+                        .setMessage("Every song must come from this Fred Server. Local files and songs from another server cannot be played by the other devices.")
+                        .setPositiveButton("OK", null)
+                        .show();
+                return;
+            }
+            serverPaths.put(path);
+        }
+
+        boolean replacesExisting = false;
+        for (int i = 0; i < summaries.length(); i++) {
+            JSONObject summary = summaries.optJSONObject(i);
+            if (summary != null
+                    && activePlaylistName.equalsIgnoreCase(summary.optString("name", ""))) {
+                replacesExisting = true;
+                break;
+            }
+        }
+        if (!replacesExisting) {
+            shareCurrentPlaylist(baseUrl, token, serverPaths);
+            return;
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("Update shared playlist?")
+                .setMessage("Replace the server copy of \"" + activePlaylistName + "\" with the current "
+                        + playlist.size() + (playlist.size() == 1 ? " song?" : " songs?"))
+                .setPositiveButton("Update", (dialog, which) ->
+                        shareCurrentPlaylist(baseUrl, token, serverPaths))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void shareCurrentPlaylist(String baseUrl, String token, JSONArray serverPaths) {
+        String name = activePlaylistName;
+        Toast.makeText(this, "Sharing " + name + "…", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            try {
+                RemoteLibraryClient.sharePlaylist(baseUrl, token, name, serverPaths);
+                runOnUiThread(() -> new AlertDialog.Builder(this)
+                        .setTitle("Playlist shared")
+                        .setMessage("\"" + name + "\" is on the server for other devices to download. Deleting this device’s copy will not remove the server copy.")
+                        .setPositiveButton("OK", null)
+                        .show());
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(
+                        this,
+                        "Could not share playlist: " + e.getMessage(),
+                        Toast.LENGTH_LONG).show());
+            }
+        }, "FredPlayerSharePlaylist").start();
+    }
+
+    private void downloadSharedPlaylist(
+            String name,
+            JSONArray library,
+            String baseUrl,
+            String token) {
+        if (name.isEmpty()) {
+            return;
+        }
+        Toast.makeText(this, "Downloading " + name + "…", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            try {
+                JSONArray paths = RemoteLibraryClient.fetchPlaylistTracks(baseUrl, token, name);
+                Map<String, JSONObject> libraryByPath = new HashMap<>();
+                for (int i = 0; i < library.length(); i++) {
+                    JSONObject track = library.optJSONObject(i);
+                    if (track != null) {
+                        libraryByPath.put(track.optString("path", ""), track);
+                    }
+                }
+                ArrayList<String> urls = new ArrayList<>();
+                Map<String, String[]> metadata = new HashMap<>();
+                for (int i = 0; i < paths.length(); i++) {
+                    String path = paths.optString(i, "");
+                    if (path.isEmpty()) {
+                        continue;
+                    }
+                    String url = RemoteLibraryClient.buildStreamUrl(baseUrl, path);
+                    urls.add(url);
+                    JSONObject track = libraryByPath.get(path);
+                    if (track != null) {
+                        metadata.put(url, new String[]{
+                                track.optString("title", ""),
+                                track.optString("artist", ""),
+                                track.optString("album", ""),
+                        });
+                    }
+                }
+                PlaylistStore.saveTrackMetadata(this, metadata);
+                runOnUiThread(() -> installSharedPlaylist(name, urls));
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(
+                        this,
+                        "Could not download playlist: " + e.getMessage(),
+                        Toast.LENGTH_LONG).show());
+            }
+        }, "FredPlayerDownloadPlaylist").start();
+    }
+
+    private void installSharedPlaylist(String sharedName, ArrayList<String> urls) {
+        if (urls.isEmpty()) {
+            Toast.makeText(this, "That shared playlist has no playable songs", Toast.LENGTH_LONG).show();
+            return;
+        }
+        String localName = uniquePlaylistName(sharedName);
+        persistActivePlaylist();
+        playlists.put(localName, new ArrayList<>(urls));
+        PlaylistStore.savePlaylists(this, playlists);
+        switchPlaylist(localName);
+        updatePlaylistEditor();
+        new AlertDialog.Builder(this)
+                .setTitle("Playlist downloaded")
+                .setMessage("Saved \"" + localName + "\" on this device. You can change or delete it without changing the shared server copy.")
+                .setPositiveButton("OK", null)
+                .show();
+    }
+
     private void refreshRemoteMetadataIfNeeded() {
         if (metadataRefreshStarted) {
             return;
@@ -873,6 +1062,10 @@ public class MainActivity extends Activity {
         Button addFromServerButton = button("Add from server");
         addFromServerButton.setOnClickListener(view -> openServerLibraryDialog());
         root.addView(addFromServerButton, topMargin(10));
+
+        Button sharedPlaylistsButton = button("Shared playlists");
+        sharedPlaylistsButton.setOnClickListener(view -> openSharedPlaylists());
+        root.addView(sharedPlaylistsButton, topMargin(10));
 
         Button askLiamButton = button("Ask Liam");
         askLiamButton.setOnClickListener(view -> openAskLiamDialog());
@@ -1399,7 +1592,7 @@ public class MainActivity extends Activity {
         }
         new AlertDialog.Builder(this)
                 .setTitle("Delete " + activePlaylistName + "?")
-                .setMessage("The playlist will be removed. Your audio files will stay on this device.")
+                .setMessage("The playlist will be removed from this device. Its audio files and any shared server copy will stay.")
                 .setPositiveButton("Delete", (dialog, which) -> {
                     playlists.remove(activePlaylistName);
                     activePlaylistName = playlists.keySet().iterator().next();

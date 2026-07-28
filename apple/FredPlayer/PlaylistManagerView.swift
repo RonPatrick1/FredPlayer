@@ -126,8 +126,162 @@ struct PlaylistManagerView: View {
                 }
                 Button("Cancel", role: .cancel) { playlistToDelete = nil }
             } message: {
-                Text("The playlist will be deleted. Its audio files will not be removed.")
+                Text("The playlist will be deleted from this device. Its audio files and any shared server copy will not be removed.")
             }
         }
+    }
+}
+
+struct SharedPlaylistsView: View {
+    @EnvironmentObject private var player: PlayerController
+    @Environment(\.dismiss) private var dismiss
+    @State private var summaries: [SharedPlaylistSummary] = []
+    @State private var isLoading = true
+    @State private var isWorking = false
+    @State private var message: String?
+    @State private var confirmingUpdate = false
+
+    private var currentNameExists: Bool {
+        summaries.contains {
+            $0.name.caseInsensitiveCompare(player.playlist.activePlaylistName) == .orderedSame
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Button {
+                        requestShare()
+                    } label: {
+                        Label("Share Current Playlist", systemImage: "square.and.arrow.up")
+                    }
+                    .disabled(isWorking || player.playlist.tracks.isEmpty)
+                } footer: {
+                    Text("Sharing publishes a server copy. Deleting a playlist from a device never deletes that shared copy.")
+                }
+
+                Section("On Fred Server") {
+                    if isLoading {
+                        ProgressView("Loading shared playlists…")
+                    } else if summaries.isEmpty {
+                        Text("No playlists have been shared yet.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(summaries) { summary in
+                            Button {
+                                download(summary)
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading) {
+                                        Text(summary.name)
+                                        Text("\(summary.count) \(summary.count == 1 ? "track" : "tracks")")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "arrow.down.circle")
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(isWorking)
+                        }
+                    }
+                }
+
+                if let message {
+                    Section { Text(message).foregroundStyle(.secondary) }
+                }
+            }
+            .navigationTitle("Shared Playlists")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+            }
+            .task { await load() }
+            .confirmationDialog(
+                "Update ‘\(player.playlist.activePlaylistName)’ on the server?",
+                isPresented: $confirmingUpdate,
+                titleVisibility: .visible
+            ) {
+                Button("Update Shared Copy") { shareCurrent() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This replaces the existing shared copy with the current playlist.")
+            }
+        }
+    }
+
+    private func requestShare() {
+        guard player.playlist.activeServerPaths != nil else {
+            message = "Every song must come from this Fred Server. Local files and songs from another server cannot be shared with other devices."
+            return
+        }
+        if currentNameExists {
+            confirmingUpdate = true
+        } else {
+            shareCurrent()
+        }
+    }
+
+    private func shareCurrent() {
+        guard
+            let client = player.serverClient,
+            let paths = player.playlist.activeServerPaths
+        else { return }
+        let name = player.playlist.activePlaylistName
+        isWorking = true
+        message = "Sharing \(name)…"
+        Task {
+            do {
+                try await client.sharePlaylist(name: name, tracks: paths)
+                message = "Shared ‘\(name)’. Other devices can now download it."
+                await load(showProgress: false)
+            } catch {
+                message = "Couldn’t share playlist: \(error.localizedDescription)"
+            }
+            isWorking = false
+        }
+    }
+
+    private func download(_ summary: SharedPlaylistSummary) {
+        guard let client = player.serverClient else { return }
+        isWorking = true
+        message = "Downloading \(summary.name)…"
+        Task {
+            do {
+                async let playlistRequest = client.fetchSharedPlaylist(name: summary.name)
+                async let libraryRequest = client.fetchLibrary()
+                let (shared, library) = try await (playlistRequest, libraryRequest)
+                let byPath = Dictionary(uniqueKeysWithValues: library.map { ($0.path, $0) })
+                let tracks = shared.tracks.compactMap { byPath[$0] }
+                guard tracks.count == shared.tracks.count, !tracks.isEmpty else {
+                    message = "The server copy contains songs that are no longer in its library."
+                    isWorking = false
+                    return
+                }
+                player.stop()
+                let localName = player.playlist.installSharedPlaylist(name: shared.name, serverTracks: tracks)
+                message = "Saved ‘\(localName)’ on this device. Local changes and deletion won’t affect the server copy."
+            } catch {
+                message = "Couldn’t download playlist: \(error.localizedDescription)"
+            }
+            isWorking = false
+        }
+    }
+
+    private func load(showProgress: Bool = true) async {
+        guard let client = player.serverClient else {
+            message = FredServerError.invalidBaseURL.localizedDescription
+            isLoading = false
+            return
+        }
+        if showProgress { isLoading = true }
+        do {
+            summaries = try await client.fetchSharedPlaylists()
+        } catch {
+            message = "Couldn’t load shared playlists: \(error.localizedDescription)"
+        }
+        isLoading = false
     }
 }

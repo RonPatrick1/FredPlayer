@@ -10,30 +10,17 @@ across three clients sharing one media server.
 - `linux/` — Ubuntu/GTK desktop client (Python), including MPRIS integration.
 - `apple/` — iOS/macOS client (Swift), including CarPlay support.
 
-Android and Linux clients talk to `server/` over HTTP (`/api/library`,
-`/stream/*`, `/api/profile/*`, `/api/visual/*`, `/api/ask-liam`). The Apple
-client is currently local-file-only and does not yet integrate with the
-shared server.
+Android, Linux, and Apple clients talk to `server/` over HTTP for library
+browsing and streaming, device-cache sync, Ask Liam, and durable shared
+playlists. A shared playlist is a server-owned snapshot that any client can
+download as a local copy; deleting the device copy does not delete the server
+copy.
 
 ## Known gaps / notes
 
-- **Apple has no remote-server client.** `apple/FredPlayer/PlaylistStore.swift`
-  only imports local files via security-scoped bookmarks (plus a bundled
-  "Classical" folder) — there's no networking code in the Swift project at
-  all. Android (`RemoteLibraryClient.java`) and Linux (`fredplayer/remote.py`)
-  both fetch the library, stream tracks, and sync loudness/visualization
-  profiles through `server/`; Apple's loudness/visual analysis
-  (`MediaCache.swift`) is real but purely a local disk cache, never synced.
-  Bringing Apple to parity means adding a Swift equivalent of
-  `RemoteLibraryClient`/`remote.py` (`/api/library`, `/stream/*`,
-  `/api/profile/*`, `/api/visual/*`).
-  The server now has a separate `/api/apple-visual/*`/`data/apple-visual/`
-  namespace, an offline generator, and a matching Swift format decoder ready
-  for that client integration; it does not make Apple's local-only audio engine
-  stream remote tracks by itself.
-- **`apple/` was imported byte-for-byte, unmodified**, from the Mac Mini's
-  working copy — intentional, so the Apple-side development thread starts
-  from exactly what was already there.
+- Apple uses its own visualization-cache format and namespace while sharing
+  the same library, streams, loudness profiles, and playlists as Android and
+  Ubuntu.
 - **LiamAgent (`/var/www/LiamAgent`) is a separate project/repo**, not part
   of this monorepo. It only relates to this repo by calling `server/`'s
   `/api/ask-liam` endpoint. Its own playlist-tool fix (`fredplayer_save_playlist`

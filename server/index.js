@@ -8,6 +8,7 @@ const path = require('path');
 const express = require('express');
 const mm = require('music-metadata');
 const precomputeCache = require('./precompute-cache.js');
+const sharedPlaylists = require('./shared-playlists.js');
 
 const MUSIC_DIR = path.resolve(process.env.MUSIC_DIR || '');
 const PORT = parseInt(process.env.PORT || '8790', 10);
@@ -19,7 +20,6 @@ const ANDROID_VISUAL_DIR = path.join(DATA_DIR, 'android-visual');
 const APPLE_VISUAL_DIR = path.join(DATA_DIR, 'apple-visual');
 const APPLE_VISUAL_VARIANT_DIR = path.join(DATA_DIR, 'apple-visual-variant');
 const PLAYLISTS_DIR = path.join(DATA_DIR, 'playlists');
-const PLAYLIST_NAME_RE = /^[^/\\]{1,100}$/;
 const LIAM_ASK_URL = process.env.LIAM_ASK_URL || 'http://127.0.0.1:8787/fredplayer-ask';
 // This hop is localhost-only (Node -> LiamAgent), not through nginx, so it
 // can afford real headroom for handle_fredplayer_ask's up-to-3 retry
@@ -257,60 +257,53 @@ libraryPromise.then(() => triggerAutoPrecompute());
 
 app.get('/api/playlists', async (req, res) => {
   try {
-    await fsp.mkdir(PLAYLISTS_DIR, { recursive: true });
-    const files = await fsp.readdir(PLAYLISTS_DIR);
-    const playlists = [];
-    for (const file of files) {
-      if (!file.endsWith('.json')) {
-        continue;
-      }
-      try {
-        const contents = JSON.parse(await fsp.readFile(path.join(PLAYLISTS_DIR, file), 'utf8'));
-        playlists.push({ name: contents.name, count: (contents.tracks || []).length });
-      } catch (err) {
-        // Skip unreadable/corrupt playlist files.
-      }
-    }
-    playlists.sort((a, b) => a.name.localeCompare(b.name));
-    res.json(playlists);
+    res.json(await sharedPlaylists.listSharedPlaylists(PLAYLISTS_DIR));
   } catch (err) {
-    res.status(500).json({ error: 'could not list playlists' });
+    res.status(500).json({ error: 'could not list shared playlists' });
   }
 });
 
 app.get('/api/playlists/:name', async (req, res) => {
   const name = req.params.name;
-  if (!PLAYLIST_NAME_RE.test(name)) {
+  if (!sharedPlaylists.validPlaylistName(name)) {
     res.status(400).json({ error: 'invalid playlist name' });
     return;
   }
   try {
-    const contents = await fsp.readFile(path.join(PLAYLISTS_DIR, name + '.json'), 'utf8');
-    res.type('application/json').send(contents);
+    const playlist = await sharedPlaylists.readSharedPlaylist(PLAYLISTS_DIR, name);
+    if (!playlist) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json(playlist);
   } catch (err) {
-    res.status(404).json({ error: 'not found' });
+    res.status(500).json({ error: 'could not read shared playlist' });
   }
 });
 
 app.post('/api/playlists', express.json({ limit: '2mb' }), async (req, res) => {
   const { name, tracks } = req.body || {};
-  if (typeof name !== 'string' || !PLAYLIST_NAME_RE.test(name)) {
-    res.status(400).json({ error: 'name must be 1-100 characters with no slashes' });
-    return;
-  }
-  if (!Array.isArray(tracks) || tracks.length === 0 || !tracks.every((t) => typeof t === 'string')) {
-    res.status(400).json({ error: 'tracks must be a non-empty array of strings' });
-    return;
-  }
   try {
-    await fsp.mkdir(PLAYLISTS_DIR, { recursive: true });
-    await fsp.writeFile(
-      path.join(PLAYLISTS_DIR, name + '.json'),
-      JSON.stringify({ name, tracks }),
+    const library = await libraryPromise;
+    const validTrackPaths = new Set(library.map((track) => track.path));
+    const result = await sharedPlaylists.writeSharedPlaylist(
+      PLAYLISTS_DIR,
+      name,
+      tracks,
+      validTrackPaths,
     );
-    res.status(204).end();
+    res.status(result.created ? 201 : 200).json({
+      name: result.playlist.name,
+      count: result.playlist.tracks.length,
+      shared: true,
+      updatedAt: result.playlist.updatedAt,
+    });
   } catch (err) {
-    res.status(500).json({ error: 'write failed' });
+    if (err.code === 'INVALID_NAME' || err.code === 'INVALID_TRACKS') {
+      res.status(400).json({ error: err.message });
+      return;
+    }
+    res.status(500).json({ error: 'could not save shared playlist' });
   }
 });
 

@@ -7,6 +7,23 @@ Apple's compact `FAV1` files use `/api/apple-visual/*` and
 platform's incompatible bytes. Leveling profiles remain shared JSON at
 `/api/profile/*` and `data/profiles/`.
 
+## Shared playlists
+
+Shared playlists are durable server-owned snapshots under
+`data/playlists/`. All three clients can publish the current playlist with
+`POST /api/playlists`, browse the summaries returned by `GET /api/playlists`,
+and download a local copy from `GET /api/playlists/:name`. Publishing the same
+name updates the server snapshot. There is intentionally no device-facing
+delete endpoint, so deleting or editing a downloaded playlist on Android,
+Apple, or Ubuntu cannot remove the shared copy.
+
+Only paths in the server's current music library can be published. A local
+file URI would not be playable by another device, so clients reject playlists
+containing local files or tracks from a different server instead of publishing
+a misleading partial copy. Existing JSON files in `data/playlists/` remain
+visible as shared playlists and are upgraded to the versioned format the next
+time they are published.
+
 ## Precomputing device caches
 
 `precompute-cache.js` is an offline, manual job; the HTTP process never starts

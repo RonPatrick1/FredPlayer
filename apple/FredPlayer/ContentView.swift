@@ -12,6 +12,7 @@ struct ContentView: View {
     @State private var isServerLibraryPresented = false
     @State private var isAskLiamPresented = false
     @State private var isPlaylistManagerPresented = false
+    @State private var isSharedPlaylistsPresented = false
     private let logger = Logger(subsystem: "com.example.FredPlayer", category: "Import")
 
     var body: some View {
@@ -40,6 +41,9 @@ struct ContentView: View {
             .sheet(isPresented: $isPlaylistManagerPresented) {
                 PlaylistManagerView().environmentObject(player)
             }
+            .sheet(isPresented: $isSharedPlaylistsPresented) {
+                SharedPlaylistsView().environmentObject(player)
+            }
             .navigationTitle("FredPlayer")
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -56,6 +60,10 @@ struct ContentView: View {
                         }
                         Button("Browse Server Library…", systemImage: "music.note.house") {
                             isServerLibraryPresented = true
+                        }
+                        .disabled(player.serverClient == nil)
+                        Button("Shared Playlists…", systemImage: "person.2") {
+                            isSharedPlaylistsPresented = true
                         }
                         .disabled(player.serverClient == nil)
                         Button("Ask Liam…", systemImage: "bubble.left.and.text.bubble.right") {

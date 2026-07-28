@@ -72,6 +72,30 @@ final class RemoteLibraryClient {
         return playlist.getJSONArray("tracks");
     }
 
+    static void sharePlaylist(String baseUrl, String token, String name, JSONArray tracks)
+            throws IOException, JSONException {
+        JSONObject requestBody = new JSONObject();
+        requestBody.put("name", name);
+        requestBody.put("tracks", tracks);
+        post(
+                normalizeBaseUrl(baseUrl) + "/api/playlists",
+                token,
+                requestBody.toString(),
+                READ_TIMEOUT_MS);
+    }
+
+    static String serverPath(String baseUrl, String uriString) {
+        if (uriString == null) {
+            return null;
+        }
+        String prefix = normalizeBaseUrl(baseUrl) + "/stream/";
+        if (!uriString.startsWith(prefix)) {
+            return null;
+        }
+        String encodedPath = uriString.substring(prefix.length());
+        return encodedPath.isEmpty() ? null : Uri.decode(encodedPath);
+    }
+
     static JSONObject askLiam(String baseUrl, String token, String deviceId, String message)
             throws IOException, JSONException {
         JSONObject requestBody = new JSONObject();
@@ -81,7 +105,11 @@ final class RemoteLibraryClient {
         } catch (JSONException e) {
             throw new IOException(e);
         }
-        String body = post(normalizeBaseUrl(baseUrl) + "/api/ask-liam", token, requestBody.toString());
+        String body = post(
+                normalizeBaseUrl(baseUrl) + "/api/ask-liam",
+                token,
+                requestBody.toString(),
+                ASK_LIAM_READ_TIMEOUT_MS);
         return new JSONObject(body);
     }
 
@@ -102,10 +130,11 @@ final class RemoteLibraryClient {
         }
     }
 
-    private static String post(String urlString, String token, String jsonBody) throws IOException {
+    private static String post(String urlString, String token, String jsonBody, int readTimeoutMs)
+            throws IOException {
         HttpURLConnection connection = (HttpURLConnection) new URL(urlString).openConnection();
         connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
-        connection.setReadTimeout(ASK_LIAM_READ_TIMEOUT_MS);
+        connection.setReadTimeout(readTimeoutMs);
         connection.setRequestMethod("POST");
         connection.setRequestProperty("Authorization", "Bearer " + token);
         connection.setRequestProperty("Content-Type", "application/json");
@@ -114,7 +143,7 @@ final class RemoteLibraryClient {
         try {
             connection.getOutputStream().write(body);
             int code = connection.getResponseCode();
-            if (code != HttpURLConnection.HTTP_OK) {
+            if (code < 200 || code >= 300) {
                 String errorBody = readAll(connection.getErrorStream());
                 throw new IOException("Server returned HTTP " + code + ": " + errorBody);
             }

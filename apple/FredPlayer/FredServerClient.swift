@@ -25,6 +25,22 @@ struct AskLiamResponse: Codable {
     let playlist: AskLiamPlaylist?
 }
 
+struct SharedPlaylistSummary: Codable, Identifiable, Hashable {
+    let name: String
+    let count: Int
+    let shared: Bool?
+    let updatedAt: String?
+
+    var id: String { name }
+}
+
+struct SharedPlaylistDocument: Codable {
+    let name: String
+    let tracks: [String]
+    let shared: Bool?
+    let updatedAt: String?
+}
+
 enum FredServerError: LocalizedError {
     case invalidBaseURL
     case invalidResponse
@@ -64,6 +80,34 @@ struct FredServerClient {
 
     private struct RescanResponse: Decodable {
         let count: Int
+    }
+
+    func fetchSharedPlaylists() async throws -> [SharedPlaylistSummary] {
+        let (data, response) = try await URLSession.shared.data(for: request(path: "api/playlists"))
+        try validate(response, errorData: data)
+        return try JSONDecoder().decode([SharedPlaylistSummary].self, from: data)
+    }
+
+    func fetchSharedPlaylist(name: String) async throws -> SharedPlaylistDocument {
+        let (data, response) = try await URLSession.shared.data(
+            for: request(path: "api/playlists/\(encodedPath(name))")
+        )
+        try validate(response, errorData: data)
+        return try JSONDecoder().decode(SharedPlaylistDocument.self, from: data)
+    }
+
+    func sharePlaylist(name: String, tracks: [String]) async throws {
+        var request = request(path: "api/playlists")
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(SharePlaylistRequest(name: name, tracks: tracks))
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validate(response, errorData: data)
+    }
+
+    private struct SharePlaylistRequest: Encodable {
+        let name: String
+        let tracks: [String]
     }
 
     func streamURL(forServerPath path: String) -> URL {

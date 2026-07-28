@@ -76,6 +76,20 @@ def fetch_playlist_tracks(base_url: str, token: str, name: str) -> list[str]:
     return json.loads(body).get("tracks", [])
 
 
+def server_path(base_url: str, track_url: str) -> str | None:
+    prefix = f"{normalize_base_url(base_url)}{STREAM_SEGMENT}"
+    if not isinstance(track_url, str) or not track_url.startswith(prefix):
+        return None
+    encoded_path = track_url[len(prefix):]
+    return urllib.parse.unquote(encoded_path) if encoded_path else None
+
+
+def share_playlist(base_url: str, token: str, name: str, tracks: list[str]) -> None:
+    url = f"{normalize_base_url(base_url)}/api/playlists"
+    body = json.dumps({"name": name, "tracks": tracks}).encode("utf-8")
+    _request(url, token, method="POST", data=body, content_type="application/json")
+
+
 def ask_liam(base_url: str, token: str, device_id: str, message: str) -> dict:
     """POSTs to the FredPlayer server's /api/ask-liam relay, which forwards
     to Liam's own local-only agent endpoint. Long timeout — a multi-tool-call
@@ -118,5 +132,4 @@ def upload_profile(track_url: str, token: str, rms: float, peak: float) -> None:
         _request(url, token, method="PUT", data=body, content_type="application/json")
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError):
         pass  # Best-effort — the next device just recomputes locally instead.
-
 

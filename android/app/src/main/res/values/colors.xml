@@ -1,8 +1,4 @@
 <resources>
     <color name="night_background">#111315</color>
-    <color name="panel_background">#1C2220</color>
-    <color name="primary_text">#F5F3ED</color>
-    <color name="secondary_text">#B7B6AD</color>
-    <color name="accent">#7CC9A4</color>
     <color name="launcher_background">#011039</color>
 </resources>

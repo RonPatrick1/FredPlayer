@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GRADLE_VERSION="${GRADLE_VERSION:-8.7}"
+GRADLE_VERSION="${GRADLE_VERSION:-8.11.1}"
 DIST_DIR="$ROOT_DIR/.gradle-dist"
 ZIP_FILE="$DIST_DIR/gradle-$GRADLE_VERSION-bin.zip"
 GRADLE_HOME="$DIST_DIR/gradle-$GRADLE_VERSION"

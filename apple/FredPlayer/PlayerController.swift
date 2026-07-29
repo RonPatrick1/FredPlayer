@@ -30,7 +30,12 @@ final class PlayerController: ObservableObject {
     @Published private(set) var outputLatency: Double = 0
     @Published var playbackError: String?
     @Published var serverBaseURL = "" { didSet { saveSettings() } }
-    @Published var serverToken = "" { didSet { saveSettings() } }
+    @Published var serverToken = "" {
+        didSet {
+            guard !isRestoringSettings else { return }
+            KeychainStore.set(serverToken, for: "server.token")
+        }
+    }
     @Published private(set) var deviceID = ""
     @Published var shuffleEnabled = true {
         didSet { saveSettings() }
@@ -87,8 +92,7 @@ final class PlayerController: ObservableObject {
     }
 
     var serverClient: FredServerClient? {
-        let value = serverBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty, let url = URL(string: value), url.scheme != nil else { return nil }
+        guard let url = FredServerURLPolicy.validatedURL(serverBaseURL) else { return nil }
         return FredServerClient(baseURL: url, token: serverToken)
     }
 
@@ -103,7 +107,7 @@ final class PlayerController: ObservableObject {
     private var streamingFailureObserver: NSObjectProtocol?
     private var streamingVisualTask: Task<Void, Never>?
     private var streamingUsesLiveVisualization = false
-    private let logger = Logger(subsystem: "com.example.FredPlayer", category: "Playback")
+    private let logger = Logger(subsystem: "com.ronpatrick.FredPlayer", category: "Playback")
     private var audioFile: AVAudioFile?
     private var securityScopedURL: URL?
     private var didAccessSecurityScope = false
@@ -372,7 +376,7 @@ final class PlayerController: ObservableObject {
                 // A newer play request or Stop superseded this one.
             } catch {
                 playbackError = error.localizedDescription
-                logger.error("Playback preparation failed for \(track.filename, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                logger.error("Playback preparation failed for \(track.filename, privacy: .private): \(error.localizedDescription, privacy: .public)")
             }
             if playbackRequestID == requestID {
                 if streamingPlayer == nil { isLoadingRemoteTrack = false }
@@ -406,9 +410,9 @@ final class PlayerController: ObservableObject {
             currentTrackID = track.id
             isPlaying = true
             recordPlayback(track.id, enabled: recordHistory)
-            logger.info("Playing: \(track.displayTitle, privacy: .public)")
+            logger.info("Playing: \(track.displayTitle, privacy: .private)")
         } catch {
-            logger.error("Playback failed for \(track.filename, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            logger.error("Playback failed for \(track.filename, privacy: .private): \(error.localizedDescription, privacy: .public)")
             audioFile = nil
             releaseSecurityScope()
             currentTrackID = nil
@@ -529,7 +533,7 @@ final class PlayerController: ObservableObject {
                 self.refreshCacheStatus()
             }
         }
-        logger.info("Streaming: \(track.displayTitle, privacy: .public)")
+        logger.info("Streaming: \(track.displayTitle, privacy: .private)")
         updateNowPlayingInfo()
     }
 
@@ -1097,8 +1101,7 @@ final class PlayerController: ObservableObject {
             "player.fftSmoothing": 0.0,
             "player.logarithmicFFT": true,
             "player.startupScanSeconds": 10.0,
-            "server.baseURL": "",
-            "server.token": ""
+            "server.baseURL": ""
         ])
         shuffleEnabled = settings.bool(forKey: "player.shuffleEnabled")
         outputLevel = settings.float(forKey: "player.outputLevel")
@@ -1115,7 +1118,17 @@ final class PlayerController: ObservableObject {
         logarithmicFFT = settings.bool(forKey: "player.logarithmicFFT")
         startupScanSeconds = settings.double(forKey: "player.startupScanSeconds")
         serverBaseURL = settings.string(forKey: "server.baseURL") ?? ""
-        serverToken = settings.string(forKey: "server.token") ?? ""
+        if let protectedToken = KeychainStore.string(for: "server.token") {
+            serverToken = protectedToken
+            settings.removeObject(forKey: "server.token")
+        } else {
+            let legacyToken = settings.string(forKey: "server.token") ?? ""
+            serverToken = legacyToken
+            if !legacyToken.isEmpty,
+               KeychainStore.set(legacyToken, for: "server.token") {
+                settings.removeObject(forKey: "server.token")
+            }
+        }
         if let savedID = settings.string(forKey: "server.deviceID"), !savedID.isEmpty {
             deviceID = savedID.replacingOccurrences(of: "-", with: "").lowercased()
             settings.set(deviceID, forKey: "server.deviceID")
@@ -1142,7 +1155,6 @@ final class PlayerController: ObservableObject {
         settings.set(logarithmicFFT, forKey: "player.logarithmicFFT")
         settings.set(startupScanSeconds, forKey: "player.startupScanSeconds")
         settings.set(serverBaseURL, forKey: "server.baseURL")
-        settings.set(serverToken, forKey: "server.token")
         settings.set(deviceID, forKey: "server.deviceID")
     }
 }

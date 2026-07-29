@@ -23,9 +23,10 @@ final class PlaylistStore: ObservableObject {
     @Published private(set) var isAddingCopiedMusic = false
     @Published var operationMessage: String?
 
-    private let logger = Logger(subsystem: "com.example.FredPlayer", category: "Playlist")
+    private let logger = Logger(subsystem: "com.ronpatrick.FredPlayer", category: "Playlist")
     private let defaultsKey = "playlist.v1"
     private let libraryDefaultsKey = "playlist.library.v2"
+    private let sampleDefaultsKey = "playlist.sampleInstalled.v1"
 
     var activePlaylistName: String {
         playlists.first(where: { $0.id == activePlaylistID })?.name ?? "Playlist"
@@ -55,13 +56,13 @@ final class PlaylistStore: ObservableObject {
                     relativeTo: nil
                 )
                 guard !tracks.contains(where: { $0.bookmark == bookmark }) else {
-                    logger.info("Skipped duplicate import: \(url.lastPathComponent, privacy: .public)")
+                    logger.info("Skipped duplicate import: \(url.lastPathComponent, privacy: .private)")
                     continue
                 }
                 tracks.append(PlaylistTrack(filename: url.lastPathComponent, bookmark: bookmark))
-                logger.info("Imported: \(url.lastPathComponent, privacy: .public)")
+                logger.info("Imported: \(url.lastPathComponent, privacy: .private)")
             } catch {
-                logger.error("Import failed for \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                logger.error("Import failed for \(url.lastPathComponent, privacy: .private): \(error.localizedDescription, privacy: .public)")
             }
         }
         save()
@@ -104,7 +105,7 @@ final class PlaylistStore: ObservableObject {
                     )
                 )
             } catch {
-                logger.error("Skipped unreadable copied file \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                logger.error("Skipped unreadable library file \(url.lastPathComponent, privacy: .private): \(error.localizedDescription, privacy: .public)")
             }
         }
 
@@ -117,7 +118,7 @@ final class PlaylistStore: ObservableObject {
             }
             return $0.folderName.localizedStandardCompare($1.folderName) == .orderedAscending
         }
-        logger.info("Found \(files.count) copied music files")
+        logger.info("Found \(files.count) FredPlayer library files")
     }
 
     func addCopiedMusic(ids: Set<LocalMusicFile.ID>) {
@@ -212,7 +213,7 @@ final class PlaylistStore: ObservableObject {
                 )
                 addedCount += 1
             } catch {
-                logger.error("Could not add \(file.url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                logger.error("Could not add \(file.url.lastPathComponent, privacy: .private): \(error.localizedDescription, privacy: .public)")
             }
         }
         save()
@@ -302,12 +303,12 @@ final class PlaylistStore: ObservableObject {
                 bookmarkDataIsStale: &stale
             )
             if logSuccess {
-                logger.info("Restored bookmark for: \(track.filename, privacy: .public), stale: \(stale)")
+                logger.info("Restored bookmark for: \(track.filename, privacy: .private), stale: \(stale)")
             }
             if stale { refreshBookmark(for: track, url: url) }
             return url
         } catch {
-            logger.error("Bookmark restore failed for \(track.filename, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            logger.error("Bookmark restore failed for \(track.filename, privacy: .private): \(error.localizedDescription, privacy: .public)")
             return nil
         }
     }
@@ -322,6 +323,7 @@ final class PlaylistStore: ObservableObject {
                 : state.playlists[0].id
             tracks = playlists.first(where: { $0.id == activePlaylistID })?.tracks ?? []
             logger.info("Restored \(self.playlists.count) playlists")
+            installBundledSampleIfNeeded()
             return
         }
         guard let data = UserDefaults.standard.data(forKey: defaultsKey) else {
@@ -329,6 +331,7 @@ final class PlaylistStore: ObservableObject {
             playlists = [playlist]
             activePlaylistID = playlist.id
             logger.info("No saved playlist found")
+            installBundledSampleIfNeeded()
             return
         }
         do {
@@ -338,8 +341,47 @@ final class PlaylistStore: ObservableObject {
             activePlaylistID = playlist.id
             save()
             logger.info("Restored playlist with \(self.tracks.count) tracks")
+            installBundledSampleIfNeeded()
         } catch {
             logger.error("Playlist restore failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func installBundledSampleIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: sampleDefaultsKey) else { return }
+        defer { UserDefaults.standard.set(true, forKey: sampleDefaultsKey) }
+        guard tracks.isEmpty,
+              let bundledURL = Bundle.main.url(
+                forResource: "FredPlayer Sample",
+                withExtension: "flac"
+              ) else { return }
+        do {
+            let documentsURL = FileManager.default.urls(
+                for: .documentDirectory,
+                in: .userDomainMask
+            )[0]
+            let localURL = documentsURL.appendingPathComponent("FredPlayer Sample.flac")
+            if !FileManager.default.fileExists(atPath: localURL.path) {
+                try FileManager.default.copyItem(at: bundledURL, to: localURL)
+            }
+            let bookmark = try localURL.bookmarkData(
+                options: .minimalBookmark,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            tracks = [PlaylistTrack(
+                filename: localURL.lastPathComponent,
+                bookmark: bookmark,
+                title: "FredPlayer Sample",
+                artist: "Silveron Studios",
+                album: "FredPlayer"
+            )]
+            if let index = playlists.firstIndex(where: { $0.id == activePlaylistID }) {
+                playlists[index].tracks = tracks
+            }
+            save()
+        } catch {
+            logger.error("Bundled sample installation failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -373,7 +415,7 @@ final class PlaylistStore: ObservableObject {
             )
             save()
         } catch {
-            logger.error("Bookmark refresh failed for \(track.filename, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            logger.error("Bookmark refresh failed for \(track.filename, privacy: .private): \(error.localizedDescription, privacy: .public)")
         }
     }
 

@@ -697,8 +697,8 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         self.window_state = state.window_state
         self._is_maximized = state.window_state.maximized
 
-        self.set_size_request(900, 620)
-        self.set_default_size(max(900, self.window_state.width), max(620, self.window_state.height))
+        self.set_size_request(640, 620)
+        self.set_default_size(max(640, self.window_state.width), max(620, self.window_state.height))
         self.playback_requested = False
         self.audio_actually_playing = False
         self.current_index = -1
@@ -758,6 +758,7 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         self.add(root)
 
         self.page_stack = Gtk.Stack()
+        self.page_stack.set_homogeneous(False)
         self.page_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         self.page_stack.set_transition_duration(180)
         root.pack_start(self.page_stack, True, True, 0)

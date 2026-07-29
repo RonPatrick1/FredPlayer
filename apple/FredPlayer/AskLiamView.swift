@@ -49,7 +49,7 @@ struct AskLiamView: View {
                     } header: {
                         Text("What playlist should Liam make?")
                     } footer: {
-                        Text("Liam will either create and open a new playlist, or explain why nothing was created.")
+                        Text("Your prompt and a random app identifier are sent only to your configured Fred Server. Liam will either create and open a new playlist, or explain why nothing was created.")
                     }
                 }
             }

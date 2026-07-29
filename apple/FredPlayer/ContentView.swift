@@ -13,7 +13,7 @@ struct ContentView: View {
     @State private var isAskLiamPresented = false
     @State private var isPlaylistManagerPresented = false
     @State private var isSharedPlaylistsPresented = false
-    private let logger = Logger(subsystem: "com.example.FredPlayer", category: "Import")
+    private let logger = Logger(subsystem: "com.ronpatrick.FredPlayer", category: "Import")
 
     var body: some View {
         NavigationStack {
@@ -70,6 +70,9 @@ struct ContentView: View {
                             isAskLiamPresented = true
                         }
                         .disabled(player.serverClient == nil)
+                        Divider()
+                        Link("Privacy Policy", destination: URL(string: "https://patrick-lamphier.com/fredplayer-privacy")!)
+                        Link("Support", destination: URL(string: "https://patrick-lamphier.com/fredplayer-support")!)
                         if !player.playlist.tracks.isEmpty {
                             Divider()
                             Button("Clear Playlist", role: .destructive) {

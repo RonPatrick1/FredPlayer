@@ -18,6 +18,13 @@ struct ServerSettingsView: View {
                         .autocorrectionDisabled()
                     SecureField("Token", text: $player.serverToken)
                         .textInputAutocapitalization(.never)
+                    if !player.serverBaseURL.isEmpty && player.serverClient == nil {
+                        Text("Use an HTTPS Fred Server URL without embedded credentials, a query, or a fragment.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                } footer: {
+                    Text("FredPlayer sends the token and playback requests only to the private server you configure. It may upload derived visualization, leveling, and shared-playlist data; microphone audio is never uploaded. The token is stored in Keychain.")
                 }
                 Section("Device ID") {
                     Text(player.deviceID)

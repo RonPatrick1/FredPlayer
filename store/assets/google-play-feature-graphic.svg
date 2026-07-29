@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="500" viewBox="0 0 1024 500">
+  <defs>
+    <linearGradient id="background" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0" stop-color="#011039"/>
+      <stop offset="0.55" stop-color="#17144c"/>
+      <stop offset="1" stop-color="#3a205f"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0" stop-color="#ffd979"/>
+      <stop offset="1" stop-color="#b8a0ff"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1024" height="500" fill="#07143f"/>
+  <circle cx="845" cy="250" r="170" fill="none" stroke="#9e8cff" stroke-width="4" opacity="0.18"/>
+  <circle cx="845" cy="250" r="125" fill="none" stroke="#d7c9ff" stroke-width="5" opacity="0.25"/>
+  <g fill="#c5aeff" opacity="0.9">
+    <rect x="681" y="224" width="15" height="52" rx="7"/>
+    <rect x="710" y="188" width="15" height="124" rx="7"/>
+    <rect x="739" y="151" width="15" height="198" rx="7"/>
+    <rect x="768" y="198" width="15" height="104" rx="7"/>
+    <rect x="797" y="121" width="15" height="258" rx="7"/>
+    <rect x="826" y="176" width="15" height="148" rx="7"/>
+    <rect x="855" y="207" width="15" height="86" rx="7"/>
+    <rect x="884" y="160" width="15" height="180" rx="7"/>
+    <rect x="913" y="200" width="15" height="100" rx="7"/>
+    <rect x="942" y="229" width="15" height="42" rx="7"/>
+  </g>
+  <path d="M650 250 C690 172 732 332 774 250 S858 168 900 250 S966 324 993 250"
+        fill="none" stroke="#fff2b6" stroke-width="6" stroke-linecap="round" opacity="0.85"/>
+  <text x="82" y="235" fill="#ffffff" font-family="DejaVu Sans, sans-serif" font-size="78" font-weight="700">FredPlayer</text>
+  <rect x="84" y="265" width="470" height="5" rx="2.5" fill="#ffd979"/>
+  <text x="84" y="322" fill="#ddd7f6" font-family="DejaVu Sans, sans-serif" font-size="30">Your music, leveled and visualized.</text>
+</svg>

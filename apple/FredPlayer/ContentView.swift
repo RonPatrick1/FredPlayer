@@ -113,7 +113,7 @@ struct ContentView: View {
                 if player.playlist.isAddingCopiedMusic || player.isLoadingRemoteTrack {
                     ZStack {
                         Color.black.opacity(0.2).ignoresSafeArea()
-                        ProgressView(player.isLoadingRemoteTrack ? "Downloading track…" : "Adding tracks…")
+                        ProgressView(player.isLoadingRemoteTrack ? "Buffering track…" : "Adding tracks…")
                             .padding()
                             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                     }

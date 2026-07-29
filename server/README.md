@@ -7,6 +7,15 @@ Apple's compact `FAV1` files use `/api/apple-visual/*` and
 platform's incompatible bytes. Leveling profiles remain shared JSON at
 `/api/profile/*` and `data/profiles/`.
 
+## Progressive playback
+
+`POST /api/stream-ticket` accepts a server-library `path` under normal bearer
+authentication and returns a six-hour, track-scoped URL signature. Apple uses
+that URL with `AVPlayer`, allowing the same `/stream/*` byte-range behavior
+used by Android without placing the permanent server token in a media URL.
+Tickets permit only `GET` and `HEAD`, are bound to one exact encoded track, and
+cannot authorize any API request or another library file.
+
 ## Shared playlists
 
 Shared playlists are durable server-owned snapshots under

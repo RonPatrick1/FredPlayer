@@ -3,6 +3,14 @@ import Combine
 import MediaPlayer
 import OSLog
 
+private enum PlaybackPreparationError: LocalizedError {
+    case noAudioTrack
+
+    var errorDescription: String? {
+        "The selected file does not contain a playable audio track."
+    }
+}
+
 @MainActor
 final class PlayerController: ObservableObject {
     static let shared = PlayerController()
@@ -30,6 +38,7 @@ final class PlayerController: ObservableObject {
 
     @Published var outputLevel: Float = 0.8 {
         didSet {
+            updateDynamics()
             saveSettings()
         }
     }
@@ -63,12 +72,12 @@ final class PlayerController: ObservableObject {
             saveSettings()
         }
     }
-    @Published var visualizationFPS = 60.0 { didSet { saveSettings() } }
-    @Published var waveformWindow = 0.08 { didSet { saveSettings() } }
-    @Published var fftSize = 2048 { didSet { saveSettings() } }
-    @Published var fftBarCount = 64 { didSet { saveSettings() } }
-    @Published var fftSmoothing: Float = 0 { didSet { saveSettings() } }
-    @Published var logarithmicFFT = true { didSet { saveSettings() } }
+    @Published var visualizationFPS = 60.0 { didSet { updateDynamics(); saveSettings() } }
+    @Published var waveformWindow = 0.08 { didSet { updateDynamics(); saveSettings() } }
+    @Published var fftSize = 2048 { didSet { updateDynamics(); saveSettings() } }
+    @Published var fftBarCount = 64 { didSet { updateDynamics(); saveSettings() } }
+    @Published var fftSmoothing: Float = 0 { didSet { updateDynamics(); saveSettings() } }
+    @Published var logarithmicFFT = true { didSet { updateDynamics(); saveSettings() } }
     @Published var startupScanSeconds = 10.0 { didSet { saveSettings() } }
 
     let playlist = PlaylistStore()
@@ -85,6 +94,15 @@ final class PlayerController: ObservableObject {
 
     private let engine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
+    private var streamingPlayer: AVPlayer?
+    private var streamingPlayerItem: AVPlayerItem?
+    private var streamingAudioTap: StreamingAudioTap?
+    private var streamingItemStatusObservation: NSKeyValueObservation?
+    private var streamingTimeControlObservation: NSKeyValueObservation?
+    private var streamingEndObserver: NSObjectProtocol?
+    private var streamingFailureObserver: NSObjectProtocol?
+    private var streamingVisualTask: Task<Void, Never>?
+    private var streamingUsesLiveVisualization = false
     private let logger = Logger(subsystem: "com.example.FredPlayer", category: "Playback")
     private var audioFile: AVAudioFile?
     private var securityScopedURL: URL?
@@ -113,6 +131,7 @@ final class PlayerController: ObservableObject {
         engine.connect(playerNode, to: engine.mainMixerNode, format: nil)
         playerNode.volume = 1
         engine.mainMixerNode.outputVolume = outputLevel
+        RemoteTrackCache.removeLegacyDownloads()
         configureAudioSession()
         observeAudioSession()
         installVisualizationTap()
@@ -135,18 +154,28 @@ final class PlayerController: ObservableObject {
         playbackTask?.cancel()
         routeRecoveryTask?.cancel()
         progressTimer?.invalidate()
+        tearDownStreamingPlayer()
         engine.mainMixerNode.removeTap(onBus: 0)
     }
 
     func togglePlayback() {
         if isPlaying {
-            playerNode.pause()
+            if let streamingPlayer {
+                streamingPlayer.pause()
+            } else {
+                playerNode.pause()
+            }
             isPlaying = false
             updateNowPlayingInfo()
         } else if currentTrackID != nil {
             do {
-                try startEngineIfNeeded()
-                playerNode.play()
+                if let streamingPlayer {
+                    try activateAudioSession()
+                    streamingPlayer.play()
+                } else {
+                    try startEngineIfNeeded()
+                    playerNode.play()
+                }
                 isPlaying = true
                 updateNowPlayingInfo()
             } catch {
@@ -174,9 +203,7 @@ final class PlayerController: ObservableObject {
         playbackTask?.cancel()
         playbackTask = nil
         isLoadingRemoteTrack = false
-        playerNode.stop()
-        audioFile = nil
-        releaseSecurityScope()
+        stopActiveTransport()
         currentTrackID = nil
         isPlaying = false
         currentTime = 0
@@ -191,6 +218,17 @@ final class PlayerController: ObservableObject {
     }
 
     func seek(to time: TimeInterval) {
+        if let streamingPlayer {
+            let clamped = min(max(0, time), duration)
+            currentTime = clamped
+            streamingPlayer.seek(
+                to: CMTime(seconds: clamped, preferredTimescale: 600),
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            )
+            updateNowPlayingInfo()
+            return
+        }
         guard let file = audioFile, let trackID = currentTrackID else { return }
         let sampleRate = file.processingFormat.sampleRate
         let clamped = min(max(0, time), duration)
@@ -304,8 +342,8 @@ final class PlayerController: ObservableObject {
         let requestID = UUID()
         playbackRequestID = requestID
         playbackTask?.cancel()
-        playerNode.stop()
-        releaseSecurityScope()
+        stopActiveTransport()
+        currentTrackID = nil
         isPlaying = false
         isLoadingRemoteTrack = track.isRemote
         playbackError = nil
@@ -313,15 +351,23 @@ final class PlayerController: ObservableObject {
         playbackTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let prepared = try await preparePlayback(for: track)
-                try Task.checkCancellation()
-                beginPlayback(
-                    track: track,
-                    url: prepared.url,
-                    loudness: prepared.loudness,
-                    visual: prepared.visual,
-                    recordHistory: recordHistory
-                )
+                if let serverPath = track.serverPath {
+                    try await prepareStreamingPlayback(
+                        track: track,
+                        serverPath: serverPath,
+                        recordHistory: recordHistory
+                    )
+                } else {
+                    let prepared = try prepareLocalPlayback(for: track)
+                    try Task.checkCancellation()
+                    beginLocalPlayback(
+                        track: track,
+                        url: prepared.url,
+                        loudness: prepared.loudness,
+                        visual: prepared.visual,
+                        recordHistory: recordHistory
+                    )
+                }
             } catch is CancellationError {
                 // A newer play request or Stop superseded this one.
             } catch {
@@ -329,23 +375,21 @@ final class PlayerController: ObservableObject {
                 logger.error("Playback preparation failed for \(track.filename, privacy: .public): \(error.localizedDescription, privacy: .public)")
             }
             if playbackRequestID == requestID {
-                isLoadingRemoteTrack = false
+                if streamingPlayer == nil { isLoadingRemoteTrack = false }
                 playbackTask = nil
             }
         }
     }
 
-    private func beginPlayback(
+    private func beginLocalPlayback(
         track: PlaylistTrack,
         url: URL,
         loudness: LoudnessCacheEntry?,
         visual: VisualCacheEntry?,
         recordHistory: Bool
     ) {
-        if !track.isRemote {
-            securityScopedURL = url
-            didAccessSecurityScope = url.startAccessingSecurityScopedResource()
-        }
+        securityScopedURL = url
+        didAccessSecurityScope = url.startAccessingSecurityScopedResource()
 
         do {
             let file = try AVAudioFile(forReading: url)
@@ -361,14 +405,7 @@ final class PlayerController: ObservableObject {
             playerNode.play()
             currentTrackID = track.id
             isPlaying = true
-
-            if recordHistory {
-                if historyIndex < history.count - 1 {
-                    history.removeSubrange((historyIndex + 1)..<history.count)
-                }
-                history.append(track.id)
-                historyIndex = history.count - 1
-            }
+            recordPlayback(track.id, enabled: recordHistory)
             logger.info("Playing: \(track.displayTitle, privacy: .public)")
         } catch {
             logger.error("Playback failed for \(track.filename, privacy: .public): \(error.localizedDescription, privacy: .public)")
@@ -380,49 +417,129 @@ final class PlayerController: ObservableObject {
         updateNowPlayingInfo()
     }
 
-    private func preparePlayback(
+    private func prepareLocalPlayback(
         for track: PlaylistTrack
-    ) async throws -> (url: URL, loudness: LoudnessCacheEntry?, visual: VisualCacheEntry?) {
+    ) throws -> (url: URL, loudness: LoudnessCacheEntry?, visual: VisualCacheEntry?) {
         let visualSettings = makeVisualCacheSettings()
-        guard let serverPath = track.serverPath else {
-            guard let url = playlist.resolvedURL(for: track) else { throw CocoaError(.fileNoSuchFile) }
-            return (
-                url,
-                initialLoudness(for: url),
-                MediaCache.visual(for: url, settings: visualSettings)
-            )
-        }
+        guard let url = playlist.resolvedURL(for: track) else { throw CocoaError(.fileNoSuchFile) }
+        return (
+            url,
+            initialLoudness(for: url),
+            MediaCache.visual(for: url, settings: visualSettings)
+        )
+    }
+
+    private func prepareStreamingPlayback(
+        track: PlaylistTrack,
+        serverPath: String,
+        recordHistory: Bool
+    ) async throws {
         guard let client = serverClient else { throw FredServerError.invalidBaseURL }
+        let visualSettings = makeVisualCacheSettings()
+        let cachedVisual = MediaCache.visual(forServerPath: serverPath, settings: visualSettings)
 
-        async let downloaded = RemoteTrackCache.download(serverPath: serverPath, client: client)
+        async let streamURL = client.streamingURL(serverPath: serverPath)
         async let profile = remoteLoudness(serverPath: serverPath, client: client)
-        async let visual = remoteVisual(serverPath: serverPath, client: client, settings: visualSettings)
-        let url = try await downloaded
-        var loudness = await profile
-        var visualEntry = await visual
+        let url = try await streamURL
+        let loudness = await profile
+        try Task.checkCancellation()
 
-        if loudness == nil {
-            loudness = await Task.detached(priority: .utility) {
-                try? MediaCache.analyzeLoudness(url: url, seconds: nil)
-            }.value
-            if let loudness {
-                try? MediaCache.store(loudness, forServerPath: serverPath)
-                let wire = Self.profile(from: loudness)
-                Task { _ = await client.uploadProfile(wire, serverPath: serverPath) }
+        let asset = AVURLAsset(url: url)
+        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+        guard let audioTrack = audioTracks.first else { throw PlaybackPreparationError.noAudioTrack }
+        try Task.checkCancellation()
+
+        let usesLiveVisualization = cachedVisual == nil
+        let tap = try StreamingAudioTap(
+            initialGain: initialGain(for: loudness),
+            compression: makeCompressionConfiguration(),
+            visualization: usesLiveVisualization ? makeLiveVisualizationConfiguration() : nil
+        ) { [weak self] waveform, spectrum in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.currentTrackID == track.id,
+                      self.currentVisualCache == nil else { return }
+                self.publishVisualFrame(waveform: waveform, spectrum: spectrum)
             }
         }
-        if visualEntry == nil {
-            visualEntry = await Task.detached(priority: .utility) {
-                try? MediaCache.analyzeVisuals(url: url, settings: visualSettings)
-            }.value
-            if let visualEntry {
-                try? MediaCache.store(visualEntry, forServerPath: serverPath, settings: visualSettings)
-                let data = MediaCache.encodeServerVisual(visualEntry, settings: visualSettings)
-                Task { _ = await client.uploadVisual(data, serverPath: serverPath, settings: visualSettings) }
-            }
-        }
+        let inputParameters = AVMutableAudioMixInputParameters(track: audioTrack)
+        inputParameters.audioTapProcessor = tap.tap
+        let audioMix = AVMutableAudioMix()
+        audioMix.inputParameters = [inputParameters]
+        let item = AVPlayerItem(asset: asset)
+        item.audioMix = audioMix
+
+        try beginStreamingPlayback(
+            track: track,
+            serverPath: serverPath,
+            client: client,
+            item: item,
+            tap: tap,
+            visual: cachedVisual,
+            visualSettings: visualSettings,
+            usesLiveVisualization: usesLiveVisualization,
+            recordHistory: recordHistory
+        )
         refreshCacheStatus()
-        return (url, loudness, visualEntry)
+    }
+
+    private func beginStreamingPlayback(
+        track: PlaylistTrack,
+        serverPath: String,
+        client: FredServerClient,
+        item: AVPlayerItem,
+        tap: StreamingAudioTap,
+        visual: VisualCacheEntry?,
+        visualSettings: VisualCacheSettings,
+        usesLiveVisualization: Bool,
+        recordHistory: Bool
+    ) throws {
+        try activateAudioSession()
+
+        let player = AVPlayer(playerItem: item)
+        player.automaticallyWaitsToMinimizeStalling = true
+        player.volume = 1
+        streamingPlayer = player
+        streamingPlayerItem = item
+        streamingAudioTap = tap
+        streamingUsesLiveVisualization = usesLiveVisualization
+        currentVisualCache = visual
+        currentTime = 0
+        duration = 0
+        currentTrackID = track.id
+        isPlaying = true
+        recordPlayback(track.id, enabled: recordHistory)
+        observeStreamingPlayback(player: player, item: item, trackID: track.id)
+        player.play()
+
+        if visual == nil {
+            streamingVisualTask = Task { [weak self] in
+                guard let self,
+                      let fetched = await self.remoteVisual(
+                        serverPath: serverPath,
+                        client: client,
+                        settings: visualSettings
+                      ),
+                      !Task.isCancelled,
+                      self.currentTrackID == track.id,
+                      self.streamingPlayerItem === item else { return }
+                self.currentVisualCache = fetched
+                self.streamingUsesLiveVisualization = false
+                self.updateDynamics()
+                self.refreshCacheStatus()
+            }
+        }
+        logger.info("Streaming: \(track.displayTitle, privacy: .public)")
+        updateNowPlayingInfo()
+    }
+
+    private func recordPlayback(_ id: PlaylistTrack.ID, enabled: Bool) {
+        guard enabled else { return }
+        if historyIndex < history.count - 1 {
+            history.removeSubrange((historyIndex + 1)..<history.count)
+        }
+        history.append(id)
+        historyIndex = history.count - 1
     }
 
     private func remoteLoudness(serverPath: String, client: FredServerClient) async -> LoudnessCacheEntry? {
@@ -458,14 +575,123 @@ final class PlayerController: ObservableObject {
         )
     }
 
-    private func startEngineIfNeeded() throws {
+    private func observeStreamingPlayback(
+        player: AVPlayer,
+        item: AVPlayerItem,
+        trackID: PlaylistTrack.ID
+    ) {
+        streamingItemStatusObservation = item.observe(\.status, options: [.initial, .new]) {
+            [weak self] observedItem, _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.streamingPlayerItem === observedItem else { return }
+                switch observedItem.status {
+                case .readyToPlay:
+                    let seconds = observedItem.duration.seconds
+                    if seconds.isFinite && seconds > 0 { self.duration = seconds }
+                    self.isLoadingRemoteTrack = false
+                    self.updateNowPlayingInfo()
+                case .failed:
+                    self.handleStreamingFailure(
+                        observedItem.error ?? PlaybackPreparationError.noAudioTrack
+                    )
+                case .unknown:
+                    break
+                @unknown default:
+                    break
+                }
+            }
+        }
+        streamingTimeControlObservation = player.observe(\.timeControlStatus, options: [.new]) {
+            [weak self] observedPlayer, _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.streamingPlayer === observedPlayer else { return }
+                switch observedPlayer.timeControlStatus {
+                case .playing:
+                    self.isLoadingRemoteTrack = false
+                case .waitingToPlayAtSpecifiedRate:
+                    if self.isPlaying { self.isLoadingRemoteTrack = true }
+                case .paused:
+                    if !self.isPlaying { self.isLoadingRemoteTrack = false }
+                @unknown default:
+                    break
+                }
+            }
+        }
+        streamingEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.trackDidFinish(trackID) }
+        }
+        streamingFailureObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] notification in
+            let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+            Task { @MainActor [weak self] in
+                self?.handleStreamingFailure(error ?? FredServerError.invalidResponse)
+            }
+        }
+    }
+
+    private func handleStreamingFailure(_ error: Error) {
+        guard streamingPlayer != nil else { return }
+        logger.error("Streaming failed: \(error.localizedDescription, privacy: .public)")
+        tearDownStreamingPlayer()
+        currentTrackID = nil
+        isPlaying = false
+        isLoadingRemoteTrack = false
+        playbackError = error.localizedDescription
+        updateNowPlayingInfo()
+    }
+
+    private func stopActiveTransport() {
+        playerNode.stop()
+        audioFile = nil
+        releaseSecurityScope()
+        tearDownStreamingPlayer()
+        currentVisualCache = nil
+        currentLevelingGain = 1
+        engine.mainMixerNode.outputVolume = outputLevel
+    }
+
+    private func tearDownStreamingPlayer() {
+        streamingVisualTask?.cancel()
+        streamingVisualTask = nil
+        streamingItemStatusObservation?.invalidate()
+        streamingItemStatusObservation = nil
+        streamingTimeControlObservation?.invalidate()
+        streamingTimeControlObservation = nil
+        if let streamingEndObserver {
+            NotificationCenter.default.removeObserver(streamingEndObserver)
+        }
+        streamingEndObserver = nil
+        if let streamingFailureObserver {
+            NotificationCenter.default.removeObserver(streamingFailureObserver)
+        }
+        streamingFailureObserver = nil
+        streamingPlayer?.pause()
+        streamingPlayer?.replaceCurrentItem(with: nil)
+        streamingPlayer = nil
+        streamingPlayerItem = nil
+        streamingAudioTap = nil
+        streamingUsesLiveVisualization = false
+    }
+
+    private func activateAudioSession() throws {
         let session = AVAudioSession.sharedInstance()
         try session.setActive(true)
-        if !engine.isRunning { try engine.start() }
         let outputs = session.currentRoute.outputs
             .map { "\($0.portName) [\($0.portType.rawValue)]" }
             .joined(separator: ", ")
         logger.info("Audio route: \(outputs, privacy: .public)")
+    }
+
+    private func startEngineIfNeeded() throws {
+        try activateAudioSession()
+        if !engine.isRunning { try engine.start() }
     }
 
     private func trackDidFinish(_ id: PlaylistTrack.ID) {
@@ -474,18 +700,31 @@ final class PlayerController: ObservableObject {
     }
 
     private func startProgressTimer() {
-        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+        // Keep cached visualization frames tied to the audio clock at display
+        // cadence. The old 200 ms timer reduced a 60 FPS cache to 5 visible
+        // updates per second and made synchronization errors much easier to see.
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 1 / 60, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard
-                    let self,
-                    self.isPlaying,
-                    let renderTime = self.playerNode.lastRenderTime,
-                    let playerTime = self.playerNode.playerTime(forNodeTime: renderTime)
-                else { return }
-                self.currentTime = min(
-                    Double(playerTime.sampleTime) / playerTime.sampleRate,
-                    self.duration
-                )
+                guard let self, self.isPlaying else { return }
+                if let streamingPlayer = self.streamingPlayer {
+                    let seconds = streamingPlayer.currentTime().seconds
+                    if seconds.isFinite { self.currentTime = max(0, seconds) }
+                    if let item = self.streamingPlayerItem {
+                        let itemDuration = item.duration.seconds
+                        if itemDuration.isFinite && itemDuration > 0 {
+                            self.duration = itemDuration
+                            self.currentTime = min(self.currentTime, itemDuration)
+                        }
+                    }
+                } else {
+                    guard let renderTime = self.playerNode.lastRenderTime,
+                          let playerTime = self.playerNode.playerTime(forNodeTime: renderTime)
+                    else { return }
+                    self.currentTime = min(
+                        Double(playerTime.sampleTime) / playerTime.sampleRate,
+                        self.duration
+                    )
+                }
                 if let cache = self.currentVisualCache, !cache.frames.isEmpty {
                     let index = min(
                         cache.frames.count - 1,
@@ -649,7 +888,11 @@ final class PlayerController: ObservableObject {
         case .began:
             shouldResumeAfterInterruption = isPlaying
             if isPlaying {
-                playerNode.pause()
+                if let streamingPlayer {
+                    streamingPlayer.pause()
+                } else {
+                    playerNode.pause()
+                }
                 isPlaying = false
                 updateNowPlayingInfo()
             }
@@ -668,7 +911,12 @@ final class PlayerController: ObservableObject {
     }
 
     private func updateDynamics() {
-        // Gain riding is applied from the PCM analysis tap on the working mixer path.
+        streamingAudioTap?.update(
+            compression: makeCompressionConfiguration(),
+            visualization: streamingUsesLiveVisualization
+                ? makeLiveVisualizationConfiguration()
+                : nil
+        )
     }
 
     private func installVisualizationTap() {
@@ -798,6 +1046,28 @@ final class PlayerController: ObservableObject {
             waveformWindow: waveformWindow,
             fftSize: fftSize,
             bars: fftBarCount,
+            logarithmic: logarithmicFFT
+        )
+    }
+
+    private func makeCompressionConfiguration() -> RealtimeCompressionConfiguration {
+        RealtimeCompressionConfiguration(
+            outputLevel: outputLevel,
+            strength: levelingStrength,
+            thresholdDB: compressorThreshold,
+            attackTime: attackTime,
+            releaseTime: releaseTime,
+            ceilingDB: outputCeiling
+        )
+    }
+
+    private func makeLiveVisualizationConfiguration() -> LiveVisualizationConfiguration {
+        LiveVisualizationConfiguration(
+            fps: visualizationFPS,
+            waveformWindow: waveformWindow,
+            fftSize: fftSize,
+            bars: fftBarCount,
+            smoothing: fftSmoothing,
             logarithmic: logarithmicFFT
         )
     }

@@ -9,6 +9,7 @@ const express = require('express');
 const mm = require('music-metadata');
 const precomputeCache = require('./precompute-cache.js');
 const sharedPlaylists = require('./shared-playlists.js');
+const { issueStreamTicket, validStreamTicket } = require('./stream-tickets.js');
 
 const MUSIC_DIR = path.resolve(process.env.MUSIC_DIR || '');
 const PORT = parseInt(process.env.PORT || '8790', 10);
@@ -80,7 +81,7 @@ function checkToken(req) {
 }
 
 app.use((req, res, next) => {
-  if (!checkToken(req)) {
+  if (!checkToken(req) && !validStreamTicket(req, AUTH_TOKEN)) {
     res.status(401).json({ error: 'unauthorized' });
     return;
   }
@@ -89,8 +90,13 @@ app.use((req, res, next) => {
 
 // Resolves a request-supplied relative path against a base directory,
 // rejecting anything that would escape it (path traversal guard).
-function resolveWithin(baseDir, relPath) {
-  const decoded = decodeURIComponent(relPath || '');
+function resolveWithin(baseDir, relPath, alreadyDecoded = false) {
+  let decoded;
+  try {
+    decoded = alreadyDecoded ? (relPath || '') : decodeURIComponent(relPath || '');
+  } catch (_error) {
+    return null;
+  }
   const resolvedBase = path.resolve(baseDir);
   const resolved = path.resolve(resolvedBase, decoded);
   if (resolved !== resolvedBase && !resolved.startsWith(resolvedBase + path.sep)) {
@@ -163,6 +169,29 @@ app.post('/api/rescan', (req, res) => {
       triggerAutoPrecompute();
     })
     .catch(() => res.status(500).json({ error: 'rescan failed' }));
+});
+
+app.post('/api/stream-ticket', express.json({ limit: '8kb' }), async (req, res) => {
+  const serverPath = req.body?.path;
+  if (typeof serverPath !== 'string' || !serverPath || serverPath.startsWith('/')) {
+    res.status(400).json({ error: 'path is required' });
+    return;
+  }
+  const filePath = resolveWithin(MUSIC_DIR, serverPath, true);
+  if (!filePath) {
+    res.status(400).json({ error: 'invalid path' });
+    return;
+  }
+  try {
+    const stats = await fsp.stat(filePath);
+    if (!stats.isFile() || !AUDIO_EXTENSIONS.has(path.extname(filePath).toLowerCase())) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json(issueStreamTicket(serverPath, AUTH_TOKEN));
+  } catch (_error) {
+    res.status(404).json({ error: 'not found' });
+  }
 });
 
 // Fills in any missing visualization/leveling cache data for the library

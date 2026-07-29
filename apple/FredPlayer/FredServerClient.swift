@@ -110,16 +110,31 @@ struct FredServerClient {
         let tracks: [String]
     }
 
-    func streamURL(forServerPath path: String) -> URL {
-        endpoint("stream/\(encodedPath(path))")
+    func streamingURL(serverPath: String) async throws -> URL {
+        var request = request(path: "api/stream-ticket")
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(StreamTicketRequest(path: serverPath))
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validate(response, errorData: data)
+        let ticket = try JSONDecoder().decode(StreamTicketResponse.self, from: data)
+        var components = URLComponents(
+            url: endpoint(ticket.path),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "expires", value: String(ticket.expires)),
+            URLQueryItem(name: "signature", value: ticket.signature)
+        ]
+        guard let url = components.url else { throw FredServerError.invalidResponse }
+        return url
     }
 
-    func downloadTrack(serverPath: String) async throws -> URL {
-        let (url, response) = try await URLSession.shared.download(
-            for: authorizedRequest(url: streamURL(forServerPath: serverPath))
-        )
-        try validate(response)
-        return url
+    private struct StreamTicketRequest: Encodable { let path: String }
+    private struct StreamTicketResponse: Decodable {
+        let path: String
+        let expires: Int
+        let signature: String
     }
 
     func fetchProfile(serverPath: String) async -> TrackProfile? {

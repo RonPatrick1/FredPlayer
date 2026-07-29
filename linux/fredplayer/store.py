@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -293,6 +293,26 @@ class StoredState:
     server_base_url: str = ""
     server_token: str = ""
     shuffle_enabled: bool = True
+    speaker_latencies: dict[str, "SpeakerLatency"] = field(default_factory=dict)
+    selected_microphone: str = ""
+
+
+@dataclass(frozen=True)
+class SpeakerLatency:
+    key: str
+    label: str
+    delay_ms: int
+
+    @classmethod
+    def from_json(cls, key: str, value: object) -> Optional["SpeakerLatency"]:
+        if not key or not isinstance(value, dict):
+            return None
+        label = str(value.get("label", "")).strip() or key
+        delay_ms = max(0, min(1500, _safe_int(value.get("delay_ms"), 0)))
+        return cls(key=key, label=label, delay_ms=delay_ms)
+
+    def to_json(self) -> dict:
+        return {"label": self.label, "delay_ms": self.delay_ms}
 
 
 @dataclass
@@ -315,7 +335,7 @@ class WindowState:
         return cls(
             x=_safe_int(value.get("x"), defaults.x),
             y=_safe_int(value.get("y"), defaults.y),
-            width=max(900, _safe_int(value.get("width"), defaults.width)),
+            width=max(480, _safe_int(value.get("width"), defaults.width)),
             height=max(620, _safe_int(value.get("height"), defaults.height)),
             maximized=bool(value.get("maximized", False)),
             monitor_x=_safe_int(value.get("monitor_x"), 0),
@@ -378,6 +398,13 @@ class StateStore:
         if isinstance(data.get("playlist"), list):
             named_playlists[active_playlist] = legacy_playlist
         playlist = list(named_playlists[active_playlist])
+        speaker_latencies: dict[str, SpeakerLatency] = {}
+        raw_speaker_latencies = data.get("speaker_latencies", {})
+        if isinstance(raw_speaker_latencies, dict):
+            for raw_key, raw_value in raw_speaker_latencies.items():
+                calibration = SpeakerLatency.from_json(str(raw_key), raw_value)
+                if calibration is not None:
+                    speaker_latencies[calibration.key] = calibration
 
         return StoredState(
             playlist=playlist,
@@ -391,6 +418,8 @@ class StateStore:
             server_base_url=str(data.get("server_base_url", "")),
             server_token=str(data.get("server_token", "")),
             shuffle_enabled=bool(data.get("shuffle_enabled", True)),
+            speaker_latencies=speaker_latencies,
+            selected_microphone=str(data.get("selected_microphone", "")),
         )
 
     @staticmethod
@@ -419,7 +448,7 @@ class StateStore:
             else next(iter(named_playlists), self.DEFAULT_PLAYLIST_NAME)
         )
         data = {
-            "version": 2,
+            "version": 3,
             # Keep the active list in the original field so older versions can
             # still read it if the user rolls back.
             "playlist": [entry.to_json() for entry in state.playlist],
@@ -433,6 +462,11 @@ class StateStore:
             "server_base_url": state.server_base_url,
             "server_token": state.server_token,
             "shuffle_enabled": state.shuffle_enabled,
+            "speaker_latencies": {
+                key: calibration.to_json()
+                for key, calibration in state.speaker_latencies.items()
+            },
+            "selected_microphone": state.selected_microphone,
         }
         self._write_json(self.path, data)
 

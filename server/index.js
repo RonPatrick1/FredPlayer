@@ -5,6 +5,7 @@ const fs = require('fs');
 const fsp = fs.promises;
 const http = require('http');
 const path = require('path');
+const { spawn } = require('child_process');
 const express = require('express');
 const mm = require('music-metadata');
 const precomputeCache = require('./precompute-cache.js');
@@ -20,6 +21,8 @@ const VISUAL_DIR = path.join(DATA_DIR, 'visual');
 const ANDROID_VISUAL_DIR = path.join(DATA_DIR, 'android-visual');
 const APPLE_VISUAL_DIR = path.join(DATA_DIR, 'apple-visual');
 const APPLE_VISUAL_VARIANT_DIR = path.join(DATA_DIR, 'apple-visual-variant');
+const LINUX_VISUAL_VARIANT_DIR = path.join(DATA_DIR, 'linux-visual-variant');
+const LINUX_VISUAL_USAGE_PATH = path.join(DATA_DIR, 'linux-visual-usage.json');
 const PLAYLISTS_DIR = path.join(DATA_DIR, 'playlists');
 const LIAM_ASK_URL = process.env.LIAM_ASK_URL || 'http://127.0.0.1:8787/fredplayer-ask';
 // This hop is localhost-only (Node -> LiamAgent), not through nginx, so it
@@ -194,92 +197,208 @@ app.post('/api/stream-ticket', express.json({ limit: '8kb' }), async (req, res) 
   }
 });
 
-// Fills in any missing visualization/leveling cache data for the library
-// on its own — no manual `node precompute-cache.js` run required. Triggered
-// once at startup (catches anything added while the process was down) and
-// after every /api/rescan (the library-changed signal). jobForTrack() only
-// ever selects tracks that are actually missing valid cache data, so calling
-// this liberally costs nothing for the overwhelming majority of tracks that
-// are already cached — it just confirms "nothing to do" quickly.
+// Authenticated Ubuntu requests teach the server which settings are actually
+// in use. Only observed settings receive full-library background passes.
+let linuxVisualUsage = { version: 1, variants: {} };
+try {
+  const loaded = JSON.parse(fs.readFileSync(LINUX_VISUAL_USAGE_PATH, 'utf8'));
+  if (loaded?.version === 1 && loaded.variants && typeof loaded.variants === 'object') {
+    linuxVisualUsage = loaded;
+  }
+} catch (_error) {}
+
+let linuxUsageSaveTimer = null;
+function recordLinuxVisualUsage(key) {
+  const firstRequest = !linuxVisualUsage.variants[key];
+  const current = linuxVisualUsage.variants[key] || { requests: 0, last_used: '' };
+  current.requests = Math.max(0, Number(current.requests) || 0) + 1;
+  current.last_used = new Date().toISOString();
+  linuxVisualUsage.variants[key] = current;
+  if (firstRequest) setImmediate(triggerAutoPrecompute);
+  if (linuxUsageSaveTimer) return;
+  linuxUsageSaveTimer = setTimeout(async () => {
+    linuxUsageSaveTimer = null;
+    const tempPath = `${LINUX_VISUAL_USAGE_PATH}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+    try {
+      await fsp.mkdir(path.dirname(LINUX_VISUAL_USAGE_PATH), { recursive: true });
+      await fsp.writeFile(tempPath, `${JSON.stringify(linuxVisualUsage, null, 2)}\n`, { flag: 'wx' });
+      await fsp.rename(tempPath, LINUX_VISUAL_USAGE_PATH);
+    } catch (error) {
+      await fsp.unlink(tempPath).catch(() => {});
+      console.error(`Could not save Ubuntu visual usage: ${error.message}`);
+    }
+  }, 2000);
+  linuxUsageSaveTimer.unref?.();
+}
+
+function requestedLinuxSettings() {
+  return Object.entries(linuxVisualUsage.variants)
+    .filter(([key, usage]) => (Number(usage.requests) || 0) > 0
+      && precomputeCache.parseLinuxVariantKey(key))
+    .sort((left, right) => (Number(right[1].requests) || 0) - (Number(left[1].requests) || 0))
+    .map(([key]) => precomputeCache.parseLinuxVariantKey(key));
+}
+
+const precomputeChildQueue = [];
+let precomputeChildRunning = false;
+
+function enqueuePrecomputeChild(label, args, priority = 0) {
+  return new Promise((resolve, reject) => {
+    precomputeChildQueue.push({ label, args, priority, resolve, reject });
+    precomputeChildQueue.sort((left, right) => right.priority - left.priority);
+    if (!precomputeChildRunning) setImmediate(drainPrecomputeChildQueue);
+  });
+}
+
+async function drainPrecomputeChildQueue() {
+  if (precomputeChildRunning) return;
+  precomputeChildRunning = true;
+  try {
+    while (precomputeChildQueue.length) {
+      const job = precomputeChildQueue.shift();
+      console.log(`Starting background cache child: ${job.label}`);
+      try {
+        const didWork = await new Promise((resolve, reject) => {
+          const script = path.join(__dirname, 'precompute-cache.js');
+          const child = spawn('nice', ['-n', '15', process.execPath, script, ...job.args], {
+            cwd: __dirname,
+            env: process.env,
+            stdio: ['ignore', 'inherit', 'inherit'],
+          });
+          child.once('error', reject);
+          child.once('close', (code, signal) => {
+            if (code === 0) resolve(true);
+            else if (code === 3) resolve(false);
+            else reject(new Error(`cache child exited ${code ?? signal}`));
+          });
+        });
+        job.resolve(didWork);
+      } catch (error) {
+        job.reject(error);
+      }
+    }
+  } finally {
+    precomputeChildRunning = false;
+    if (precomputeChildQueue.length) setImmediate(drainPrecomputeChildQueue);
+  }
+}
+
+function commonPrecomputeArgs() {
+  return ['--music-dir', MUSIC_DIR, '--data-dir', DATA_DIR,
+    '--concurrency', '1', '--limit', '4', '--nice', '--status-exit'];
+}
+
+function linuxPrecomputeArgs(settings, track = '') {
+  const args = [...commonPrecomputeArgs(), '--platform', 'linux', '--visual-only',
+    '--linux-variant', '--linux-fps', String(settings.fps),
+    '--linux-waveform-ms', String(settings.waveformMs),
+    '--linux-fft-size', String(settings.fftSize),
+    '--linux-bars', String(settings.bars)];
+  if (!settings.logarithmic) args.push('--linux-linear');
+  if (track) args.push('--track', track);
+  return args;
+}
+
+const linuxVisualQueue = new Map();
+let linuxVisualQueueRunning = false;
+
+function queueLinuxVisual(relativePath, settings) {
+  const key = `${precomputeCache.linuxVariantKey(settings)}\n${relativePath}`;
+  if (!linuxVisualQueue.has(key)) linuxVisualQueue.set(key, { relativePath, settings });
+  if (!linuxVisualQueueRunning) setImmediate(drainLinuxVisualQueue);
+}
+
+async function drainLinuxVisualQueue() {
+  if (linuxVisualQueueRunning) return;
+  linuxVisualQueueRunning = true;
+  try {
+    while (linuxVisualQueue.size) {
+      const [key, request] = linuxVisualQueue.entries().next().value;
+      linuxVisualQueue.delete(key);
+      const sourcePath = resolveWithin(MUSIC_DIR, request.relativePath, true);
+      if (!sourcePath) continue;
+      await enqueuePrecomputeChild(
+        `Ubuntu requested ${request.relativePath}`,
+        linuxPrecomputeArgs(request.settings, request.relativePath),
+        10,
+      );
+    }
+  } catch (error) {
+    console.error(`Ubuntu visual background fill failed: ${error.message}`);
+  } finally {
+    linuxVisualQueueRunning = false;
+    if (linuxVisualQueue.size) setImmediate(drainLinuxVisualQueue);
+  }
+}
+
+// Fills missing cache data without doing FFT/decoding work on the HTTP event
+// loop. Small, low-priority child batches run at startup, after rescans, and
+// periodically while work remains. Authenticated track misses have priority
+// between batches, keeping both playback requests and requested caches moving.
 let autoPrecomputeRunning = false;
 let autoPrecomputeQueued = false;
+let autoPrecomputeTimer = null;
 
 async function triggerAutoPrecompute() {
+  if (autoPrecomputeTimer) {
+    clearTimeout(autoPrecomputeTimer);
+    autoPrecomputeTimer = null;
+  }
   if (autoPrecomputeRunning) {
     autoPrecomputeQueued = true;
     return;
   }
   autoPrecomputeRunning = true;
+  let didWork = false;
   try {
     do {
       autoPrecomputeQueued = false;
-      await runAutoPrecomputePass();
+      didWork = await runAutoPrecomputePass() || didWork;
     } while (autoPrecomputeQueued);
   } catch (err) {
     console.error(`Auto-precompute failed: ${err.message}`);
   } finally {
     autoPrecomputeRunning = false;
+    autoPrecomputeTimer = setTimeout(triggerAutoPrecompute, didWork ? 15000 : 300000);
+    autoPrecomputeTimer.unref?.();
   }
 }
 
 async function runAutoPrecomputePass() {
-  const inferred = await precomputeCache.inferAndroidSettings(VISUAL_DIR);
-  const baseOptions = {
-    musicDir: MUSIC_DIR,
-    dataDir: DATA_DIR,
-    platform: 'both',
-    analysisSeconds: 10,
-    visualOnly: false,
-    profilesOnly: false,
-    limit: Infinity,
-    // Lower than the manual CLI's default (8) — this runs inside the live
-    // streaming process alongside real traffic, not as a supervised
-    // maintenance job, so it should stay a background citizen.
-    concurrency: 3,
-    dryRun: false,
-    force: false,
-    nice: true,
-    android: {
-      ...precomputeCache.DEFAULT_ANDROID,
-      ...(inferred ? { fps: inferred.fps, bars: inferred.bars } : {}),
-    },
-    apple: { ...precomputeCache.DEFAULT_APPLE },
-  };
-  const tracks = await precomputeCache.walkAudioFiles(MUSIC_DIR, MUSIC_DIR);
+  const common = commonPrecomputeArgs();
   const passes = [
-    { label: 'legacy/Apple/profile', options: baseOptions },
-    {
-      label: `Android ${precomputeCache.androidVariantKey(ANDROID_60_SETTINGS)}`,
-      options: {
-        ...baseOptions,
-        platform: 'android',
-        visualOnly: true,
-        androidVariant: true,
-        android: { ...ANDROID_60_SETTINGS },
-      },
-    },
-    {
-      label: `Apple ${precomputeCache.appleVariantKey(APPLE_60_SETTINGS)}`,
-      options: {
-        ...baseOptions,
-        platform: 'apple',
-        visualOnly: true,
-        appleVariant: true,
-        apple: { ...APPLE_60_SETTINGS },
-      },
-    },
+    { label: 'legacy/Apple/profile', args: [...common, '--platform', 'both'] },
+    { label: `Android ${precomputeCache.androidVariantKey(ANDROID_60_SETTINGS)}`,
+      args: [...common, '--platform', 'android', '--visual-only', '--android-variant',
+        '--android-fps', String(ANDROID_60_SETTINGS.fps),
+        '--android-waveform-ms', String(ANDROID_60_SETTINGS.waveformMs),
+        '--android-fft-size', String(ANDROID_60_SETTINGS.fftSize),
+        '--android-bars', String(ANDROID_60_SETTINGS.bars)] },
+    { label: `Apple ${precomputeCache.appleVariantKey(APPLE_60_SETTINGS)}`,
+      args: [...common, '--platform', 'apple', '--visual-only', '--apple-variant',
+        '--apple-fps', String(APPLE_60_SETTINGS.fps),
+        '--apple-waveform-ms', String(APPLE_60_SETTINGS.waveformMs),
+        '--apple-fft-size', String(APPLE_60_SETTINGS.fftSize),
+        '--apple-bars', String(APPLE_60_SETTINGS.bars)] },
   ];
-  let totalJobs = 0;
-  for (const pass of passes) {
-    const jobs = tracks
-      .map((track) => precomputeCache.jobForTrack(track, pass.options))
-      .filter(Boolean);
-    totalJobs += jobs.length;
-    if (jobs.length === 0) continue;
-    console.log(`Auto-precompute (${pass.label}): ${jobs.length} track(s) need cache data`);
-    await precomputeCache.runJobs(jobs, pass.options);
+  for (const settings of requestedLinuxSettings()) {
+    passes.push({
+      label: `Ubuntu requested ${precomputeCache.linuxVariantKey(settings)}`,
+      args: linuxPrecomputeArgs(settings),
+    });
   }
-  if (totalJobs === 0) console.log('Auto-precompute: library cache is already up to date');
+  let didWork = false;
+  for (const pass of passes) {
+    try {
+      didWork = await enqueuePrecomputeChild(pass.label, pass.args, 0) || didWork;
+    } catch (error) {
+      // One corrupt or unusually short track must not prevent the independent
+      // Android, Apple, and Ubuntu cache passes from running. The next sweep
+      // will retry anything that remains missing.
+      console.error(`Auto-precompute (${pass.label}) failed: ${error.message}`);
+    }
+  }
+  return didWork;
 }
 
 libraryPromise.then(() => triggerAutoPrecompute());
@@ -443,6 +562,54 @@ app.put('/api/profile/*', express.json({ limit: '64kb' }), async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: 'write failed' });
   }
+});
+
+app.get('/api/linux-visual-variant/:variant/*', async (req, res) => {
+  const settings = precomputeCache.parseLinuxVariantKey(req.params.variant);
+  if (!settings) {
+    res.status(400).json({ error: 'invalid Ubuntu visual settings' });
+    return;
+  }
+  const relativePath = req.params[0];
+  const sourcePath = resolveWithin(MUSIC_DIR, relativePath, true);
+  if (!sourcePath) {
+    res.status(400).json({ error: 'invalid path' });
+    return;
+  }
+  let sourceStats;
+  try {
+    sourceStats = await fsp.stat(sourcePath);
+    if (!sourceStats.isFile() || !AUDIO_EXTENSIONS.has(path.extname(sourcePath).toLowerCase())) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+  } catch (_error) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  const key = precomputeCache.linuxVariantKey(settings);
+  recordLinuxVisualUsage(key);
+  const variantDirectory = path.join(LINUX_VISUAL_VARIANT_DIR, key);
+  const filePath = resolveWithin(variantDirectory, `${relativePath}.flv`, true);
+  if (!filePath) {
+    res.status(400).json({ error: 'invalid path' });
+    return;
+  }
+  const header = precomputeCache.readLinuxHeader(filePath);
+  if (header
+      && Math.abs(header.fps - settings.fps) < 0.001
+      && Math.abs(header.waveformMs - settings.waveformMs) < 0.001
+      && header.fftSize === settings.fftSize
+      && header.bars === settings.bars
+      && Boolean(header.flags & 1) === settings.logarithmic
+      && header.sourceSize === sourceStats.size
+      && Math.abs(header.sourceMtimeMs - Math.round(sourceStats.mtimeMs)) <= 1) {
+    res.type('application/octet-stream').sendFile(filePath);
+    return;
+  }
+  queueLinuxVisual(relativePath, settings);
+  res.set('Retry-After', '5');
+  res.status(202).json({ status: 'queued', variant: key });
 });
 
 app.get('/api/android-visual/:variant/*', async (req, res) => {

@@ -9,14 +9,19 @@ const {
   analyzeTrack,
   androidVariantKey,
   appleVariantKey,
+  linuxVariantKey,
   inferAndroidSettings,
   jobForTrack,
   parseAndroidVariantKey,
   parseAppleVariantKey,
+  parseArgs,
+  parseLinuxVariantKey,
   readAndroidHeader,
   readAppleHeader,
+  readLinuxHeader,
   validAndroidVisual,
   validAppleVisual,
+  validLinuxVisual,
   validProfile,
 } = require('../precompute-cache');
 
@@ -180,4 +185,72 @@ test('Apple variants use a validated settings-keyed directory', async (context) 
     job.applePath,
     path.join(root, 'data', 'apple-visual-variant', key, `${relativePath}.fav`),
   );
+});
+
+test('Ubuntu FLV1 variants are settings-keyed, compressed, and source-bound', async (context) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'fredplayer-cache-linux-variant-'));
+  context.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const settings = {
+    fps: 60,
+    waveformMs: 412,
+    fftSize: 8192,
+    bars: 256,
+    logarithmic: true,
+    level: 1,
+  };
+  const key = 'fps60-wave412-fft8192-bars256-log1-level1';
+  assert.equal(linuxVariantKey(settings), key);
+  assert.deepEqual(parseLinuxVariantKey(key), settings);
+  assert.equal(parseLinuxVariantKey('../linux-visual'), null);
+  assert.equal(parseLinuxVariantKey('fps60-wave412-fft1000-bars256-log1-level1'), null);
+
+  const musicDir = path.join(root, 'music');
+  const dataDir = path.join(root, 'data');
+  const relativePath = path.join('Artist', 'Track.wav');
+  const sourcePath = path.join(musicDir, relativePath);
+  writeTestWave(sourcePath, { sampleRate: 8_000, seconds: 0.2 });
+  const options = {
+    dataDir,
+    platform: 'linux',
+    visualOnly: true,
+    profilesOnly: false,
+    analysisSeconds: 10,
+    force: false,
+    linuxVariant: true,
+    android: { fps: 20, waveformMs: 90, fftSize: 512, bars: 32, logarithmic: true },
+    apple: { fps: 24, waveformMs: 80, fftSize: 1024, bars: 32, logarithmic: true },
+    linux: settings,
+  };
+  const job = jobForTrack({ sourcePath, relativePath }, options);
+  assert.ok(job?.linux);
+  assert.equal(job.linuxPath, path.join(dataDir, 'linux-visual-variant', key, `${relativePath}.flv`));
+  const written = await analyzeTrack(job, options);
+  assert.equal(written.linux, true);
+  assert.equal(validLinuxVisual(job.linuxPath), true);
+  const header = readLinuxHeader(job.linuxPath);
+  assert.equal(header.sampleRate, 48_000);
+  assert.equal(header.fps, 60);
+  assert.equal(header.waveformMs, 412);
+  assert.equal(header.fftSize, 8192);
+  assert.equal(header.bars, 256);
+  assert.equal(header.waveformPoints, 512);
+  assert.equal(header.sourceSize, (await fsp.stat(sourcePath)).size);
+  assert.equal(jobForTrack({ sourcePath, relativePath }, options), null);
+  await fsp.appendFile(sourcePath, Buffer.from([0]));
+  assert.ok(jobForTrack({ sourcePath, relativePath }, options)?.linux,
+    'a changed source invalidates its otherwise well-formed FLV1 file');
+});
+
+test('server child options select one exact track and report an idle pass', () => {
+  const options = parseArgs([
+    '--music-dir', '/tmp/music',
+    '--platform', 'linux',
+    '--track', 'Artist/Album/Track.flac',
+    '--status-exit',
+    '--linux-variant',
+  ]);
+  assert.equal(options.track, 'Artist/Album/Track.flac');
+  assert.equal(options.statusExit, true);
+  assert.equal(options.platform, 'linux');
+  assert.equal(options.linuxVariant, true);
 });

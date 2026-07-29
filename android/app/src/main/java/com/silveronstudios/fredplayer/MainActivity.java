@@ -17,16 +17,20 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.DocumentsContract;
+import android.text.Editable;
 import android.text.InputType;
+import android.text.TextWatcher;
 import android.view.DisplayCutout;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.widget.Button;
+import android.widget.ArrayAdapter;
 import android.widget.EditText;
 import android.widget.ImageButton;
 import android.widget.LinearLayout;
+import android.widget.ListView;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
@@ -37,6 +41,7 @@ import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -51,6 +56,30 @@ public class MainActivity extends Activity {
     private static final int REQUEST_PICK_FOLDER = 1003;
     private static final int REQUEST_AUDIO_CALIBRATION = 1004;
     private static final int MAX_FOLDER_DEPTH = 12;
+
+    private static final class ServerBrowserEntry {
+        final String folderPath;
+        final int folderTrackCount;
+        final int trackIndex;
+
+        private ServerBrowserEntry(String folderPath, int folderTrackCount, int trackIndex) {
+            this.folderPath = folderPath;
+            this.folderTrackCount = folderTrackCount;
+            this.trackIndex = trackIndex;
+        }
+
+        static ServerBrowserEntry folder(String path, int count) {
+            return new ServerBrowserEntry(path, count, -1);
+        }
+
+        static ServerBrowserEntry track(int index) {
+            return new ServerBrowserEntry(null, 0, index);
+        }
+
+        boolean isFolder() {
+            return folderPath != null;
+        }
+    }
 
     private final ArrayList<String> playlist = new ArrayList<>();
     private final LinkedHashMap<String, ArrayList<String>> playlists = new LinkedHashMap<>();
@@ -377,61 +406,269 @@ public class MainActivity extends Activity {
     }
 
     private void showServerTrackPicker(JSONArray tracks, String baseUrl) {
-        LinkedHashMap<String, ArrayList<Integer>> folders = new LinkedHashMap<>();
+        LinkedHashSet<Integer> selectedTracks = new LinkedHashSet<>();
+        ArrayList<ServerBrowserEntry> entries = new ArrayList<>();
+        String[] currentFolder = {""};
+
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setPadding(dp(16), dp(4), dp(16), 0);
+
+        LinearLayout folderRow = new LinearLayout(this);
+        folderRow.setOrientation(LinearLayout.HORIZONTAL);
+        folderRow.setGravity(Gravity.CENTER_VERTICAL);
+        Button upButton = button("Up");
+        folderRow.addView(upButton, inlineButton());
+        TextView folderLabel = text("All music", 16, Color.rgb(245, 243, 237));
+        folderLabel.setSingleLine(true);
+        folderRow.addView(folderLabel, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        TextView selectionLabel = text("0 selected", 13, Color.rgb(183, 182, 173));
+        folderRow.addView(selectionLabel);
+        container.addView(folderRow);
+
+        EditText search = new EditText(this);
+        search.setSingleLine(true);
+        search.setHint("Search titles, artists, albums, or folders");
+        container.addView(search, topMargin(6));
+
+        ListView list = new ListView(this);
+        int listHeight = Math.min(dp(520),
+                Math.max(dp(260), (int) (getResources().getDisplayMetrics().heightPixels * 0.56f)));
+        container.addView(list, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, listHeight));
+
+        ArrayAdapter<ServerBrowserEntry> adapter = new ArrayAdapter<ServerBrowserEntry>(
+                this, android.R.layout.simple_list_item_2, android.R.id.text1, entries) {
+            @Override
+            public View getView(int position, View convertView, ViewGroup parent) {
+                View row = super.getView(position, convertView, parent);
+                TextView primary = row.findViewById(android.R.id.text1);
+                TextView secondary = row.findViewById(android.R.id.text2);
+                ServerBrowserEntry entry = getItem(position);
+                if (entry == null) {
+                    return row;
+                }
+                if (entry.isFolder()) {
+                    primary.setText("Folder  " + serverFolderName(entry.folderPath));
+                    secondary.setText(entry.folderTrackCount +
+                            (entry.folderTrackCount == 1 ? " track" : " tracks") + "  ›");
+                } else {
+                    JSONObject track = tracks.optJSONObject(entry.trackIndex);
+                    String path = track == null ? "" : track.optString("path", "");
+                    String title = track == null ? "" : track.optString("title", "");
+                    if (title.isEmpty()) {
+                        int slash = path.lastIndexOf('/');
+                        title = slash >= 0 ? path.substring(slash + 1) : path;
+                    }
+                    primary.setText((selectedTracks.contains(entry.trackIndex) ? "✓  " : "○  ") + title);
+                    String artist = track == null ? "" : track.optString("artist", "");
+                    String album = track == null ? "" : track.optString("album", "");
+                    String subtitle = artist;
+                    if (!album.isEmpty()) {
+                        subtitle += (subtitle.isEmpty() ? "" : " — ") + album;
+                    }
+                    secondary.setText(subtitle.isEmpty() ? serverTrackFolder(path) : subtitle);
+                }
+                return row;
+            }
+        };
+        list.setAdapter(adapter);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Add from server")
+                .setView(container)
+                .setPositiveButton("Add selected tracks", null)
+                .setNeutralButton("Add all music", null)
+                .setNegativeButton("Cancel", null)
+                .create();
+
+        Runnable updateActions = () -> {
+            selectionLabel.setText(selectedTracks.size() + " selected");
+            Button addSelected = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+            Button addFolder = dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
+            if (addSelected != null) {
+                addSelected.setText(selectedTracks.isEmpty()
+                        ? "Add selected tracks"
+                        : "Add selected (" + selectedTracks.size() + ")");
+                addSelected.setEnabled(!selectedTracks.isEmpty());
+            }
+            if (addFolder != null) {
+                int count = countServerTracksInFolder(tracks, currentFolder[0]);
+                addFolder.setText(currentFolder[0].isEmpty()
+                        ? "Add all music (" + count + ")"
+                        : "Add folder (" + count + ")");
+                addFolder.setEnabled(count > 0);
+            }
+        };
+
+        Runnable refreshBrowser = () -> {
+            entries.clear();
+            String query = search.getText().toString().trim().toLowerCase(Locale.ROOT);
+            LinkedHashMap<String, Integer> childFolderCounts = new LinkedHashMap<>();
+            ArrayList<Integer> visibleTracks = new ArrayList<>();
+            for (int i = 0; i < tracks.length(); i++) {
+                JSONObject track = tracks.optJSONObject(i);
+                String path = track == null ? "" : track.optString("path", "");
+                if (path.isEmpty() || !serverTrackIsInFolder(path, currentFolder[0])) {
+                    continue;
+                }
+                if (!query.isEmpty()) {
+                    if (serverTrackMatches(track, query)) {
+                        visibleTracks.add(i);
+                    }
+                    continue;
+                }
+                String childFolder = immediateServerChildFolder(path, currentFolder[0]);
+                if (childFolder != null) {
+                    childFolderCounts.put(childFolder,
+                            childFolderCounts.getOrDefault(childFolder, 0) + 1);
+                } else {
+                    visibleTracks.add(i);
+                }
+            }
+            ArrayList<String> childFolders = new ArrayList<>(childFolderCounts.keySet());
+            childFolders.sort(String.CASE_INSENSITIVE_ORDER);
+            for (String child : childFolders) {
+                entries.add(ServerBrowserEntry.folder(child, childFolderCounts.get(child)));
+            }
+            visibleTracks.sort(Comparator.comparing(index ->
+                    serverTrackSortLabel(tracks.optJSONObject(index)), String.CASE_INSENSITIVE_ORDER));
+            for (int index : visibleTracks) {
+                entries.add(ServerBrowserEntry.track(index));
+            }
+            adapter.notifyDataSetChanged();
+            list.setSelection(0);
+            folderLabel.setText(currentFolder[0].isEmpty() ? "All music" : currentFolder[0]);
+            upButton.setEnabled(!currentFolder[0].isEmpty());
+            updateActions.run();
+        };
+
+        list.setOnItemClickListener((parent, view, position, id) -> {
+            ServerBrowserEntry entry = entries.get(position);
+            if (entry.isFolder()) {
+                currentFolder[0] = entry.folderPath;
+                search.setText("");
+                refreshBrowser.run();
+                return;
+            }
+            if (!selectedTracks.add(entry.trackIndex)) {
+                selectedTracks.remove(entry.trackIndex);
+            }
+            adapter.notifyDataSetChanged();
+            updateActions.run();
+        });
+        upButton.setOnClickListener(view -> {
+            currentFolder[0] = parentServerFolder(currentFolder[0]);
+            search.setText("");
+            refreshBrowser.run();
+        });
+        search.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                refreshBrowser.run();
+            }
+            @Override public void afterTextChanged(Editable s) {}
+        });
+        dialog.setOnShowListener(ignored -> {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+                addServerTrackIndices(tracks, baseUrl, new ArrayList<>(selectedTracks));
+                dialog.dismiss();
+            });
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
+                ArrayList<Integer> folderTracks = new ArrayList<>();
+                for (int i = 0; i < tracks.length(); i++) {
+                    JSONObject track = tracks.optJSONObject(i);
+                    String path = track == null ? "" : track.optString("path", "");
+                    if (serverTrackIsInFolder(path, currentFolder[0])) {
+                        folderTracks.add(i);
+                    }
+                }
+                addServerTrackIndices(tracks, baseUrl, folderTracks);
+                dialog.dismiss();
+            });
+            refreshBrowser.run();
+        });
+        dialog.show();
+    }
+
+    private String serverTrackFolder(String path) {
+        int slash = path.lastIndexOf('/');
+        return slash < 0 ? "" : path.substring(0, slash);
+    }
+
+    private String serverFolderName(String folder) {
+        int slash = folder.lastIndexOf('/');
+        return slash < 0 ? folder : folder.substring(slash + 1);
+    }
+
+    private String parentServerFolder(String folder) {
+        int slash = folder.lastIndexOf('/');
+        return slash < 0 ? "" : folder.substring(0, slash);
+    }
+
+    private boolean serverTrackIsInFolder(String trackPath, String folder) {
+        return !trackPath.isEmpty() &&
+                (folder.isEmpty() || trackPath.startsWith(folder + "/"));
+    }
+
+    private String immediateServerChildFolder(String trackPath, String folder) {
+        String trackFolder = serverTrackFolder(trackPath);
+        if (trackFolder.equals(folder)) {
+            return null;
+        }
+        String prefix = folder.isEmpty() ? "" : folder + "/";
+        if (!trackFolder.startsWith(prefix)) {
+            return null;
+        }
+        String remainder = trackFolder.substring(prefix.length());
+        int slash = remainder.indexOf('/');
+        String child = slash < 0 ? remainder : remainder.substring(0, slash);
+        return child.isEmpty() ? null : prefix + child;
+    }
+
+    private int countServerTracksInFolder(JSONArray tracks, String folder) {
+        int count = 0;
         for (int i = 0; i < tracks.length(); i++) {
             JSONObject track = tracks.optJSONObject(i);
-            String path = track == null ? "" : track.optString("path", "");
-            int slash = path.indexOf('/');
-            String folder = slash > 0 ? path.substring(0, slash) : "(other)";
-            ArrayList<Integer> indices = folders.get(folder);
-            if (indices == null) {
-                indices = new ArrayList<>();
-                folders.put(folder, indices);
+            if (track != null && serverTrackIsInFolder(track.optString("path", ""), folder)) {
+                count++;
             }
-            indices.add(i);
         }
-        ArrayList<String> folderNames = new ArrayList<>(folders.keySet());
-        Collections.sort(folderNames, String.CASE_INSENSITIVE_ORDER);
-        String[] labels = new String[folderNames.size()];
-        boolean[] checked = new boolean[folderNames.size()];
-        for (int i = 0; i < folderNames.size(); i++) {
-            labels[i] = folderNames.get(i) + " (" + folders.get(folderNames.get(i)).size() + ")";
-        }
+        return count;
+    }
 
-        new AlertDialog.Builder(this)
-                .setTitle("Choose folders (" + tracks.length() + " songs total)")
-                .setMultiChoiceItems(labels, checked, (dialog, which, isChecked) -> checked[which] = isChecked)
-                .setPositiveButton("Add Selected", (dialog, which) -> {
-                    LinkedHashSet<String> merged = new LinkedHashSet<>(playlist);
-                    Map<String, String[]> metadataOut = new HashMap<>();
-                    int added = 0;
-                    for (int i = 0; i < folderNames.size(); i++) {
-                        if (!checked[i]) {
-                            continue;
-                        }
-                        for (int trackIndex : folders.get(folderNames.get(i))) {
-                            if (addServerTrack(merged, tracks, trackIndex, baseUrl, metadataOut)) {
-                                added++;
-                            }
-                        }
-                    }
-                    PlaylistStore.saveTrackMetadata(this, metadataOut);
-                    reportServerAdd(merged, added);
-                })
-                .setNeutralButton("Add All", (dialog, which) -> {
-                    LinkedHashSet<String> merged = new LinkedHashSet<>(playlist);
-                    Map<String, String[]> metadataOut = new HashMap<>();
-                    int added = 0;
-                    for (int i = 0; i < tracks.length(); i++) {
-                        if (addServerTrack(merged, tracks, i, baseUrl, metadataOut)) {
-                            added++;
-                        }
-                    }
-                    PlaylistStore.saveTrackMetadata(this, metadataOut);
-                    reportServerAdd(merged, added);
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
+    private boolean serverTrackMatches(JSONObject track, String query) {
+        if (track == null) {
+            return false;
+        }
+        String searchable = track.optString("path", "") + "\n" +
+                track.optString("title", "") + "\n" +
+                track.optString("artist", "") + "\n" +
+                track.optString("album", "");
+        return searchable.toLowerCase(Locale.ROOT).contains(query);
+    }
+
+    private String serverTrackSortLabel(JSONObject track) {
+        if (track == null) {
+            return "";
+        }
+        String title = track.optString("title", "");
+        return title.isEmpty() ? track.optString("path", "") : title;
+    }
+
+    private void addServerTrackIndices(
+            JSONArray tracks, String baseUrl, Iterable<Integer> indices) {
+        LinkedHashSet<String> merged = new LinkedHashSet<>(playlist);
+        Map<String, String[]> metadataOut = new HashMap<>();
+        int added = 0;
+        for (int index : indices) {
+            if (addServerTrack(merged, tracks, index, baseUrl, metadataOut)) {
+                added++;
+            }
+        }
+        PlaylistStore.saveTrackMetadata(this, metadataOut);
+        reportServerAdd(merged, added);
     }
 
     private boolean addServerTrack(LinkedHashSet<String> merged, JSONArray tracks, int index, String baseUrl,
@@ -880,9 +1117,7 @@ public class MainActivity extends Activity {
         Button settingsButton = button("Settings");
         settingsButton.setContentDescription("Open settings");
         settingsButton.setOnClickListener(view -> showSettingsScreen());
-        header.addView(settingsButton, new LinearLayout.LayoutParams(
-                dp(112),
-                ViewGroup.LayoutParams.WRAP_CONTENT));
+        header.addView(settingsButton, inlineButton());
 
         stateText = text("Paused", 17, Color.rgb(183, 182, 173));
         stateText.setGravity(Gravity.CENTER);
@@ -1016,9 +1251,7 @@ public class MainActivity extends Activity {
 
         Button backButton = button("Back");
         backButton.setOnClickListener(view -> showPlayerScreen());
-        header.addView(backButton, new LinearLayout.LayoutParams(
-                dp(92),
-                ViewGroup.LayoutParams.WRAP_CONTENT));
+        header.addView(backButton, inlineButton());
 
         TextView title = text("Settings", 28, Color.rgb(245, 243, 237));
         title.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
@@ -1042,11 +1275,11 @@ public class MainActivity extends Activity {
         Button privacyButton = button("Privacy policy");
         privacyButton.setOnClickListener(view -> openWebPage(
                 "https://patrick-lamphier.com/fredplayer-privacy"));
-        root.addView(privacyButton, topMargin(10));
+        root.addView(privacyButton, actionButtonParams(10));
         Button supportButton = button("Support");
         supportButton.setOnClickListener(view -> openWebPage(
                 "https://patrick-lamphier.com/fredplayer-support"));
-        root.addView(supportButton, topMargin(10));
+        root.addView(supportButton, actionButtonParams(10));
 
         cacheText = text("", 13, Color.rgb(183, 182, 173));
         root.addView(cacheText, topMargin(22));
@@ -1073,32 +1306,32 @@ public class MainActivity extends Activity {
     private void addPlaylistManagementControls(LinearLayout root) {
         Button playlistsButton = button("Choose or manage playlists");
         playlistsButton.setOnClickListener(view -> showPlaylistMenu());
-        root.addView(playlistsButton, topMargin(12));
+        root.addView(playlistsButton, actionButtonParams(12));
 
         LinearLayout addButtons = new LinearLayout(this);
         addButtons.setOrientation(LinearLayout.HORIZONTAL);
-        addButtons.setGravity(Gravity.CENTER);
+        addButtons.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
         root.addView(addButtons, topMargin(10));
 
         Button addButton = button("Add files");
         addButton.setOnClickListener(view -> openAudioPicker());
-        addButtons.addView(addButton, weightedButton());
+        addButtons.addView(addButton, inlineButton());
 
         Button addFolderButton = button("Add folder");
         addFolderButton.setOnClickListener(view -> openFolderPicker());
-        addButtons.addView(addFolderButton, weightedButton());
+        addButtons.addView(addFolderButton, inlineButton());
 
         Button addFromServerButton = button("Add from server");
         addFromServerButton.setOnClickListener(view -> openServerLibraryDialog());
-        root.addView(addFromServerButton, topMargin(10));
+        root.addView(addFromServerButton, actionButtonParams(10));
 
         Button sharedPlaylistsButton = button("Shared playlists");
         sharedPlaylistsButton.setOnClickListener(view -> openSharedPlaylists());
-        root.addView(sharedPlaylistsButton, topMargin(10));
+        root.addView(sharedPlaylistsButton, actionButtonParams(10));
 
         Button askLiamButton = button("Ask Liam");
         askLiamButton.setOnClickListener(view -> openAskLiamDialog());
-        root.addView(askLiamButton, topMargin(10));
+        root.addView(askLiamButton, actionButtonParams(10));
 
         Button clearButton = button("Clear list");
         clearButton.setOnClickListener(view -> {
@@ -1107,11 +1340,11 @@ public class MainActivity extends Activity {
             updatePlaylistText();
             sendServiceCommand(SleepMusicService.ACTION_CLEAR);
         });
-        root.addView(clearButton, topMargin(10));
+        root.addView(clearButton, actionButtonParams(10));
 
         Button shuffleButton = button("Shuffle list");
         shuffleButton.setOnClickListener(view -> shufflePlaylist());
-        root.addView(shuffleButton, topMargin(10));
+        root.addView(shuffleButton, actionButtonParams(10));
     }
 
     private void addPrimarySettingsControls(LinearLayout root) {
@@ -1324,7 +1557,7 @@ public class MainActivity extends Activity {
                     !visualizationSettings.logScale));
             scaleButton.setText(scaleButtonText());
         });
-        root.addView(scaleButton, topMargin(10));
+        root.addView(scaleButton, actionButtonParams(10));
 
         addBluetoothDelayControls(root);
     }
@@ -1364,7 +1597,7 @@ public class MainActivity extends Activity {
 
             bluetoothCalibrateButton = button("Calibrate with microphone");
             bluetoothCalibrateButton.setOnClickListener(view -> confirmBluetoothCalibration());
-            root.addView(bluetoothCalibrateButton, topMargin(10));
+            root.addView(bluetoothCalibrateButton, actionButtonParams(10));
 
             TextView privacy = text(
                     "Calibration plays a short chirp and measures it locally. No recording or timing data is uploaded.",
@@ -1459,14 +1692,12 @@ public class MainActivity extends Activity {
 
             Button clear = button("Clear");
             clear.setOnClickListener(view -> confirmClearBluetoothCalibration(entry));
-            row.addView(clear, new LinearLayout.LayoutParams(
-                    dp(92),
-                    ViewGroup.LayoutParams.WRAP_CONTENT));
+            row.addView(clear, inlineButton());
         }
 
         Button clearAll = button("Clear all speaker calibrations");
         clearAll.setOnClickListener(view -> confirmClearAllBluetoothCalibrations());
-        bluetoothSavedListContainer.addView(clearAll, topMargin(12));
+        bluetoothSavedListContainer.addView(clearAll, actionButtonParams(12));
     }
 
     private void sendOutputVisualDelay(int delayMs) {
@@ -1879,7 +2110,7 @@ public class MainActivity extends Activity {
         button.setTextSize(13);
         button.setMinHeight(dp(38));
         button.setOnClickListener(listener);
-        row.addView(button, new LinearLayout.LayoutParams(dp(104), ViewGroup.LayoutParams.WRAP_CONTENT));
+        row.addView(button, inlineButton());
 
         parent.addView(row, matchWrap());
     }
@@ -2294,10 +2525,21 @@ public class MainActivity extends Activity {
         return params;
     }
 
-    private LinearLayout.LayoutParams weightedButton() {
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+    private LinearLayout.LayoutParams inlineButton() {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
         params.leftMargin = dp(5);
         params.rightMargin = dp(5);
+        return params;
+    }
+
+    private LinearLayout.LayoutParams actionButtonParams(int topMarginDp) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.topMargin = dp(topMarginDp);
+        params.gravity = Gravity.START;
         return params;
     }
 

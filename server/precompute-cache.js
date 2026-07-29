@@ -8,6 +8,7 @@ const fsp = fs.promises;
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
+const zlib = require('zlib');
 
 const AUDIO_EXTENSIONS = new Set([
   '.mp3', '.flac', '.m4a', '.wav', '.ogg', '.aac', '.wma', '.opus', '.alac',
@@ -23,6 +24,11 @@ const APPLE_VERSION = 1;
 const APPLE_WAVEFORM_POINTS = 128;
 const APPLE_HEADER_BYTES = 60;
 
+const LINUX_MAGIC = 0x464c5631; // FLV1
+const LINUX_VERSION = 1;
+const LINUX_WAVEFORM_POINTS = 512;
+const LINUX_HEADER_BYTES = 72;
+
 const DEFAULT_ANDROID = Object.freeze({
   fps: 20,
   waveformMs: 90,
@@ -36,6 +42,14 @@ const DEFAULT_APPLE = Object.freeze({
   fftSize: 1024,
   bars: 32,
   logarithmic: true,
+});
+const DEFAULT_LINUX = Object.freeze({
+  fps: 30,
+  waveformMs: 80,
+  fftSize: 4096,
+  bars: 96,
+  logarithmic: true,
+  level: 1,
 });
 
 function androidVariantKey(settings) {
@@ -86,6 +100,34 @@ function parseAppleVariantKey(value) {
       || settings.waveformMs > 1000
       || settings.fftSize < 2
       || settings.bars < 1
+      || settings.bars > 256) {
+    return null;
+  }
+  return settings;
+}
+
+function linuxVariantKey(settings) {
+  return `fps${settings.fps}-wave${settings.waveformMs}-fft${settings.fftSize}`
+    + `-bars${settings.bars}-log${settings.logarithmic ? 1 : 0}-level1`;
+}
+
+function parseLinuxVariantKey(value) {
+  const match = /^fps(\d+(?:\.\d+)?)-wave(\d+(?:\.\d+)?)-fft(\d+)-bars(\d+)-log([01])-level1$/.exec(value || '');
+  if (!match) return null;
+  const settings = {
+    fps: Number(match[1]),
+    waveformMs: Number(match[2]),
+    fftSize: Number(match[3]),
+    bars: Number(match[4]),
+    logarithmic: match[5] === '1',
+    level: 1,
+  };
+  if (settings.fps < 5
+      || settings.fps > 144
+      || settings.waveformMs < 10
+      || settings.waveformMs > 500
+      || ![512, 1024, 2048, 4096, 8192, 16384, 32768].includes(settings.fftSize)
+      || settings.bars < 24
       || settings.bars > 256) {
     return null;
   }
@@ -194,12 +236,13 @@ files are never replaced, so the command is safe to interrupt and resume.
 Options:
   --music-dir PATH          Audio library (default: MUSIC_DIR from .env)
   --data-dir PATH           Cache root (default: server/data)
-  --platform both|android|apple
-                            Visual formats to create (default: both)
+  --platform both|all|android|apple|linux
+                            Visual formats to create (default: Android+Apple)
   --analysis-seconds N      Leveling scan length (default: 10)
   --visual-only             Do not create leveling profiles
   --profiles-only           Do not create visualization files
   --limit N                 Process at most N tracks that need work
+  --track PATH              Process one exact library-relative track
   --concurrency N           Parallel decode jobs (default: min(8, cpus-1))
   --dry-run                 Report work without decoding audio
   --force                   Regenerate even tracks with already-valid caches
@@ -208,6 +251,7 @@ Options:
                             real playback/streaming reads on the same disk.
                             Recommended alongside a lower --concurrency when
                             running while the library might be in active use.
+  --status-exit             Exit 3 when no selected track needs work (server use)
   --android-fps N           Override observed/default Android FPS
   --android-waveform-ms N   Android waveform window (default: 90)
   --android-fft-size N      Android FFT size (default: 512)
@@ -225,6 +269,13 @@ Options:
                             data/apple-visual-variant/<settings>/ directory
                             instead of the legacy single-slot
                             data/apple-visual directory
+  --linux-fps N             Ubuntu FPS (default: 30)
+  --linux-waveform-ms N     Ubuntu waveform window (default: 80)
+  --linux-fft-size N        Ubuntu FFT size (default: 4096)
+  --linux-bars N            Ubuntu spectrum bars (default: 96)
+  --linux-linear            Use a linear Ubuntu spectrum scale
+  --linux-variant           Store FLV1 output under the settings-keyed
+                            data/linux-visual-variant/<settings>/ directory
   --help                    Show this help
 `;
 }
@@ -246,14 +297,18 @@ function parseArgs(argv) {
     visualOnly: false,
     profilesOnly: false,
     limit: Infinity,
+    track: '',
     concurrency: Math.max(1, Math.min(8, os.cpus().length - 1)),
     dryRun: false,
     force: false,
     nice: false,
+    statusExit: false,
     androidVariant: false,
     appleVariant: false,
+    linuxVariant: false,
     android: { ...DEFAULT_ANDROID },
     apple: { ...DEFAULT_APPLE },
+    linux: { ...DEFAULT_LINUX },
   };
 
   const take = (index, option) => {
@@ -276,10 +331,12 @@ function parseArgs(argv) {
       case '--visual-only': options.visualOnly = true; break;
       case '--profiles-only': options.profilesOnly = true; break;
       case '--limit': options.limit = parseNumber(take(i++, arg), arg, { integer: true, min: 1 }); break;
+      case '--track': options.track = take(i++, arg).split(path.sep).join('/'); break;
       case '--concurrency': options.concurrency = parseNumber(take(i++, arg), arg, { integer: true, min: 1 }); break;
       case '--dry-run': options.dryRun = true; break;
       case '--force': options.force = true; break;
       case '--nice': options.nice = true; break;
+      case '--status-exit': options.statusExit = true; break;
       case '--android-fps': options.android.fps = parseNumber(take(i++, arg), arg, { integer: true, min: 1 }); break;
       case '--android-waveform-ms': options.android.waveformMs = parseNumber(take(i++, arg), arg, { integer: true, min: 1 }); break;
       case '--android-fft-size': options.android.fftSize = parseNumber(take(i++, arg), arg, { integer: true, min: 2 }); break;
@@ -292,12 +349,18 @@ function parseArgs(argv) {
       case '--apple-bars': options.apple.bars = parseNumber(take(i++, arg), arg, { integer: true, min: 1 }); break;
       case '--apple-linear': options.apple.logarithmic = false; break;
       case '--apple-variant': options.appleVariant = true; break;
+      case '--linux-fps': options.linux.fps = parseNumber(take(i++, arg), arg, { min: 1 }); break;
+      case '--linux-waveform-ms': options.linux.waveformMs = parseNumber(take(i++, arg), arg, { min: 1 }); break;
+      case '--linux-fft-size': options.linux.fftSize = parseNumber(take(i++, arg), arg, { integer: true, min: 2 }); break;
+      case '--linux-bars': options.linux.bars = parseNumber(take(i++, arg), arg, { integer: true, min: 1 }); break;
+      case '--linux-linear': options.linux.logarithmic = false; break;
+      case '--linux-variant': options.linuxVariant = true; break;
       default: throw new Error(`Unknown option: ${arg}`);
     }
   }
 
-  if (!['both', 'android', 'apple'].includes(options.platform)) {
-    throw new Error('--platform must be both, android, or apple');
+  if (!['both', 'all', 'android', 'apple', 'linux'].includes(options.platform)) {
+    throw new Error('--platform must be both, all, android, apple, or linux');
   }
   if (options.visualOnly && options.profilesOnly) {
     throw new Error('--visual-only and --profiles-only cannot be combined');
@@ -305,6 +368,7 @@ function parseArgs(argv) {
   for (const [label, size] of [
     ['--android-fft-size', options.android.fftSize],
     ['--apple-fft-size', options.apple.fftSize],
+    ['--linux-fft-size', options.linux.fftSize],
   ]) {
     if ((size & (size - 1)) !== 0) {
       throw new Error(`${label} must be a power of two`);
@@ -446,6 +510,74 @@ function readAppleHeader(filePath) {
 
 function validAppleVisual(filePath) {
   return readAppleHeader(filePath) !== null;
+}
+
+function readLinuxHeader(filePath) {
+  try {
+    const stats = fs.statSync(filePath);
+    if (!stats.isFile() || stats.size < LINUX_HEADER_BYTES) return null;
+    const descriptor = fs.openSync(filePath, 'r');
+    const header = Buffer.alloc(LINUX_HEADER_BYTES);
+    try {
+      if (fs.readSync(descriptor, header, 0, header.length, 0) !== header.length) return null;
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    const result = {
+      magic: header.readUInt32BE(0),
+      version: header.readUInt16BE(4),
+      flags: header.readUInt16BE(6),
+      headerBytes: header.readUInt32BE(8),
+      sampleRate: header.readUInt32BE(12),
+      fps: header.readFloatBE(16),
+      waveformMs: header.readFloatBE(20),
+      fftSize: header.readUInt32BE(24),
+      bars: header.readUInt32BE(28),
+      waveformPoints: header.readUInt32BE(32),
+      frameCount: header.readUInt32BE(36),
+      frameIntervalNs: Number(header.readBigUInt64BE(40)),
+      sourceSize: Number(header.readBigUInt64BE(48)),
+      sourceMtimeMs: Number(header.readBigUInt64BE(56)),
+      uncompressedBytes: header.readUInt32BE(64),
+      compressedBytes: header.readUInt32BE(68),
+    };
+    const stride = result.waveformPoints + result.bars;
+    if (result.magic !== LINUX_MAGIC
+        || result.version !== LINUX_VERSION
+        || result.headerBytes !== LINUX_HEADER_BYTES
+        || result.sampleRate !== 48000
+        || !Number.isFinite(result.fps)
+        || result.fps < 5
+        || !Number.isFinite(result.waveformMs)
+        || result.waveformMs < 10
+        || result.waveformPoints !== LINUX_WAVEFORM_POINTS
+        || result.bars < 24
+        || result.frameCount < 1
+        || result.frameIntervalNs < 1
+        || result.uncompressedBytes !== result.frameCount * stride
+        || result.compressedBytes !== stats.size - LINUX_HEADER_BYTES) {
+      return null;
+    }
+    return result;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function validLinuxVisual(filePath) {
+  return readLinuxHeader(filePath) !== null;
+}
+
+function validLinuxVisualForSource(filePath, sourcePath) {
+  const header = readLinuxHeader(filePath);
+  if (!header) return false;
+  try {
+    const stats = fs.statSync(sourcePath);
+    return header.sourceSize === stats.size
+      && Math.abs(header.sourceMtimeMs - Math.round(stats.mtimeMs)) <= 1;
+  } catch (_error) {
+    return false;
+  }
 }
 
 async function inferAndroidSettings(visualDirectory) {
@@ -763,6 +895,142 @@ class AppleVisualWriter {
   discard() { this.output.discard(); }
 }
 
+class LinuxVisualWriter {
+  constructor(targetPath, sourcePath, sampleRate, settings, force = false) {
+    this.targetPath = targetPath;
+    this.sourcePath = sourcePath;
+    this.sampleRate = sampleRate;
+    this.settings = settings;
+    this.force = force;
+    this.frameCount = 0;
+    this.frames = [];
+    this.framesPerEmit = Math.max(1, Math.round(sampleRate / settings.fps));
+    this.framesSinceEmit = 0;
+    this.waveform = new Float32Array(Math.max(
+      LINUX_WAVEFORM_POINTS,
+      Math.round(sampleRate * settings.waveformMs / 1000),
+    ));
+    this.waveformWrite = 0;
+    this.waveformFilled = 0;
+    this.fftRing = new Float32Array(settings.fftSize);
+    this.fftOrdered = new Float32Array(settings.fftSize);
+    this.fftWrite = 0;
+    this.fftFilled = 0;
+    this.window = new Float64Array(settings.fftSize);
+    this.windowSum = 0;
+    for (let index = 0; index < settings.fftSize; index++) {
+      this.window[index] = 0.5 - 0.5 * Math.cos(
+        2 * Math.PI * index / Math.max(1, settings.fftSize - 1),
+      );
+      this.windowSum += this.window[index];
+    }
+    this.fft = new FFT(settings.fftSize);
+  }
+
+  accept(sample) {
+    const clipped = clamp(sample, -1, 1);
+    this.waveform[this.waveformWrite] = clipped;
+    this.waveformWrite = (this.waveformWrite + 1) % this.waveform.length;
+    this.waveformFilled = Math.min(this.waveformFilled + 1, this.waveform.length);
+    this.fftRing[this.fftWrite] = clipped;
+    this.fftWrite = (this.fftWrite + 1) % this.fftRing.length;
+    this.fftFilled = Math.min(this.fftFilled + 1, this.fftRing.length);
+    this.framesSinceEmit++;
+    if (this.framesSinceEmit < this.framesPerEmit) return;
+    this.framesSinceEmit = 0;
+    this.writeFrame();
+  }
+
+  writeFrame() {
+    const frame = Buffer.alloc(LINUX_WAVEFORM_POINTS + this.settings.bars);
+    const oldest = (this.waveformWrite - this.waveformFilled + this.waveform.length)
+      % this.waveform.length;
+    for (let point = 0; point < LINUX_WAVEFORM_POINTS; point++) {
+      const start = Math.floor(point * this.waveformFilled / LINUX_WAVEFORM_POINTS);
+      const end = Math.max(start + 1, Math.floor((point + 1) * this.waveformFilled / LINUX_WAVEFORM_POINTS));
+      let chosen = 0;
+      for (let offset = start; offset < end && offset < this.waveformFilled; offset++) {
+        const value = this.waveform[(oldest + offset) % this.waveform.length];
+        if (Math.abs(value) > Math.abs(chosen)) chosen = value;
+      }
+      frame[point] = Math.round(clamp(chosen, -1, 1) * 127) & 0xff;
+    }
+
+    this.fftOrdered.fill(0);
+    const missing = this.fftRing.length - this.fftFilled;
+    const fftOldest = (this.fftWrite - this.fftFilled + this.fftRing.length)
+      % this.fftRing.length;
+    for (let index = 0; index < this.fftFilled; index++) {
+      this.fftOrdered[missing + index] = this.fftRing[(fftOldest + index) % this.fftRing.length];
+    }
+    this.fft.transform(this.fftOrdered, this.window);
+    const nyquist = this.sampleRate * 0.5;
+    const lowHz = 32;
+    const highHz = Math.min(18000, nyquist);
+    for (let band = 0; band < this.settings.bars; band++) {
+      let startHz;
+      let endHz;
+      if (this.settings.logarithmic) {
+        startHz = lowHz * ((highHz / lowHz) ** (band / this.settings.bars));
+        endHz = lowHz * ((highHz / lowHz) ** ((band + 1) / this.settings.bars));
+      } else {
+        startHz = lowHz + (highHz - lowHz) * band / this.settings.bars;
+        endHz = lowHz + (highHz - lowHz) * (band + 1) / this.settings.bars;
+      }
+      const first = clamp(Math.floor(startHz * this.settings.fftSize / this.sampleRate), 1, this.settings.fftSize / 2);
+      const last = clamp(Math.max(first + 1, Math.floor(endHz * this.settings.fftSize / this.sampleRate)), 1, this.settings.fftSize / 2 + 1);
+      let amplitude = 0;
+      for (let bin = first; bin < last; bin++) {
+        amplitude = Math.max(amplitude, 2 * this.fft.magnitude(bin) / Math.max(1, this.windowSum));
+      }
+      const normalized = (20 * Math.log10(Math.max(amplitude, 0.000001)) + 80) / 80;
+      frame[LINUX_WAVEFORM_POINTS + band] = Math.round(clamp(normalized, 0, 1) * 255);
+    }
+    this.frames.push(frame);
+    this.frameCount++;
+  }
+
+  finish() {
+    if (this.framesSinceEmit > 0 || this.frameCount === 0) this.writeFrame();
+    const raw = Buffer.concat(this.frames);
+    const compressed = zlib.deflateSync(raw, { level: 6 });
+    const header = Buffer.alloc(LINUX_HEADER_BYTES);
+    const stats = fs.statSync(this.sourcePath);
+    header.writeUInt32BE(LINUX_MAGIC, 0);
+    header.writeUInt16BE(LINUX_VERSION, 4);
+    header.writeUInt16BE(this.settings.logarithmic ? 1 : 0, 6);
+    header.writeUInt32BE(LINUX_HEADER_BYTES, 8);
+    header.writeUInt32BE(48000, 12);
+    header.writeFloatBE(this.settings.fps, 16);
+    header.writeFloatBE(this.settings.waveformMs, 20);
+    header.writeUInt32BE(this.settings.fftSize, 24);
+    header.writeUInt32BE(this.settings.bars, 28);
+    header.writeUInt32BE(LINUX_WAVEFORM_POINTS, 32);
+    header.writeUInt32BE(this.frameCount, 36);
+    header.writeBigUInt64BE(BigInt(Math.round(1e9 / this.settings.fps)), 40);
+    header.writeBigUInt64BE(BigInt(stats.size), 48);
+    header.writeBigUInt64BE(BigInt(Math.round(stats.mtimeMs)), 56);
+    header.writeUInt32BE(raw.length, 64);
+    header.writeUInt32BE(compressed.length, 68);
+    fs.mkdirSync(path.dirname(this.targetPath), { recursive: true });
+    const tempPath = temporaryPath(this.targetPath);
+    try {
+      fs.writeFileSync(tempPath, Buffer.concat([header, compressed]), { flag: 'wx' });
+      if (!this.force && validLinuxVisualForSource(this.targetPath, this.sourcePath)) {
+        fs.unlinkSync(tempPath);
+        return false;
+      }
+      fs.renameSync(tempPath, this.targetPath);
+      return true;
+    } catch (error) {
+      try { fs.unlinkSync(tempPath); } catch (_unlinkError) {}
+      throw error;
+    }
+  }
+
+  discard() { this.frames = []; }
+}
+
 function commandOutput(command, args) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -813,16 +1081,20 @@ async function atomicProfileWrite(filePath, profile, { force = false } = {}) {
 
 async function analyzeTrack(job, options, abortSignal) {
   const { sampleRate, channels } = await audioFormat(job.sourcePath);
+  const decodeSampleRate = job.linux ? 48000 : sampleRate;
   const android = job.android
-    ? new AndroidVisualWriter(job.androidPath, sampleRate, options.android, options.force)
+    ? new AndroidVisualWriter(job.androidPath, decodeSampleRate, options.android, options.force)
     : null;
   const apple = job.apple
-    ? new AppleVisualWriter(job.applePath, sampleRate, options.apple, options.force)
+    ? new AppleVisualWriter(job.applePath, decodeSampleRate, options.apple, options.force)
     : null;
-  const normalizer = (android || apple)
-    ? new VolumeNormalizer(sampleRate, loadExistingProfile(job.profilePath), LEVELING_SETTINGS)
+  const linux = job.linux
+    ? new LinuxVisualWriter(job.linuxPath, job.sourcePath, decodeSampleRate, options.linux, options.force)
     : null;
-  const profileFrameLimit = Math.floor(options.analysisSeconds * sampleRate);
+  const normalizer = (android || apple || linux)
+    ? new VolumeNormalizer(decodeSampleRate, loadExistingProfile(job.profilePath), LEVELING_SETTINGS)
+    : null;
+  const profileFrameLimit = Math.floor(options.analysisSeconds * decodeSampleRate);
   let profileFrames = 0;
   let profileSamples = 0;
   let sumSquares = 0;
@@ -833,7 +1105,8 @@ async function analyzeTrack(job, options, abortSignal) {
   try {
     const args = ['-v', 'error', '-nostdin', '-threads', '1', '-i', job.sourcePath,
       '-map', '0:a:0', '-vn', '-sn', '-dn'];
-    if (!android && !apple) args.push('-t', String(options.analysisSeconds));
+    if (!android && !apple && !linux) args.push('-t', String(options.analysisSeconds));
+    if (job.linux) args.push('-ar', '48000');
     args.push('-f', 'f32le', '-acodec', 'pcm_f32le', 'pipe:1');
     // options.nice: background-safe mode, used by the server's own in-process
     // auto-trigger (and available to the CLI via --nice) so this doesn't
@@ -917,6 +1190,9 @@ async function analyzeTrack(job, options, abortSignal) {
           if (android) {
             android.accept((leveledLeft + leveledRight) * 0.5);
           }
+          if (linux) {
+            linux.accept((leveledLeft + leveledRight) * 0.5);
+          }
         }
       }
       pending = Buffer.from(data.subarray(usable));
@@ -931,6 +1207,7 @@ async function analyzeTrack(job, options, abortSignal) {
     const written = { profile: false, android: false, apple: false };
     if (android) written.android = android.finish();
     if (apple) written.apple = apple.finish();
+    if (linux) written.linux = linux.finish();
     if (job.profile) {
       written.profile = await atomicProfileWrite(job.profilePath, {
         rms: profileSamples ? Math.sqrt(sumSquares / profileSamples) : 0.18,
@@ -942,11 +1219,13 @@ async function analyzeTrack(job, options, abortSignal) {
     if (child && child.exitCode === null) child.kill('SIGTERM');
     android?.discard();
     apple?.discard();
+    linux?.discard();
     throw error;
   }
 }
 
 function jobForTrack(track, options) {
+  const linuxSettings = options.linux || DEFAULT_LINUX;
   const profilePath = path.join(options.dataDir, 'profiles', `${track.relativePath}.json`);
   const androidDirectory = options.androidVariant
     ? path.join(options.dataDir, 'android-visual', androidVariantKey(options.android))
@@ -956,21 +1235,31 @@ function jobForTrack(track, options) {
     ? path.join(options.dataDir, 'apple-visual-variant', appleVariantKey(options.apple))
     : path.join(options.dataDir, 'apple-visual');
   const applePath = path.join(appleDirectory, `${track.relativePath}.fav`);
+  const linuxDirectory = path.join(
+    options.dataDir,
+    'linux-visual-variant',
+    linuxVariantKey(linuxSettings),
+  );
+  const linuxPath = path.join(linuxDirectory, `${track.relativePath}.flv`);
   const visualEnabled = !options.profilesOnly;
   const job = {
     ...track,
     profilePath,
     androidPath,
     applePath,
+    linuxPath,
     profile: !options.visualOnly && options.analysisSeconds > 0 && (options.force || !validProfile(profilePath)),
     android: visualEnabled
-      && (options.platform === 'both' || options.platform === 'android')
+      && (options.platform === 'both' || options.platform === 'all' || options.platform === 'android')
       && (options.force || !validAndroidVisual(androidPath)),
     apple: visualEnabled
-      && (options.platform === 'both' || options.platform === 'apple')
+      && (options.platform === 'both' || options.platform === 'all' || options.platform === 'apple')
       && (options.force || !validAppleVisual(applePath)),
+    linux: visualEnabled
+      && (options.platform === 'all' || options.platform === 'linux')
+      && (options.force || !validLinuxVisualForSource(linuxPath, track.sourcePath)),
   };
-  return job.profile || job.android || job.apple ? job : null;
+  return job.profile || job.android || job.apple || job.linux ? job : null;
 }
 
 function formatDuration(seconds) {
@@ -1009,8 +1298,11 @@ async function main(argv = process.argv.slice(2)) {
     if (!barsWereExplicit) options.android.bars = inferred.bars;
   }
 
-  const tracks = await walkAudioFiles(options.musicDir, options.musicDir);
+  let tracks = await walkAudioFiles(options.musicDir, options.musicDir);
   tracks.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+  if (options.track) {
+    tracks = tracks.filter((track) => track.relativePath.split(path.sep).join('/') === options.track);
+  }
   const allJobs = tracks.map((track) => jobForTrack(track, options)).filter(Boolean);
   const jobs = allJobs.slice(0, options.limit);
   console.log(`Library: ${tracks.length} tracks; ${allJobs.length} need work; ${jobs.length} selected`);
@@ -1019,7 +1311,7 @@ async function main(argv = process.argv.slice(2)) {
     console.log(`Profiles: ${tracks.length - missing} valid; ${missing} missing`);
   }
   if (!options.profilesOnly) {
-    if (options.platform === 'both' || options.platform === 'android') {
+    if (options.platform === 'both' || options.platform === 'all' || options.platform === 'android') {
       const missing = allJobs.filter((job) => job.android).length;
       const storage = options.androidVariant
         ? `variant ${androidVariantKey(options.android)}`
@@ -1027,7 +1319,7 @@ async function main(argv = process.argv.slice(2)) {
       console.log(`Android visuals (${storage}): ${tracks.length - missing} valid; ${missing} missing`);
       console.log(`  settings: ${options.android.fps} FPS, ${options.android.waveformMs} ms, FFT ${options.android.fftSize}, ${options.android.bars} bars, ${options.android.logarithmic ? 'log' : 'linear'}`);
     }
-    if (options.platform === 'both' || options.platform === 'apple') {
+    if (options.platform === 'both' || options.platform === 'all' || options.platform === 'apple') {
       const missing = allJobs.filter((job) => job.apple).length;
       const storage = options.appleVariant
         ? `variant ${appleVariantKey(options.apple)}`
@@ -1035,10 +1327,18 @@ async function main(argv = process.argv.slice(2)) {
       console.log(`Apple visuals (${storage}): ${tracks.length - missing} valid; ${missing} missing`);
       console.log(`  settings: ${options.apple.fps} FPS, ${options.apple.waveformMs} ms, FFT ${options.apple.fftSize}, ${options.apple.bars} bars, ${options.apple.logarithmic ? 'log' : 'linear'}`);
     }
+    if (options.platform === 'all' || options.platform === 'linux') {
+      const missing = allJobs.filter((job) => job.linux).length;
+      console.log(`Ubuntu visuals (variant ${linuxVariantKey(options.linux)}): ${tracks.length - missing} valid; ${missing} missing`);
+      console.log(`  settings: ${options.linux.fps} FPS, ${options.linux.waveformMs} ms, FFT ${options.linux.fftSize}, ${options.linux.bars} bars, ${options.linux.logarithmic ? 'log' : 'linear'}`);
+    }
     if (inferred) console.log(`Android FPS/bars inferred from ${inferred.count} existing valid server files`);
   }
   if (!options.visualOnly) console.log(`Leveling: first ${options.analysisSeconds} seconds, silence-gated RMS and peak`);
-  if (options.dryRun || jobs.length === 0) return;
+  if (options.dryRun || jobs.length === 0) {
+    if (options.statusExit && jobs.length === 0) process.exitCode = 3;
+    return;
+  }
 
   const controller = new AbortController();
   const interrupt = () => controller.abort();
@@ -1078,7 +1378,7 @@ async function runJobs(jobs, options, { signal } = {}) {
       if (index >= jobs.length) return;
       const job = jobs[index];
       const relative = job.relativePath.split(path.sep).join('/');
-      const kinds = [job.profile && 'profile', job.android && 'Android', job.apple && 'Apple'].filter(Boolean).join('+');
+      const kinds = [job.profile && 'profile', job.android && 'Android', job.apple && 'Apple', job.linux && 'Ubuntu'].filter(Boolean).join('+');
       console.log(`[${index + 1}/${jobs.length}] ${kinds}: ${relative}`);
       try {
         await analyzeTrack(job, options, effectiveSignal);
@@ -1110,21 +1410,29 @@ module.exports = {
   ANDROID_VERSION,
   APPLE_MAGIC,
   APPLE_VERSION,
+  LINUX_MAGIC,
+  LINUX_VERSION,
   DEFAULT_ANDROID,
   DEFAULT_APPLE,
+  DEFAULT_LINUX,
   analyzeTrack,
   androidVariantKey,
   appleVariantKey,
+  linuxVariantKey,
   inferAndroidSettings,
   jobForTrack,
   parseArgs,
   parseAndroidVariantKey,
   parseAppleVariantKey,
+  parseLinuxVariantKey,
   runJobs,
   readAndroidHeader,
   readAppleHeader,
+  readLinuxHeader,
   validAndroidVisual,
   validAppleVisual,
+  validLinuxVisual,
+  validLinuxVisualForSource,
   validProfile,
   walkAudioFiles,
 };

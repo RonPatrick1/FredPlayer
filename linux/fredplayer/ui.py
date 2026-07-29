@@ -29,6 +29,7 @@ from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
 
 from . import APP_ID, APP_NAME
 from .audio import BackgroundPrecomputer, NormalizingAudioPlayer, PlayerCallbacks, PrecomputeCallbacks
+from . import latency
 from .leveling import LevelingSettings
 from .mpris import MprisServer
 from . import remote
@@ -36,6 +37,7 @@ from .store import (
     AUDIO_EXTENSIONS,
     PlaylistEntry,
     ProfileCache,
+    SpeakerLatency,
     StateStore,
     StoredState,
     SpectrumCache,
@@ -623,10 +625,19 @@ def surface_to_pixbuf(surface: cairo.ImageSurface, width: int, height: int) -> G
 
 def make_icon_button(icon_name: str, tooltip: str, primary: bool = False) -> Gtk.Button:
     button = Gtk.Button()
+    button.set_hexpand(False)
+    button.set_halign(Gtk.Align.CENTER)
     button.get_style_context().add_class("icon-button")
     if primary:
         button.get_style_context().add_class("primary-button")
     set_button_icon(button, icon_name, tooltip)
+    return button
+
+
+def make_text_button(label: str) -> Gtk.Button:
+    button = Gtk.Button(label=label)
+    button.set_hexpand(False)
+    button.set_halign(Gtk.Align.START)
     return button
 
 
@@ -694,11 +705,13 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         self.server_base_url = state.server_base_url
         self.server_token = state.server_token
         self.shuffle_enabled = state.shuffle_enabled
+        self.speaker_latencies = dict(state.speaker_latencies)
+        self.selected_microphone = state.selected_microphone
         self.window_state = state.window_state
         self._is_maximized = state.window_state.maximized
 
-        self.set_size_request(640, 620)
-        self.set_default_size(max(640, self.window_state.width), max(620, self.window_state.height))
+        self.set_size_request(480, 620)
+        self.set_default_size(max(480, self.window_state.width), max(620, self.window_state.height))
         self.playback_requested = False
         self.audio_actually_playing = False
         self.current_index = -1
@@ -719,6 +732,13 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         self._track_list_generation = 0
         self._liam_wait_dialog: Gtk.Dialog | None = None
         self._save_state_debounce_id: int | None = None
+        self._latency_route: latency.AudioOutput | None = None
+        self._latency_system_ms: int | None = None
+        self._latency_system_route_key = ""
+        self._latency_probe_running = False
+        self._latency_route_check_running = False
+        self._latency_calibrating = False
+        self._resume_after_latency_calibration = False
 
         self.player = NormalizingAudioPlayer(
             PlayerCallbacks(
@@ -733,6 +753,7 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         self.player.set_leveling_strength(self.leveling_strength)
         self.player.set_leveling_settings(self.leveling_settings)
         self.player.set_visualization_settings(self.visualization_settings)
+        self.player.set_visual_delay_ms(0)
         self.player.set_server_config(self.server_base_url, self.server_token)
         self.precomputer = BackgroundPrecomputer(
             PrecomputeCallbacks(
@@ -750,6 +771,7 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         self.connect("destroy", self._on_destroy)
         GLib.timeout_add(4, self._on_visual_clock_tick)
         GLib.timeout_add(500, self._on_progress_tick)
+        GLib.timeout_add_seconds(3, self._on_latency_route_tick)
         GLib.timeout_add_seconds(15, self._on_cache_status_tick)
 
     def _build_ui(self) -> None:
@@ -765,8 +787,17 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
 
         player_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         settings_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        settings_scroller = Gtk.ScrolledWindow()
+        settings_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        settings_scroller.set_hexpand(True)
+        settings_scroller.set_vexpand(True)
+        try:
+            settings_scroller.set_propagate_natural_width(False)
+        except AttributeError:
+            pass
+        settings_scroller.add(settings_page)
         self.page_stack.add_named(player_page, "player")
-        self.page_stack.add_named(settings_page, "settings")
+        self.page_stack.add_named(settings_scroller, "settings")
 
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
         header.get_style_context().add_class("top-bar")
@@ -787,14 +818,20 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
 
         self.now_title_label = Gtk.Label(label="No song selected")
         self.now_title_label.get_style_context().add_class("now-title")
-        self.now_title_label.set_halign(Gtk.Align.START)
+        self.now_title_label.set_halign(Gtk.Align.FILL)
+        self.now_title_label.set_xalign(0.0)
         self.now_title_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.now_title_label.set_max_width_chars(1)
+        self.now_title_label.set_hexpand(True)
         now_box.pack_start(self.now_title_label, False, False, 0)
 
         self.now_meta_label = Gtk.Label(label="")
         self.now_meta_label.get_style_context().add_class("now-meta")
-        self.now_meta_label.set_halign(Gtk.Align.START)
+        self.now_meta_label.set_halign(Gtk.Align.FILL)
+        self.now_meta_label.set_xalign(0.0)
         self.now_meta_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.now_meta_label.set_max_width_chars(1)
+        self.now_meta_label.set_hexpand(True)
         now_box.pack_start(self.now_meta_label, False, False, 0)
 
         self.seek_adjustment = Gtk.Adjustment(
@@ -834,12 +871,18 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
 
         self.state_label = Gtk.Label(label="Paused")
         self.state_label.get_style_context().add_class("muted")
-        self.state_label.set_halign(Gtk.Align.START)
-        status_row.pack_start(self.state_label, False, False, 0)
+        self.state_label.set_halign(Gtk.Align.FILL)
+        self.state_label.set_xalign(0.0)
+        self.state_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.state_label.set_max_width_chars(1)
+        self.state_label.set_hexpand(True)
+        status_row.pack_start(self.state_label, True, True, 0)
 
         self.playlist_count_label = Gtk.Label()
         self.playlist_count_label.get_style_context().add_class("muted")
         self.playlist_count_label.set_halign(Gtk.Align.START)
+        self.playlist_count_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.playlist_count_label.set_max_width_chars(24)
         status_row.pack_start(self.playlist_count_label, False, False, 0)
 
         action_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -865,7 +908,7 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         next_button.connect("clicked", lambda _button: self._skip_track())
         transport.pack_start(next_button, False, False, 0)
 
-        settings_button = Gtk.Button(label="Settings")
+        settings_button = make_text_button("Settings")
         settings_button.connect("clicked", lambda _button: self._show_settings())
         action_box.pack_start(settings_button, False, False, 0)
 
@@ -890,8 +933,11 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
 
         self.visualizer_status_label = Gtk.Label(label=self._visualizer_default_text())
         self.visualizer_status_label.get_style_context().add_class("muted")
-        self.visualizer_status_label.set_halign(Gtk.Align.END)
+        self.visualizer_status_label.set_halign(Gtk.Align.FILL)
+        self.visualizer_status_label.set_xalign(1.0)
         self.visualizer_status_label.set_hexpand(True)
+        self.visualizer_status_label.set_ellipsize(Pango.EllipsizeMode.START)
+        self.visualizer_status_label.set_max_width_chars(1)
         player_visualizer_header.pack_start(self.visualizer_status_label, True, True, 0)
 
         self.visualizer_view = VisualizerView()
@@ -907,7 +953,7 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         settings_header.set_margin_end(18)
         settings_page.pack_start(settings_header, False, False, 0)
 
-        back_button = Gtk.Button(label="Back")
+        back_button = make_text_button("Back")
         back_button.connect("clicked", lambda _button: self._show_player())
         settings_header.pack_start(back_button, False, False, 0)
 
@@ -1016,9 +1062,11 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
 
         self.cache_status_label = Gtk.Label(label=self._cache_status_text())
         self.cache_status_label.get_style_context().add_class("muted")
-        self.cache_status_label.set_halign(Gtk.Align.START)
+        self.cache_status_label.set_halign(Gtk.Align.FILL)
         self.cache_status_label.set_xalign(0.0)
         self.cache_status_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.cache_status_label.set_max_width_chars(1)
+        self.cache_status_label.set_hexpand(True)
         self.cache_status_label.set_tooltip_text(self.cache_status_label.get_text())
         visualizer_panel.pack_start(self.cache_status_label, False, False, 0)
 
@@ -1051,46 +1099,46 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         self.playlist_selector.connect("changed", self._on_playlist_selected)
         playlist_switcher.pack_start(self.playlist_selector, True, True, 0)
 
-        new_playlist = Gtk.Button(label="New")
+        new_playlist = make_text_button("New")
         new_playlist.connect("clicked", lambda _button: self._create_playlist())
         playlist_switcher.pack_start(new_playlist, False, False, 0)
 
-        rename_playlist = Gtk.Button(label="Rename")
+        rename_playlist = make_text_button("Rename")
         rename_playlist.connect("clicked", lambda _button: self._rename_playlist())
         playlist_switcher.pack_start(rename_playlist, False, False, 0)
 
-        delete_playlist = Gtk.Button(label="Delete")
+        delete_playlist = make_text_button("Delete")
         delete_playlist.connect("clicked", lambda _button: self._delete_playlist())
         playlist_switcher.pack_start(delete_playlist, False, False, 0)
 
         library_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         playlist_panel.pack_start(library_buttons, False, False, 0)
 
-        add_files = Gtk.Button(label="Add files")
+        add_files = make_text_button("Add files")
         add_files.connect("clicked", lambda _button: self._choose_files())
         library_buttons.pack_start(add_files, False, False, 0)
 
-        add_folder = Gtk.Button(label="Add folder")
+        add_folder = make_text_button("Add folder")
         add_folder.connect("clicked", lambda _button: self._choose_folder())
         library_buttons.pack_start(add_folder, False, False, 0)
 
-        add_from_server = Gtk.Button(label="Add from server")
+        add_from_server = make_text_button("Add from server")
         add_from_server.connect("clicked", lambda _button: self._open_server_library_dialog())
         library_buttons.pack_start(add_from_server, False, False, 0)
 
-        ask_liam = Gtk.Button(label="Ask Liam")
+        ask_liam = make_text_button("Ask Liam")
         ask_liam.connect("clicked", lambda _button: self._open_ask_liam_dialog())
         library_buttons.pack_start(ask_liam, False, False, 0)
 
-        shuffle = Gtk.Button(label="Shuffle")
+        shuffle = make_text_button("Shuffle")
         shuffle.connect("clicked", lambda _button: self._shuffle_playlist())
         library_buttons.pack_start(shuffle, False, False, 0)
 
-        clear = Gtk.Button(label="Clear")
+        clear = make_text_button("Clear")
         clear.connect("clicked", lambda _button: self._clear_playlist())
         library_buttons.pack_start(clear, False, False, 0)
 
-        shared_playlists = Gtk.Button(label="Shared playlists")
+        shared_playlists = make_text_button("Shared playlists")
         shared_playlists.connect("clicked", lambda _button: self._open_shared_playlists())
         playlist_panel.pack_start(shared_playlists, False, False, 0)
 
@@ -1161,7 +1209,11 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         advanced_title.set_margin_top(8)
         level_panel.pack_start(advanced_title, False, False, 0)
         self._add_advanced_controls(level_panel)
+        self._add_latency_controls(level_panel)
         self._refresh_playlist_selector()
+        self._refresh_microphones()
+        self._refresh_saved_speaker_latencies()
+        self._start_latency_route_check(probe_if_changed=True)
         self.page_stack.set_visible_child_name("player")
 
     def _add_advanced_controls(self, parent: Gtk.Box) -> None:
@@ -1228,6 +1280,73 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
             lambda value: f"{value:.0f}%",
             lambda value: self._update_leveling_settings(output_ceiling=value / 100),
         )
+
+    def _add_latency_controls(self, parent: Gtk.Box) -> None:
+        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        separator.set_margin_top(10)
+        separator.set_margin_bottom(6)
+        parent.pack_start(separator, False, False, 0)
+
+        title = Gtk.Label(label="Speaker latency")
+        title.get_style_context().add_class("subtle-heading")
+        title.set_halign(Gtk.Align.START)
+        parent.pack_start(title, False, False, 0)
+
+        self.latency_output_label = Gtk.Label(label="Current output: checking…")
+        self.latency_output_label.set_halign(Gtk.Align.FILL)
+        self.latency_output_label.set_xalign(0.0)
+        self.latency_output_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.latency_output_label.set_max_width_chars(1)
+        parent.pack_start(self.latency_output_label, False, False, 0)
+
+        self.latency_applied_label = Gtk.Label(label="Visualization delay: checking…")
+        self.latency_applied_label.get_style_context().add_class("muted")
+        self.latency_applied_label.set_halign(Gtk.Align.START)
+        self.latency_applied_label.set_xalign(0.0)
+        self.latency_applied_label.set_line_wrap(True)
+        parent.pack_start(self.latency_applied_label, False, False, 0)
+
+        microphone_label = Gtk.Label(label="Calibration microphone")
+        microphone_label.set_halign(Gtk.Align.START)
+        parent.pack_start(microphone_label, False, False, 0)
+
+        self.latency_microphone_combo = Gtk.ComboBoxText()
+        self.latency_microphone_combo.set_hexpand(True)
+        self.latency_microphone_combo.connect("changed", self._on_latency_microphone_changed)
+        parent.pack_start(self.latency_microphone_combo, False, False, 0)
+
+        self.latency_system_button = make_text_button("Refresh system estimate")
+        self.latency_system_button.connect("clicked", lambda _button: self._start_system_latency_probe())
+        parent.pack_start(self.latency_system_button, False, False, 0)
+
+        self.latency_calibrate_button = make_text_button("Calibrate with microphone")
+        self.latency_calibrate_button.connect("clicked", lambda _button: self._confirm_latency_calibration())
+        parent.pack_start(self.latency_calibrate_button, False, False, 0)
+
+        disclosure = Gtk.Label(
+            label=(
+                "The system estimate comes from the local audio stack. Microphone calibration measures "
+                "the complete speaker path; microphone audio is processed only in memory and is never saved or uploaded."
+            )
+        )
+        disclosure.get_style_context().add_class("muted")
+        disclosure.set_halign(Gtk.Align.START)
+        disclosure.set_xalign(0.0)
+        disclosure.set_line_wrap(True)
+        parent.pack_start(disclosure, False, False, 0)
+
+        saved_title = Gtk.Label(label="Saved speaker calibrations")
+        saved_title.get_style_context().add_class("subtle-heading")
+        saved_title.set_halign(Gtk.Align.START)
+        saved_title.set_margin_top(8)
+        parent.pack_start(saved_title, False, False, 0)
+
+        self.latency_saved_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        parent.pack_start(self.latency_saved_box, False, False, 0)
+
+        self.latency_clear_all_button = make_text_button("Clear all speaker calibrations")
+        self.latency_clear_all_button.connect("clicked", lambda _button: self._clear_all_speaker_latencies())
+        parent.pack_start(self.latency_clear_all_button, False, False, 0)
 
     def _add_scale(
         self,
@@ -1374,7 +1493,7 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         self.window_state = WindowState(
             x=max(-20000, int(x)),
             y=max(-20000, int(y)),
-            width=max(900, int(width)),
+            width=max(480, int(width)),
             height=max(620, int(height)),
             maximized=self._is_maximized,
             monitor_x=monitor_geometry.x,
@@ -1412,9 +1531,305 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
 
     def _show_settings(self) -> None:
         self.page_stack.set_visible_child_name("settings")
+        self._refresh_microphones()
+        self._start_latency_route_check(probe_if_changed=False)
+        self._start_system_latency_probe()
 
     def _show_player(self) -> None:
         self.page_stack.set_visible_child_name("player")
+
+    def _refresh_microphones(self) -> None:
+        if not hasattr(self, "latency_microphone_combo"):
+            return
+        choices = latency.microphones()
+        selected = self.selected_microphone
+        self.latency_microphone_combo.remove_all()
+        for microphone in choices:
+            suffix = " (default)" if microphone.default else ""
+            self.latency_microphone_combo.append(microphone.key, microphone.label + suffix)
+        available = {microphone.key for microphone in choices}
+        if selected not in available:
+            selected = choices[0].key if choices else ""
+        self.selected_microphone = selected
+        if selected:
+            self.latency_microphone_combo.set_active_id(selected)
+        elif not choices:
+            self.latency_microphone_combo.append("", "No microphone found")
+            self.latency_microphone_combo.set_active(0)
+        self._update_latency_controls()
+
+    def _on_latency_microphone_changed(self, combo: Gtk.ComboBoxText) -> None:
+        selected = combo.get_active_id() or ""
+        if selected == self.selected_microphone:
+            return
+        self.selected_microphone = selected
+        self._save_state()
+        self._update_latency_controls()
+
+    def _on_latency_route_tick(self) -> bool:
+        if self._destroyed:
+            return False
+        self._start_latency_route_check(probe_if_changed=True)
+        return True
+
+    def _start_latency_route_check(self, probe_if_changed: bool) -> None:
+        if self._destroyed or self._latency_route_check_running or self._latency_calibrating:
+            return
+        self._latency_route_check_running = True
+
+        def worker() -> None:
+            route = latency.current_output()
+            GLib.idle_add(self._on_latency_route_checked, route, probe_if_changed)
+
+        threading.Thread(target=worker, name="FredPlayerOutputRoute", daemon=True).start()
+
+    def _on_latency_route_checked(
+        self,
+        route: latency.AudioOutput,
+        probe_if_changed: bool,
+    ) -> bool:
+        self._latency_route_check_running = False
+        if self._destroyed:
+            return False
+        changed = self._latency_route is None or route.key != self._latency_route.key
+        self._latency_route = route
+        if changed:
+            self._latency_system_ms = None
+            self._latency_system_route_key = ""
+        self._apply_output_latency()
+        self._update_latency_controls()
+        if changed and probe_if_changed:
+            self._start_system_latency_probe()
+        return False
+
+    def _start_system_latency_probe(self) -> None:
+        if self._destroyed or self._latency_probe_running or self._latency_calibrating:
+            return
+        route = self._latency_route
+        if route is None:
+            self._start_latency_route_check(probe_if_changed=True)
+            return
+        self._latency_probe_running = True
+        self._update_latency_controls()
+
+        def worker() -> None:
+            try:
+                measured_ms = latency.probe_system_latency(route)
+                error = ""
+            except Exception as exc:
+                measured_ms = None
+                error = str(exc).strip() or "The audio system did not report latency"
+            GLib.idle_add(self._on_system_latency_probed, route, measured_ms, error)
+
+        threading.Thread(target=worker, name="FredPlayerLatencyProbe", daemon=True).start()
+
+    def _on_system_latency_probed(
+        self,
+        route: latency.AudioOutput,
+        measured_ms: int | None,
+        error: str,
+    ) -> bool:
+        self._latency_probe_running = False
+        if self._destroyed:
+            return False
+        if self._latency_route is not None and route.key == self._latency_route.key:
+            self._latency_system_ms = measured_ms
+            self._latency_system_route_key = route.key if measured_ms is not None else ""
+            self._apply_output_latency()
+            if error:
+                self.latency_applied_label.set_tooltip_text(error)
+        self._update_latency_controls()
+        return False
+
+    def _apply_output_latency(self) -> None:
+        route = self._latency_route
+        delay_ms = 0
+        source = "no estimate"
+        if route is not None:
+            calibration = self.speaker_latencies.get(route.key)
+            if calibration is not None:
+                delay_ms = calibration.delay_ms
+                source = "microphone calibration"
+            elif self._latency_system_route_key == route.key and self._latency_system_ms is not None:
+                delay_ms = self._latency_system_ms
+                source = "system estimate"
+        self.player.set_visual_delay_ms(delay_ms)
+        if hasattr(self, "latency_applied_label"):
+            system_text = (
+                f"{self._latency_system_ms} ms"
+                if route is not None
+                and self._latency_system_route_key == route.key
+                and self._latency_system_ms is not None
+                else "unavailable"
+            )
+            self.latency_applied_label.set_text(
+                f"Visualization delay: {delay_ms} ms ({source}); system reports {system_text}"
+            )
+
+    def _update_latency_controls(self) -> None:
+        if not hasattr(self, "latency_output_label"):
+            return
+        route = self._latency_route
+        route_text = route.label if route is not None else "checking…"
+        if route is not None and route.bluetooth:
+            route_text += " (Bluetooth)"
+        self.latency_output_label.set_text(f"Current output: {route_text}")
+        self.latency_output_label.set_tooltip_text(route_text)
+        busy = self._latency_probe_running or self._latency_calibrating
+        self.latency_system_button.set_sensitive(not busy and route is not None)
+        self.latency_system_button.set_label(
+            "Reading system estimate…" if self._latency_probe_running else "Refresh system estimate"
+        )
+        self.latency_calibrate_button.set_sensitive(
+            not busy and bool(self.selected_microphone) and route is not None
+        )
+        self.latency_calibrate_button.set_label(
+            "Calibrating…" if self._latency_calibrating else "Calibrate with microphone"
+        )
+        self.latency_clear_all_button.set_sensitive(bool(self.speaker_latencies) and not busy)
+        self._apply_output_latency()
+
+    def _confirm_latency_calibration(self) -> None:
+        if self._latency_calibrating or not self.selected_microphone:
+            return
+        route = self._latency_route
+        if route is None:
+            self._set_state("No audio output is available")
+            return
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=Gtk.DialogFlags.MODAL,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.CANCEL,
+            text=f'Calibrate speaker delay for "{route.label}"?',
+        )
+        dialog.format_secondary_text(
+            "FredPlayer will pause music and play a short audible chirp. Keep the selected microphone near the "
+            "speaker in a quiet room. Microphone audio is processed only in memory and is never saved or uploaded."
+        )
+        dialog.add_button("Start calibration", Gtk.ResponseType.OK)
+        try:
+            if dialog.run() != Gtk.ResponseType.OK:
+                return
+        finally:
+            dialog.destroy()
+
+        self._resume_after_latency_calibration = self.playback_requested
+        if self._resume_after_latency_calibration:
+            self._pause_playback()
+        self._latency_calibrating = True
+        self._set_state("Calibrating speaker latency")
+        self._update_latency_controls()
+        microphone_key = self.selected_microphone
+
+        def worker() -> None:
+            try:
+                result = latency.calibrate_with_microphone(microphone_key)
+                error = ""
+            except Exception as exc:
+                result = None
+                error = str(exc).strip() or "Speaker latency calibration failed"
+            GLib.idle_add(self._on_latency_calibration_finished, result, error)
+
+        threading.Thread(target=worker, name="FredPlayerLatencyCalibration", daemon=True).start()
+
+    def _on_latency_calibration_finished(
+        self,
+        result: latency.CalibrationResult | None,
+        error: str,
+    ) -> bool:
+        self._latency_calibrating = False
+        if self._destroyed:
+            return False
+        if result is not None:
+            self.speaker_latencies[result.output.key] = SpeakerLatency(
+                key=result.output.key,
+                label=result.output.label,
+                delay_ms=result.delay_ms,
+            )
+            self._latency_route = result.output
+            self._save_state()
+            self._refresh_saved_speaker_latencies()
+            self._apply_output_latency()
+            self._set_state(f"Speaker latency calibrated: {result.delay_ms} ms")
+        else:
+            self._set_state(error)
+        self._update_latency_controls()
+        if self._resume_after_latency_calibration:
+            self._resume_after_latency_calibration = False
+            self._start_or_resume()
+        return False
+
+    def _refresh_saved_speaker_latencies(self) -> None:
+        if not hasattr(self, "latency_saved_box"):
+            return
+        for child in list(self.latency_saved_box.get_children()):
+            self.latency_saved_box.remove(child)
+        for calibration in sorted(self.speaker_latencies.values(), key=lambda item: item.label.casefold()):
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            label = Gtk.Label(label=f"{calibration.label} · {calibration.delay_ms} ms")
+            label.set_halign(Gtk.Align.START)
+            label.set_hexpand(True)
+            label.set_ellipsize(Pango.EllipsizeMode.END)
+            label.set_max_width_chars(1)
+            row.pack_start(label, True, True, 0)
+            clear = make_text_button("Clear")
+            clear.connect(
+                "clicked",
+                lambda _button, key=calibration.key: self._confirm_clear_speaker_latency(key),
+            )
+            row.pack_start(clear, False, False, 0)
+            self.latency_saved_box.pack_start(row, False, False, 0)
+        if not self.speaker_latencies:
+            empty = Gtk.Label(label="No saved speaker calibrations")
+            empty.get_style_context().add_class("muted")
+            empty.set_halign(Gtk.Align.START)
+            self.latency_saved_box.pack_start(empty, False, False, 0)
+        self.latency_saved_box.show_all()
+        self._update_latency_controls()
+
+    def _confirm_clear_speaker_latency(self, key: str) -> None:
+        calibration = self.speaker_latencies.get(key)
+        if calibration is None:
+            return
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=Gtk.DialogFlags.MODAL,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.CANCEL,
+            text=f'Clear calibration for "{calibration.label}"?',
+        )
+        dialog.add_button("Clear", Gtk.ResponseType.OK)
+        try:
+            if dialog.run() != Gtk.ResponseType.OK:
+                return
+        finally:
+            dialog.destroy()
+        self.speaker_latencies.pop(key, None)
+        self._save_state()
+        self._refresh_saved_speaker_latencies()
+        self._apply_output_latency()
+
+    def _clear_all_speaker_latencies(self) -> None:
+        if not self.speaker_latencies:
+            return
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=Gtk.DialogFlags.MODAL,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.CANCEL,
+            text="Clear all saved speaker calibrations?",
+        )
+        dialog.add_button("Clear all", Gtk.ResponseType.OK)
+        try:
+            if dialog.run() != Gtk.ResponseType.OK:
+                return
+        finally:
+            dialog.destroy()
+        self.speaker_latencies.clear()
+        self._save_state()
+        self._refresh_saved_speaker_latencies()
+        self._apply_output_latency()
 
     def _on_key_press(self, _widget: Gtk.Widget, event: Gdk.EventKey) -> bool:
         if event.keyval == Gdk.KEY_Escape and self.page_stack.get_visible_child_name() == "settings":
@@ -2482,6 +2897,8 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
                 server_base_url=self.server_base_url,
                 server_token=self.server_token,
                 shuffle_enabled=self.shuffle_enabled,
+                speaker_latencies=self.speaker_latencies,
+                selected_microphone=self.selected_microphone,
                 window_state=self.window_state,
             )
         )
@@ -2635,7 +3052,7 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         subtitle.set_tooltip_text(subtitle_text)
         text_box.pack_start(subtitle, False, False, 0)
 
-        button = Gtk.Button(label="Remove")
+        button = make_text_button("Remove")
         button.connect("clicked", lambda _button, path=entry.path: self._remove_file(path))
         box.pack_start(button, False, False, 0)
         self.file_list.add(row)
@@ -2662,7 +3079,7 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
         label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
         box.pack_start(label, True, True, 0)
 
-        button = Gtk.Button(label=button_text)
+        button = make_text_button(button_text)
         button.connect("clicked", callback)
         box.pack_start(button, False, False, 0)
         list_box.add(row)
@@ -2685,6 +3102,7 @@ class FredPlayerWindow(Gtk.ApplicationWindow):
 
     def _set_state(self, message: str) -> None:
         self.state_label.set_text(message)
+        self.state_label.set_tooltip_text(message)
 
     def _on_destroy(self, _widget: Gtk.Widget) -> None:
         self._destroyed = True

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -595,6 +596,8 @@ class NormalizingAudioPlayer:
         self.visual_clock_profile: Optional[SpectrumProfile] = None
         self.visual_clock_waveform_profile: Optional[WaveformProfile] = None
         self.visual_clock_base_ns = 0
+        self.visual_delay_ms = 0
+        self.live_visual_frames: deque[tuple[int, VisualizationFrame]] = deque(maxlen=1024)
         self.visualizer = RealtimeAnalyzer(SAMPLE_RATE, settings=self.visualization_settings)
 
     def set_output_level(self, value: float) -> None:
@@ -630,7 +633,11 @@ class NormalizingAudioPlayer:
             ):
                 self.visual_clock_waveform_profile = None
             if self.visual_clock_profile is None and self.visual_clock_waveform_profile is None:
-                self.visual_clock_pipeline = None
+                self.live_visual_frames.clear()
+
+    def set_visual_delay_ms(self, delay_ms: int) -> None:
+        with self.visual_clock_lock:
+            self.visual_delay_ms = max(0, min(1500, int(delay_ms)))
 
     def settings_snapshot(self) -> tuple[float, float, LevelingSettings, VisualizationSettings]:
         with self.settings_lock:
@@ -1007,6 +1014,7 @@ class NormalizingAudioPlayer:
             else:
                 frame = self.visualizer.accept(left, right)
             if frame is not None:
+                self._remember_live_visualization(frame_index, frame)
                 self._emit_visualization(frame)
             pack_into(out, offset, left, right)
             offset += FRAME_BYTES
@@ -1019,6 +1027,10 @@ class NormalizingAudioPlayer:
         except Exception:
             pass
 
+    def _remember_live_visualization(self, sample_index: int, frame: VisualizationFrame) -> None:
+        with self.visual_clock_lock:
+            self.live_visual_frames.append((max(0, int(sample_index)), frame))
+
     def cached_spectrum_active(self) -> bool:
         with self.visual_clock_lock:
             return self.visual_clock_pipeline is not None and self.visual_clock_profile is not None
@@ -1030,6 +1042,7 @@ class NormalizingAudioPlayer:
                 and (
                     self.visual_clock_profile is not None
                     or self.visual_clock_waveform_profile is not None
+                    or bool(self.live_visual_frames)
                 )
             )
 
@@ -1059,7 +1072,8 @@ class NormalizingAudioPlayer:
             spectrum_profile = self.visual_clock_profile
             waveform_profile = self.visual_clock_waveform_profile
             base_ns = self.visual_clock_base_ns
-        if pipeline is None or (spectrum_profile is None and waveform_profile is None):
+            visual_delay_ms = self.visual_delay_ms
+        if pipeline is None:
             return None
         try:
             ok, position = pipeline.query_position(Gst.Format.TIME)
@@ -1075,7 +1089,24 @@ class NormalizingAudioPlayer:
             if spectrum_profile is not None
             else SAMPLE_RATE
         )
-        sample_index = int((position + base_ns) * sample_rate / Gst.SECOND)
+        delayed_position = max(0, position + base_ns - visual_delay_ms * Gst.MSECOND)
+        sample_index = int(delayed_position * sample_rate / Gst.SECOND)
+
+        live_frame = None
+        with self.visual_clock_lock:
+            for live_sample_index, candidate in reversed(self.live_visual_frames):
+                if live_sample_index <= sample_index:
+                    live_frame = candidate
+                    break
+            discard_before = sample_index - SAMPLE_RATE * 3
+            while self.live_visual_frames and self.live_visual_frames[0][0] < discard_before:
+                self.live_visual_frames.popleft()
+
+        if spectrum_profile is None and waveform_profile is None:
+            return live_frame
+
+        if live_frame is not None:
+            fallback = live_frame
         waveform = fallback.waveform
         peak = fallback.peak
         rms = fallback.rms
@@ -1103,10 +1134,11 @@ class NormalizingAudioPlayer:
         base_ns: int = 0,
     ) -> None:
         with self.visual_clock_lock:
-            self.visual_clock_pipeline = pipeline if profile is not None or waveform_profile is not None else None
+            self.visual_clock_pipeline = pipeline
             self.visual_clock_profile = profile
             self.visual_clock_waveform_profile = waveform_profile
             self.visual_clock_base_ns = max(0, int(base_ns))
+            self.live_visual_frames.clear()
 
     def _clear_visual_clock(self, pipeline: Optional[Gst.Pipeline] = None) -> None:
         with self.visual_clock_lock:
@@ -1116,6 +1148,7 @@ class NormalizingAudioPlayer:
             self.visual_clock_profile = None
             self.visual_clock_waveform_profile = None
             self.visual_clock_base_ns = 0
+            self.live_visual_frames.clear()
 
     def _set_playback_clock(
         self,

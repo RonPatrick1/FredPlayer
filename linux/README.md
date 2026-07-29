@@ -2,6 +2,18 @@
 
 Local desktop version of FredPlayer for shuffled baby sleep music playback on Ubuntu.
 
+## Native C++ preview
+
+The replacement C++17/GTKmm implementation is under `linux/cpp`. It uses
+native GStreamer DSP/playback, FFTW, OpenGL/libepoxy, TagLib, libcurl, and
+PulseAudio/PipeWire integration, while reading the existing playlists,
+settings, profiles, and visualization caches. See `linux/cpp/README.md` for
+the headless build and manual test commands.
+
+The installed desktop entry intentionally remains on the Python build until
+the native preview has been manually approved. No preview build command opens
+or manipulates application windows.
+
 ## Run
 
 ```bash
@@ -23,7 +35,7 @@ On a fresh Ubuntu install, the equivalent packages are:
 ```bash
 sudo apt install python3-gi python3-mutagen python3-opengl python3-numpy mesa-utils \
   gir1.2-gtk-3.0 gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
-  gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good pulseaudio-utils \
   gstreamer1.0-plugins-ugly gstreamer1.0-libav
 ```
 
@@ -46,6 +58,8 @@ sudo apt install python3-gi python3-mutagen python3-opengl python3-numpy mesa-ut
 - Per-track loudness profile cache keyed by path plus file size and modified time.
 - Real-time moving RMS/peak gain leveling, compression, and hard output ceiling.
 - Standard Linux media-key integration through MPRIS: Play/Pause, Stop, Next, Previous, and desktop media controls.
+- Per-output visualization synchronization using the latency reported by the local GStreamer/PipeWire audio stack.
+- Optional end-to-end speaker-delay calibration with a chosen local microphone; calibrations are saved locally per output device and microphone audio is never stored or uploaded.
 - Follows the Ubuntu light/dark theme while the app is running.
 - GPU-rendered real-time waveform and multicolor FFT spectrum display from the processed output audio.
 - Visualization controls for update rate, waveform time window, display bar count, FFT resolution/window length, FFT smoothing, and log/linear FFT scale.

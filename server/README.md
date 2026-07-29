@@ -1,7 +1,9 @@
 # FredPlayer media server
 
-The running server streams the library and serves device caches. Android and
-Linux retain their existing `/api/visual/*` namespace under `data/visual/`.
+The running server streams the library and serves device caches. Older Android
+and Linux clients retain `/api/visual/*` under `data/visual/`. The native
+Ubuntu client uses settings-keyed `FLV1` files under
+`data/linux-visual-variant/`.
 Apple's compact `FAV1` files use `/api/apple-visual/*` and
 `data/apple-visual/`, so an upload from one platform cannot displace another
 platform's incompatible bytes. Leveling profiles remain shared JSON at
@@ -35,10 +37,11 @@ time they are published.
 
 ## Precomputing device caches
 
-`precompute-cache.js` is an offline, manual job; the HTTP process never starts
-it automatically. It scans `MUSIC_DIR`, preserves every valid existing cache,
-and atomically fills missing 10-second leveling profiles plus both visual
-formats. A stopped run can be resumed with the same command.
+`precompute-cache.js` is also available as an offline manual job. The HTTP
+process runs conservative startup/rescan passes for common variants and can
+fill an authenticated device's missing track at idle I/O priority. Every path
+preserves valid files and writes atomically, so a stopped run resumes without
+discarding completed work.
 
 ```bash
 cd server
@@ -59,6 +62,31 @@ unsigned byte per spectrum bar. `MediaCache.serverVisual(from:settings:)`
 validates and expands those bytes into Apple's existing `VisualCacheEntry`.
 The matching `MediaCache.serverLoudness(from:)` helper converts the shared
 `{rms, peak}` JSON into Apple's dB-based cache entry.
+
+## Ubuntu visualization variants
+
+Native Ubuntu requests
+`/api/linux-visual-variant/<settings>/*`. The canonical key includes FPS,
+waveform window, FFT size, spectrum bars, scale, and the canonical leveling
+preset, for example `fps30-wave80-fft4096-bars96-log1-level1`.
+
+`FLV1` uses a fixed 72-byte big-endian header followed by a zlib-compressed
+payload. The header records source identity, sample rate, every analysis
+setting, 512 waveform points, frame count, and frame interval. Each decoded
+frame contains signed waveform bytes followed by unsigned spectrum bytes.
+
+If a requested track is not ready, the server returns `202` with
+`Retry-After` and queues one low-priority job. Authenticated requests update an
+atomic usage registry. Background passes fill only settings variants that have
+actually been requested; there is no hardcoded Ubuntu default pass. Old
+variants are not deleted automatically.
+
+Manual examples:
+
+```bash
+npm run precompute-cache -- --platform linux --linux-variant --dry-run
+nice -n 10 npm run precompute-cache -- --platform linux --linux-variant --nice
+```
 
 ## Android visualization variants
 

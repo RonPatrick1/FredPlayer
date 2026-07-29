@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=FredPlayer Native
+GenericName=Music Player
+Comment=Native C++ FredPlayer preview
+Exec=/var/www/FredPlayer-mono/linux/cpp/build/fredplayer-native
+Path=/var/www/FredPlayer-mono
+Icon=/var/www/FredPlayer-mono/linux/assets/fredplayer-icon.png
+Terminal=false
+Categories=Audio;AudioVideo;Player;
+StartupNotify=true
+StartupWMClass=FredPlayerNative

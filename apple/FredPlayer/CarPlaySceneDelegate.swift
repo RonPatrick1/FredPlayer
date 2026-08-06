@@ -7,7 +7,7 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
     private var interfaceController: CPInterfaceController?
     private var listTemplate: CPListTemplate?
     private var tracksObservation: AnyCancellable?
-    private var shuffleObservation: AnyCancellable?
+    private var nowPlayingButtonsObservation: AnyCancellable?
 
     func templateApplicationScene(
         _ templateApplicationScene: CPTemplateApplicationScene,
@@ -27,9 +27,13 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
                 self?.listTemplate?.updateSections([self?.makeSection(tracks: tracks) ?? CPListSection(items: [])])
             }
 
-        shuffleObservation = PlayerController.shared.$shuffleEnabled
-            .sink { shuffleEnabled in
-                CPNowPlayingTemplate.shared.updateNowPlayingButtons([Self.shuffleButton(enabled: shuffleEnabled)])
+        nowPlayingButtonsObservation = PlayerController.shared.$shuffleEnabled
+            .combineLatest(PlayerController.shared.$repeatMode)
+            .sink { shuffleEnabled, repeatMode in
+                CPNowPlayingTemplate.shared.updateNowPlayingButtons([
+                    Self.shuffleButton(enabled: shuffleEnabled),
+                    Self.repeatButton(mode: repeatMode)
+                ])
             }
     }
 
@@ -38,7 +42,7 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         didDisconnectInterfaceController interfaceController: CPInterfaceController
     ) {
         tracksObservation = nil
-        shuffleObservation = nil
+        nowPlayingButtonsObservation = nil
         listTemplate = nil
         self.interfaceController = nil
     }
@@ -48,6 +52,19 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         let image = UIImage(systemName: symbolName) ?? UIImage(systemName: "shuffle")!
         return CPNowPlayingImageButton(image: image) { _ in
             PlayerController.shared.toggleShuffle()
+        }
+    }
+
+    private static func repeatButton(mode: RepeatMode) -> CPNowPlayingImageButton {
+        let symbolName: String
+        switch mode {
+        case .off: symbolName = "repeat"
+        case .all: symbolName = "repeat.circle.fill"
+        case .one: symbolName = "repeat.1.circle.fill"
+        }
+        let image = UIImage(systemName: symbolName) ?? UIImage(systemName: "repeat")!
+        return CPNowPlayingImageButton(image: image) { _ in
+            PlayerController.shared.cycleRepeatMode()
         }
     }
 

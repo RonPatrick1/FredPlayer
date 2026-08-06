@@ -108,19 +108,36 @@ struct LyricsView: View {
     // which is what makes the progressive karaoke-style fill possible without
     // a custom Layout.
     private func activeWords(_ phrase: LyricsPhrase) -> Text {
-        phrase.words.enumerated().reduce(Text("")) { partial, entry in
+        let adjustedTime = compensatedTime(player.currentTime)
+        return phrase.words.enumerated().reduce(Text("")) { partial, entry in
             let (index, word) = entry
-            let sung = word.time <= player.currentTime
+            // A word's own timestamp marks when Whisper detected it
+            // starting, but that has a known tendency to anticipate the
+            // word slightly rather than land on its audible onset. Using
+            // the NEXT word's start (or the phrase's end for the last
+            // word) as the "fully sung" boundary instead removes that
+            // early bias.
+            let sungBoundary = index + 1 < phrase.words.count ? phrase.words[index + 1].time : phrase.end
+            let sung = sungBoundary <= adjustedTime
             let separator = index == 0 ? "" : " "
             return partial + Text(separator + word.text)
                 .foregroundStyle(sung ? Color.primary : Color.secondary.opacity(0.5))
         }
     }
 
+    // Same calibrated output latency the visualizer already delays its
+    // published frame by (see PlayerController.publishVisualFrame) —
+    // without it, lyrics highlight ahead of what's actually audible on
+    // routes with real output latency (Bluetooth etc).
+    private func compensatedTime(_ time: TimeInterval) -> TimeInterval {
+        max(0, time - player.outputLatency)
+    }
+
     private func updateActiveIndex(for time: TimeInterval) {
+        let adjustedTime = compensatedTime(time)
         var index: Int?
         for (i, phrase) in phrases.enumerated() {
-            if phrase.start <= time {
+            if phrase.start <= adjustedTime {
                 index = i
             } else {
                 break

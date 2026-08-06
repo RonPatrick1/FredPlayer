@@ -4,7 +4,7 @@ struct PlayerPanel: View {
     @EnvironmentObject private var player: PlayerController
     @State private var settingsPresented = false
     @State private var removeConfirmationPresented = false
-    @State private var lyricsComingSoonPresented = false
+    @State private var lyricsPresented = false
 
     var body: some View {
         VStack(spacing: 10) {
@@ -57,7 +57,7 @@ struct PlayerPanel: View {
                 }
                 .disabled(player.currentTrack == nil)
                 Button {
-                    lyricsComingSoonPresented = true
+                    lyricsPresented = true
                 } label: {
                     Image(systemName: "quote.bubble")
                 }
@@ -86,8 +86,9 @@ struct PlayerPanel: View {
             Button("Remove", role: .destructive) { player.removeCurrentTrack() }
             Button("Cancel", role: .cancel) {}
         }
-        .alert("Lyrics screen coming soon", isPresented: $lyricsComingSoonPresented) {
-            Button("OK", role: .cancel) {}
+        .sheet(isPresented: $lyricsPresented) {
+            LyricsView()
+                .environmentObject(player)
         }
     }
 

@@ -15,6 +15,28 @@ struct TrackProfile: Codable {
     let peak: Float
 }
 
+struct LyricsWord: Codable, Identifiable {
+    let time: Double
+    let text: String
+
+    var id: Double { time }
+}
+
+struct LyricsPhrase: Codable, Identifiable {
+    let start: Double
+    let end: Double
+    let text: String
+    let words: [LyricsWord]
+
+    var id: Double { start }
+}
+
+private struct LyricsSidecar: Codable {
+    let version: String?
+    let language: String?
+    let sections: [String: [LyricsPhrase]]
+}
+
 struct AskLiamPlaylist: Codable {
     let name: String
     let tracks: [String]
@@ -157,6 +179,22 @@ struct FredServerClient {
             try validate(response)
             return true
         } catch { return false }
+    }
+
+    // Prefers the "Original" section (matching source-language lyrics);
+    // falls back to whatever section is present for a translation-only
+    // sidecar. Returns nil for both real errors and "no lyrics for this
+    // track" (HTTP 404) — the caller only needs to distinguish "loading"
+    // from "nothing to show", not the reason.
+    func fetchLyrics(serverPath: String) async -> [LyricsPhrase]? {
+        do {
+            let (data, response) = try await URLSession.shared.data(
+                for: request(path: "api/lyrics/\(encodedPath(serverPath))")
+            )
+            try validate(response)
+            let sidecar = try JSONDecoder().decode(LyricsSidecar.self, from: data)
+            return sidecar.sections["Original"] ?? sidecar.sections.values.first
+        } catch { return nil }
     }
 
     func fetchVisual(serverPath: String, settings: VisualCacheSettings) async -> Data? {

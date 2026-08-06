@@ -3,6 +3,7 @@ import SwiftUI
 struct PlayerPanel: View {
     @EnvironmentObject private var player: PlayerController
     @State private var settingsPresented = false
+    @State private var removeConfirmationPresented = false
 
     var body: some View {
         VStack(spacing: 10) {
@@ -44,6 +45,16 @@ struct PlayerPanel: View {
                 }
                 Button(action: player.next) { Image(systemName: "forward.fill") }
                 Button(action: player.stop) { Image(systemName: "stop.fill") }
+                Button(action: player.cycleRepeatMode) {
+                    Image(systemName: player.repeatMode == .one ? "repeat.1" : "repeat")
+                        .foregroundStyle(player.repeatMode == .off ? Color.secondary : Color.accentColor)
+                }
+                Button {
+                    removeConfirmationPresented = true
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .disabled(player.currentTrack == nil)
                 Button {
                     settingsPresented = true
                 } label: {
@@ -60,6 +71,14 @@ struct PlayerPanel: View {
         .sheet(isPresented: $settingsPresented) {
             PlayerSettingsView()
                 .environmentObject(player)
+        }
+        .confirmationDialog(
+            "Remove the current track from this playlist?",
+            isPresented: $removeConfirmationPresented,
+            titleVisibility: .visible
+        ) {
+            Button("Remove", role: .destructive) { player.removeCurrentTrack() }
+            Button("Cancel", role: .cancel) {}
         }
     }
 

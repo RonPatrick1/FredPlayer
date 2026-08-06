@@ -11,6 +11,20 @@ private enum PlaybackPreparationError: LocalizedError {
     }
 }
 
+enum RepeatMode: Int {
+    case off = 0
+    case all = 1
+    case one = 2
+
+    var next: RepeatMode {
+        switch self {
+        case .off: return .all
+        case .all: return .one
+        case .one: return .off
+        }
+    }
+}
+
 @MainActor
 final class PlayerController: ObservableObject {
     static let shared = PlayerController()
@@ -38,6 +52,9 @@ final class PlayerController: ObservableObject {
     }
     @Published private(set) var deviceID = ""
     @Published var shuffleEnabled = true {
+        didSet { saveSettings() }
+    }
+    @Published var repeatMode: RepeatMode = .all {
         didSet { saveSettings() }
     }
 
@@ -198,6 +215,22 @@ final class PlayerController: ObservableObject {
 
     func next() { playNext() }
 
+    func removeCurrentTrack() {
+        guard let currentTrackID,
+              let index = playlist.tracks.firstIndex(where: { $0.id == currentTrackID }) else { return }
+        playlist.removeTracks(at: IndexSet(integer: index))
+        // The shuffle bag may reference an index/ID that shifted or no
+        // longer exists after the removal — simplest safe fix is to drop
+        // it and let it get rebuilt fresh next time it's needed.
+        shuffleBag.removeAll()
+        guard !playlist.tracks.isEmpty else {
+            stop()
+            return
+        }
+        let nextIndex = min(index, playlist.tracks.count - 1)
+        play(trackID: playlist.tracks[nextIndex].id)
+    }
+
     func play(trackID: PlaylistTrack.ID) {
         play(trackID: trackID, recordHistory: true)
     }
@@ -265,6 +298,10 @@ final class PlayerController: ObservableObject {
     func toggleShuffle() {
         shuffleEnabled.toggle()
         shuffleBag.removeAll()
+    }
+
+    func cycleRepeatMode() {
+        repeatMode = repeatMode.next
     }
 
     func prepareCaches() {
@@ -698,9 +735,27 @@ final class PlayerController: ObservableObject {
         if !engine.isRunning { try engine.start() }
     }
 
+    // Called only when a track finishes playing on its own — manual next()
+    // always advances/wraps regardless of repeat mode; only the natural
+    // end-of-track path should honor "repeat one" (replay) or "repeat off"
+    // (stop instead of wrapping).
     private func trackDidFinish(_ id: PlaylistTrack.ID) {
         guard currentTrackID == id, isPlaying else { return }
-        playNext()
+        switch repeatMode {
+        case .one:
+            play(trackID: id, recordHistory: false)
+        case .off:
+            let atEnd = shuffleEnabled
+                ? shuffleBag.isEmpty
+                : (playlist.tracks.firstIndex { $0.id == id } ?? -1) >= playlist.tracks.count - 1
+            if atEnd {
+                stop()
+            } else {
+                playNext()
+            }
+        case .all:
+            playNext()
+        }
     }
 
     private func startProgressTimer() {
@@ -788,6 +843,28 @@ final class PlayerController: ObservableObject {
                 return .commandFailed
             }
             Task { @MainActor [weak self] in self?.seek(to: event.positionTime) }
+            return .success
+        }
+
+        commandCenter.changeShuffleModeCommand.isEnabled = true
+        commandCenter.changeShuffleModeCommand.addTarget { [weak self] event in
+            guard let event = event as? MPChangeShuffleModeCommandEvent else { return .commandFailed }
+            Task { @MainActor [weak self] in
+                self?.shuffleEnabled = event.shuffleType != .off
+                self?.shuffleBag.removeAll()
+            }
+            return .success
+        }
+        commandCenter.changeRepeatModeCommand.isEnabled = true
+        commandCenter.changeRepeatModeCommand.addTarget { [weak self] event in
+            guard let event = event as? MPChangeRepeatModeCommandEvent else { return .commandFailed }
+            Task { @MainActor [weak self] in
+                switch event.repeatType {
+                case .one: self?.repeatMode = .one
+                case .off: self?.repeatMode = .off
+                default: self?.repeatMode = .all
+                }
+            }
             return .success
         }
 
@@ -1088,6 +1165,7 @@ final class PlayerController: ObservableObject {
         defer { isRestoringSettings = false }
         settings.register(defaults: [
             "player.shuffleEnabled": true,
+            "player.repeatMode": RepeatMode.all.rawValue,
             "player.outputLevel": 0.8,
             "player.levelingStrength": 0.65,
             "player.compressorThreshold": -18.0,
@@ -1104,6 +1182,7 @@ final class PlayerController: ObservableObject {
             "server.baseURL": ""
         ])
         shuffleEnabled = settings.bool(forKey: "player.shuffleEnabled")
+        repeatMode = RepeatMode(rawValue: settings.integer(forKey: "player.repeatMode")) ?? .all
         outputLevel = settings.float(forKey: "player.outputLevel")
         levelingStrength = settings.float(forKey: "player.levelingStrength")
         compressorThreshold = settings.float(forKey: "player.compressorThreshold")
@@ -1141,6 +1220,7 @@ final class PlayerController: ObservableObject {
     private func saveSettings() {
         guard !isRestoringSettings else { return }
         settings.set(shuffleEnabled, forKey: "player.shuffleEnabled")
+        settings.set(repeatMode.rawValue, forKey: "player.repeatMode")
         settings.set(outputLevel, forKey: "player.outputLevel")
         settings.set(levelingStrength, forKey: "player.levelingStrength")
         settings.set(compressorThreshold, forKey: "player.compressorThreshold")

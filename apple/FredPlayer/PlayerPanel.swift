@@ -4,6 +4,7 @@ struct PlayerPanel: View {
     @EnvironmentObject private var player: PlayerController
     @State private var settingsPresented = false
     @State private var removeConfirmationPresented = false
+    @State private var lyricsComingSoonPresented = false
 
     var body: some View {
         VStack(spacing: 10) {
@@ -56,9 +57,14 @@ struct PlayerPanel: View {
                 }
                 .disabled(player.currentTrack == nil)
                 Button {
+                    lyricsComingSoonPresented = true
+                } label: {
+                    Image(systemName: "quote.bubble")
+                }
+                Button {
                     settingsPresented = true
                 } label: {
-                    Image(systemName: "slider.horizontal.3")
+                    Image(systemName: "gearshape")
                 }
             }
             .font(.title3)
@@ -79,6 +85,9 @@ struct PlayerPanel: View {
         ) {
             Button("Remove", role: .destructive) { player.removeCurrentTrack() }
             Button("Cancel", role: .cancel) {}
+        }
+        .alert("Lyrics screen coming soon", isPresented: $lyricsComingSoonPresented) {
+            Button("OK", role: .cancel) {}
         }
     }
 

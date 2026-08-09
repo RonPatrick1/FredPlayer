@@ -5,19 +5,23 @@ struct PlayerPanel: View {
     @State private var settingsPresented = false
     @State private var removeConfirmationPresented = false
     @State private var lyricsPresented = false
+    @State private var whatsNextPresented = false
 
     var body: some View {
         VStack(spacing: 10) {
             if let track = player.currentTrack {
-                VStack(spacing: 2) {
-                    Text(track.displayTitle)
-                        .font(.headline)
-                        .lineLimit(1)
-                    if let subtitle = track.displaySubtitle {
-                        Text(subtitle)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    artworkView
+                    VStack(spacing: 2) {
+                        Text(track.displayTitle)
+                            .font(.headline)
                             .lineLimit(1)
+                        if let subtitle = track.displaySubtitle {
+                            Text(subtitle)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
                     }
                 }
 
@@ -62,6 +66,11 @@ struct PlayerPanel: View {
                     Image(systemName: "quote.bubble")
                 }
                 Button {
+                    whatsNextPresented = true
+                } label: {
+                    Image(systemName: "list.bullet")
+                }
+                Button {
                     settingsPresented = true
                 } label: {
                     Image(systemName: "gearshape")
@@ -90,11 +99,34 @@ struct PlayerPanel: View {
             LyricsView()
                 .environmentObject(player)
         }
+        .sheet(isPresented: $whatsNextPresented) {
+            WhatsNextView()
+                .environmentObject(player)
+        }
     }
 
     private func format(_ seconds: TimeInterval) -> String {
         guard seconds.isFinite else { return "0:00" }
         return String(format: "%d:%02d", Int(seconds) / 60, Int(seconds) % 60)
+    }
+
+    @ViewBuilder
+    private var artworkView: some View {
+        RoundedRectangle(cornerRadius: 8)
+            .fill(.quaternary)
+            .frame(width: 48, height: 48)
+            .overlay {
+                if let artwork = player.currentArtwork {
+                    Image(uiImage: artwork)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 48, height: 48)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                } else {
+                    Image(systemName: "music.note")
+                        .foregroundStyle(.secondary)
+                }
+            }
     }
 }
 

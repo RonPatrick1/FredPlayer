@@ -2,6 +2,7 @@ import AVFoundation
 import Combine
 import MediaPlayer
 import OSLog
+import UIKit
 
 private enum PlaybackPreparationError: LocalizedError {
     case noAudioTrack
@@ -30,7 +31,15 @@ final class PlayerController: ObservableObject {
     static let shared = PlayerController()
 
     @Published private(set) var isPlaying = false
-    @Published private(set) var currentTrackID: PlaylistTrack.ID?
+    @Published private(set) var currentTrackID: PlaylistTrack.ID? {
+        didSet {
+            guard currentTrackID != oldValue else { return }
+            currentArtwork = nil
+            artworkTask?.cancel()
+            artworkTask = Task { [weak self] in await self?.refreshArtwork() }
+        }
+    }
+    @Published private(set) var currentArtwork: UIImage?
     @Published private(set) var currentTime: TimeInterval = 0
     @Published private(set) var duration: TimeInterval = 0
     @Published private(set) var waveform: [Float] = Array(repeating: 0, count: 128)
@@ -108,6 +117,35 @@ final class PlayerController: ObservableObject {
         playlist.tracks.first { $0.id == currentTrackID }
     }
 
+    /// Tracks already played, most recent first, for the "What's Next" queue view.
+    var recentTrackIDs: [PlaylistTrack.ID] {
+        guard historyIndex > 0 else { return [] }
+        return Array(history[0..<historyIndex].reversed())
+    }
+
+    /// Tracks that will play next, in order, for the "What's Next" queue view.
+    /// Mirrors the exact decision `playNext()` makes: forward history first
+    /// (from a prior `previous()`), then the shuffle bag, then sequential
+    /// order (wrapping back to the start when repeat-all is on).
+    var upNextTrackIDs: [PlaylistTrack.ID] {
+        guard !playlist.tracks.isEmpty else { return [] }
+        if historyIndex >= 0, historyIndex < history.count - 1 {
+            return Array(history[(historyIndex + 1)...])
+        }
+        if shuffleEnabled {
+            return shuffleBag
+        }
+        guard let currentTrackID,
+              let index = playlist.tracks.firstIndex(where: { $0.id == currentTrackID }) else {
+            return []
+        }
+        var upcoming = Array(playlist.tracks[(index + 1)...].map(\.id))
+        if repeatMode == .all {
+            upcoming.append(contentsOf: playlist.tracks[..<index].map(\.id))
+        }
+        return upcoming
+    }
+
     var serverClient: FredServerClient? {
         guard let url = FredServerURLPolicy.validatedURL(serverBaseURL) else { return nil }
         return FredServerClient(baseURL: url, token: serverToken)
@@ -140,6 +178,7 @@ final class PlayerController: ObservableObject {
     private var currentVisualCache: VisualCacheEntry?
     private var cachePreparationTask: Task<Void, Never>?
     private var playbackTask: Task<Void, Never>?
+    private var artworkTask: Task<Void, Never>?
     private var routeRecoveryTask: Task<Void, Never>?
     private var shouldResumeAfterInterruption = false
     private var playbackRequestID = UUID()
@@ -218,16 +257,52 @@ final class PlayerController: ObservableObject {
     func removeCurrentTrack() {
         guard let currentTrackID,
               let index = playlist.tracks.firstIndex(where: { $0.id == currentTrackID }) else { return }
-        playlist.removeTracks(at: IndexSet(integer: index))
-        // The shuffle bag may reference an index/ID that shifted or no
-        // longer exists after the removal — simplest safe fix is to drop
-        // it and let it get rebuilt fresh next time it's needed.
-        shuffleBag.removeAll()
+        removeTracks(at: IndexSet(integer: index))
+    }
+
+    // Removes tracks by row offset — used both by removeCurrentTrack()
+    // and by the playlist list's swipe-to-delete. Unlike a raw
+    // PlaylistStore mutation, this keeps the shuffle bag and play history
+    // in sync with what actually still exists, so a removed track can't
+    // linger as a stale ID that later makes Next/Previous silently no-op
+    // (play(trackID:) can't find it) or shows up in the What's Next list.
+    func removeTracks(at offsets: IndexSet) {
+        let removedIDs = Set(offsets.compactMap { index in
+            playlist.tracks.indices.contains(index) ? playlist.tracks[index].id : nil
+        })
+        guard !removedIDs.isEmpty else { return }
+        let removingCurrent = currentTrackID.map(removedIDs.contains) ?? false
+        let firstRemovedIndex = offsets.min() ?? 0
+
+        playlist.removeTracks(at: offsets)
+        shuffleBag.removeAll(where: removedIDs.contains)
+
+        // Same browser-back/forward branching used everywhere else: if
+        // the cursor's own entry (the currently-playing track) is one of
+        // the removed tracks, only the history *before* it is still
+        // valid — a fresh pick is coming right after this, same as a
+        // manual jump would start a new branch.
+        let currentEntryRemoved = historyIndex >= 0 && historyIndex < history.count
+            && removedIDs.contains(history[historyIndex])
+        let scanLimit = currentEntryRemoved ? historyIndex : history.count
+        var newHistory: [PlaylistTrack.ID] = []
+        var newHistoryIndex = -1
+        for i in 0..<scanLimit {
+            let id = history[i]
+            if removedIDs.contains(id) { continue }
+            newHistory.append(id)
+            if i == historyIndex { newHistoryIndex = newHistory.count - 1 }
+        }
+        if currentEntryRemoved { newHistoryIndex = newHistory.count - 1 }
+        history = newHistory
+        historyIndex = newHistoryIndex
+
         guard !playlist.tracks.isEmpty else {
             stop()
             return
         }
-        let nextIndex = min(index, playlist.tracks.count - 1)
+        guard removingCurrent else { return }
+        let nextIndex = min(firstRemovedIndex, playlist.tracks.count - 1)
         play(trackID: playlist.tracks[nextIndex].id)
     }
 
@@ -380,6 +455,10 @@ final class PlayerController: ObservableObject {
 
     private func play(trackID: PlaylistTrack.ID, recordHistory: Bool) {
         guard let track = playlist.tracks.first(where: { $0.id == trackID }) else { return }
+        // A manual jump (from the playlist list or the What's Next queue)
+        // pulls the track out of the remaining shuffle order so it doesn't
+        // also play again later this pass.
+        shuffleBag.removeAll(where: { $0 == trackID })
         let requestID = UUID()
         playbackRequestID = requestID
         playbackTask?.cancel()
@@ -898,7 +977,33 @@ final class PlayerController: ObservableObject {
         info[MPMediaItemPropertyTitle] = track.displayTitle
         info[MPMediaItemPropertyArtist] = track.artist
         info[MPMediaItemPropertyAlbumTitle] = track.album
+        if let currentArtwork {
+            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: currentArtwork.size) { _ in currentArtwork }
+        }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    // Cache-first, then network — mirrors the loudness/visual fetch
+    // pattern elsewhere in this file. Guards against a track change that
+    // happened while the network fetch was in flight so a slow response
+    // for an old track can't overwrite art for whatever's playing now.
+    private func refreshArtwork() async {
+        guard let track = currentTrack, let serverPath = track.serverPath else {
+            currentArtwork = nil
+            return
+        }
+        if let cached = MediaCache.artwork(forServerPath: serverPath) {
+            currentArtwork = UIImage(data: cached)
+            updateNowPlayingInfo()
+            return
+        }
+        guard let client = serverClient,
+              let data = await client.fetchArtwork(serverPath: serverPath),
+              !Task.isCancelled,
+              currentTrack?.serverPath == serverPath else { return }
+        try? MediaCache.store(data, forServerPath: serverPath)
+        currentArtwork = UIImage(data: data)
+        updateNowPlayingInfo()
     }
 
     private func configureAudioSession() {

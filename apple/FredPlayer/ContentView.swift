@@ -5,6 +5,8 @@ import OSLog
 struct ContentView: View {
     @EnvironmentObject private var player: PlayerController
     @State private var isImporterPresented = false
+    @State private var isFolderImporterPresented = false
+    @State private var isScanningFolder = false
     @State private var isMusicSourcePresented = false
     @State private var isCopiedLibraryPresented = false
     @State private var isClearConfirmationPresented = false
@@ -106,6 +108,9 @@ struct ContentView: View {
                 Button("Choose from Files", systemImage: "folder") {
                     isImporterPresented = true
                 }
+                Button("Add Folder", systemImage: "folder.badge.plus") {
+                    isFolderImporterPresented = true
+                }
                 Button("Fred Server", systemImage: "server.rack") {
                     isServerLibraryPresented = true
                 }
@@ -113,10 +118,11 @@ struct ContentView: View {
                 Button("Cancel", role: .cancel) {}
             }
             .overlay {
-                if player.playlist.isAddingCopiedMusic || player.isLoadingRemoteTrack {
+                if player.playlist.isAddingCopiedMusic || player.isLoadingRemoteTrack || isScanningFolder {
                     ZStack {
                         Color.black.opacity(0.2).ignoresSafeArea()
-                        ProgressView(player.isLoadingRemoteTrack ? "Buffering track…" : "Adding tracks…")
+                        ProgressView(isScanningFolder ? "Scanning folder…"
+                            : player.isLoadingRemoteTrack ? "Buffering track…" : "Adding tracks…")
                             .padding()
                             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                     }
@@ -156,7 +162,60 @@ struct ContentView: View {
                     logger.error("Document picker failed: \(error.localizedDescription, privacy: .public)")
                 }
             }
+            .fileImporter(
+                isPresented: $isFolderImporterPresented,
+                allowedContentTypes: [.folder],
+                allowsMultipleSelection: false
+            ) { result in
+                switch result {
+                case .success(let urls):
+                    if let folder = urls.first { importFolder(folder) }
+                case .failure(let error):
+                    logger.error("Folder picker failed: \(error.localizedDescription, privacy: .public)")
+                }
+            }
         }
+    }
+
+    private func importFolder(_ folder: URL) {
+        isScanningFolder = true
+        Task {
+            let urls = await Task.detached(priority: .userInitiated) {
+                Self.collectAudioFiles(in: folder)
+            }.value
+            isScanningFolder = false
+            guard !urls.isEmpty else { return }
+            player.playlist.importFiles(urls)
+        }
+    }
+
+    // Recursively finds every audio file under an arbitrary folder tree,
+    // matching Android's SAF-based folder import (collectAudioFromTree in
+    // MainActivity.java). FileManager's enumerator already walks the
+    // whole subtree on its own, so no manual recursion/depth tracking is
+    // needed the way SAF's cursor-based API requires.
+    private static let importableAudioExtensions: Set<String> = [
+        "mp3", "flac", "m4a", "aac", "wav", "ogg", "opus"
+    ]
+
+    private static func collectAudioFiles(in folder: URL) -> [URL] {
+        let accessed = folder.startAccessingSecurityScopedResource()
+        defer { if accessed { folder.stopAccessingSecurityScopedResource() } }
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: folder,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        var results: [URL] = []
+        for case let url as URL in enumerator {
+            guard (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else { continue }
+            if importableAudioExtensions.contains(url.pathExtension.lowercased()) {
+                results.append(url)
+            }
+        }
+        return results
     }
 
     @ViewBuilder
@@ -190,7 +249,7 @@ struct ContentView: View {
                     }
                     .buttonStyle(.plain)
                 }
-                .onDelete(perform: player.playlist.removeTracks)
+                .onDelete(perform: player.removeTracks)
             }
         }
     }

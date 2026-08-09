@@ -197,6 +197,19 @@ struct FredServerClient {
         } catch { return nil }
     }
 
+    // Returns nil for both real errors and "no artwork cached for this
+    // album yet" (HTTP 404, common — the server only serves art it has
+    // already precomputed, it never fetches on demand).
+    func fetchArtwork(serverPath: String) async -> Data? {
+        do {
+            let (data, response) = try await URLSession.shared.data(
+                for: request(path: "api/artwork/\(encodedPath(serverPath))")
+            )
+            try validate(response)
+            return data
+        } catch { return nil }
+    }
+
     func fetchVisual(serverPath: String, settings: VisualCacheSettings) async -> Data? {
         do {
             let path = encodedPath(serverPath)

@@ -99,6 +99,15 @@ enum MediaCache {
         read(VisualCacheEntry.self, from: visualURL(forKey: remoteKey(path), settings: settings))
     }
 
+    static func artwork(forServerPath path: String) -> Data? {
+        read(Data.self, from: artworkURL(forKey: remoteKey(path)))
+    }
+
+    static func store(_ data: Data, forServerPath path: String) throws {
+        try write(data, to: artworkURL(forKey: remoteKey(path)))
+        prune(directory: artworkDirectory, above: 5_000, keeping: 4_500)
+    }
+
     /// Decodes the compact format returned by `/api/apple-visual/*`.
     /// Server frames are quantized on disk and expanded to the existing
     /// in-memory cache model here, keeping playback code format-agnostic.
@@ -332,6 +341,9 @@ enum MediaCache {
     private static var visualDirectory: URL {
         rootDirectory.appendingPathComponent("Visual", isDirectory: true)
     }
+    private static var artworkDirectory: URL {
+        rootDirectory.appendingPathComponent("Artwork", isDirectory: true)
+    }
 
     private static func loudnessURL(for url: URL) -> URL {
         loudnessURL(forKey: fileIdentity(for: url))
@@ -351,6 +363,10 @@ enum MediaCache {
             .map { String(format: "%02x", $0) }
             .joined()
         return visualDirectory.appendingPathComponent(key + ".cache")
+    }
+
+    private static func artworkURL(forKey key: String) -> URL {
+        artworkDirectory.appendingPathComponent(key + ".cache")
     }
 
     private static func remoteKey(_ path: String) -> String {

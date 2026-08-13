@@ -113,10 +113,12 @@ GVariant* MprisServer::onGetProperty(GDBusConnection*, const gchar*, const gchar
   }
   if (!std::strcmp(property, "PlaybackStatus"))
     return g_variant_new_string(!self->playing_ ? "Stopped" : self->paused_ ? "Paused" : "Playing");
-  if (!std::strcmp(property, "LoopStatus")) return g_variant_new_string("Playlist");
+  if (!std::strcmp(property, "LoopStatus"))
+    return g_variant_new_string(self->repeatMode_ == RepeatMode::Off ? "None" :
+        self->repeatMode_ == RepeatMode::One ? "Track" : "Playlist");
   if (!std::strcmp(property, "Rate") || !std::strcmp(property, "MinimumRate") ||
       !std::strcmp(property, "MaximumRate") || !std::strcmp(property, "Volume")) return g_variant_new_double(1.0);
-  if (!std::strcmp(property, "Shuffle")) return g_variant_new_boolean(TRUE);
+  if (!std::strcmp(property, "Shuffle")) return g_variant_new_boolean(self->shuffleEnabled_);
   if (!std::strcmp(property, "Position")) return g_variant_new_int64(self->positionMs_ * 1000);
   if (!std::strcmp(property, "CanControl")) return g_variant_new_boolean(TRUE);
   if (!std::strcmp(property, "CanGoNext") || !std::strcmp(property, "CanGoPrevious") ||
@@ -132,6 +134,9 @@ GVariant* MprisServer::onGetProperty(GDBusConnection*, const gchar*, const gchar
       g_variant_builder_add(&builder, "{sv}", "xesam:artist", g_variant_new_strv(artists, self->track_.artist.empty() ? 0 : 1));
       g_variant_builder_add(&builder, "{sv}", "xesam:album", g_variant_new_string(self->track_.album.c_str()));
       g_variant_builder_add(&builder, "{sv}", "mpris:length", g_variant_new_int64(self->durationMs_ * 1000));
+      if (!self->artworkPath_.empty())
+        g_variant_builder_add(&builder, "{sv}", "mpris:artUrl",
+            g_variant_new_string(("file://" + self->artworkPath_).c_str()));
     }
     return g_variant_builder_end(&builder);
   }
@@ -139,10 +144,14 @@ GVariant* MprisServer::onGetProperty(GDBusConnection*, const gchar*, const gchar
 }
 
 void MprisServer::update(const TrackEntry* track, bool playing, bool paused,
-                         std::int64_t positionMs, std::int64_t durationMs) {
+                         std::int64_t positionMs, std::int64_t durationMs,
+                         const std::string& artworkPath,
+                         bool shuffleEnabled, RepeatMode repeatMode) {
   hasTrack_ = track != nullptr;
   if (track) track_ = *track;
   playing_ = playing; paused_ = paused; positionMs_ = positionMs; durationMs_ = durationMs;
+  artworkPath_ = artworkPath;
+  shuffleEnabled_ = shuffleEnabled; repeatMode_ = repeatMode;
   emitChanged();
 }
 

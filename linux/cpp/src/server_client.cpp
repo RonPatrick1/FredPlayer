@@ -155,6 +155,15 @@ std::vector<TrackEntry> ServerClient::library() const {
   return result;
 }
 
+int ServerClient::rescanLibrary() const {
+  const auto response = request(baseUrl_ + "/api/rescan", "POST", {}, {}, 120);
+  if (response.status != 200)
+    throw std::runtime_error(response.error.empty() ? "Server library rescan failed" : response.error);
+  const auto count = json::parse(response.body).value("count", -1);
+  if (count < 0) throw std::runtime_error("Server returned an invalid rescan response");
+  return count;
+}
+
 std::vector<std::string> ServerClient::sharedPlaylists() const {
   const auto response = request(baseUrl_ + "/api/playlists");
   if (response.status != 200) throw std::runtime_error("Could not load shared playlists");
@@ -195,6 +204,47 @@ std::optional<TrackProfile> ServerClient::profile(const TrackEntry& track) const
   } catch (...) { return std::nullopt; }
 }
 
+HttpResult ServerClient::artwork(const TrackEntry& track) const {
+  const auto path = decode(track.serverPath(baseUrl_));
+  if (path.empty()) return HttpResult{0, {}, "Track is not from the configured server", 0};
+  return request(apiPath("/api/artwork/", path));
+}
+
+// Prefers the "Original" section (source-language lyrics); falls back to
+// whatever section is present for a translation-only sidecar. Returns
+// nullopt for both real errors and "no lyrics for this track" (HTTP 404) —
+// callers only need to distinguish "loading" from "nothing to show".
+std::optional<std::vector<LyricsPhrase>> ServerClient::lyrics(const TrackEntry& track) const {
+  const auto path = decode(track.serverPath(baseUrl_));
+  if (path.empty()) return std::nullopt;
+  const auto response = request(apiPath("/api/lyrics/", path));
+  if (response.status != 200) return std::nullopt;
+  try {
+    const auto value = json::parse(response.body);
+    const auto& sections = value.at("sections");
+    const json* section = nullptr;
+    if (sections.contains("Original")) {
+      section = &sections.at("Original");
+    } else if (!sections.empty()) {
+      section = &sections.begin().value();
+    }
+    if (section == nullptr) return std::nullopt;
+    std::vector<LyricsPhrase> phrases;
+    for (const auto& phraseJson : *section) {
+      LyricsPhrase phrase;
+      phrase.startSeconds = phraseJson.at("start").get<double>();
+      phrase.endSeconds = phraseJson.at("end").get<double>();
+      phrase.text = phraseJson.at("text").get<std::string>();
+      for (const auto& wordJson : phraseJson.at("words")) {
+        phrase.words.push_back(LyricsWord{
+            wordJson.at("time").get<double>(), wordJson.at("text").get<std::string>()});
+      }
+      phrases.push_back(std::move(phrase));
+    }
+    return phrases;
+  } catch (...) { return std::nullopt; }
+}
+
 HttpResult ServerClient::linuxVisual(const TrackEntry& track,
                                      const VisualizationSettings& settings) const {
   const auto path = decode(track.serverPath(baseUrl_));
@@ -202,14 +252,26 @@ HttpResult ServerClient::linuxVisual(const TrackEntry& track,
   return request(baseUrl_ + "/api/linux-visual-variant/" + settings.variantKey() + "/" + encode(path, true));
 }
 
-std::string ServerClient::askLiam(const std::string& deviceId,
-                                  const std::string& message) const {
+AskLiamResult ServerClient::askLiam(const std::string& deviceId,
+                                    const std::string& message) const {
   const auto body = json{{"device_id", deviceId}, {"message", message}}.dump();
   const auto response = request(baseUrl_ + "/api/ask-liam", "POST", "application/json",
       {body.begin(), body.end()}, 620);
   if (response.status != 200) throw std::runtime_error("Ask Liam request failed");
   const auto value = json::parse(response.body);
-  return value.value("response", value.value("answer", value.dump()));
+  AskLiamResult result;
+  result.reply = value.value("reply", "");
+  const auto playlist = value.value("playlist", json::object());
+  if (playlist.is_object() && !playlist.empty()) {
+    result.hasPlaylist = true;
+    result.playlistName = playlist.value("name", "New Playlist");
+    if (const auto& tracks = playlist.value("tracks", json::array()); tracks.is_array()) {
+      for (const auto& track : tracks) {
+        if (track.is_string()) result.trackPaths.push_back(track.get<std::string>());
+      }
+    }
+  }
+  return result;
 }
 
 }  // namespace fredplayer

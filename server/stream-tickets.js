@@ -11,10 +11,29 @@ function encodeServerPath(serverPath) {
     .join('/');
 }
 
+function canonicalStreamRequestPath(requestPath) {
+  const prefix = '/stream/';
+  if (typeof requestPath !== 'string' || !requestPath.startsWith(prefix)) {
+    return null;
+  }
+  try {
+    const canonicalSuffix = requestPath
+      .slice(prefix.length)
+      .split('/')
+      .map((segment) => encodeURIComponent(decodeURIComponent(segment)))
+      .join('/');
+    return prefix + canonicalSuffix;
+  } catch (_error) {
+    return null;
+  }
+}
+
 function signatureFor(requestPath, expires, secret) {
+  const canonicalPath = canonicalStreamRequestPath(requestPath);
+  if (!canonicalPath) throw new Error('a valid stream request path is required');
   return crypto
     .createHmac('sha256', secret)
-    .update(`${expires}\n${requestPath}`)
+    .update(`${expires}\n${canonicalPath}`)
     .digest('base64url');
 }
 
@@ -39,8 +58,8 @@ function issueStreamTicket(serverPath, secret, options = {}) {
 
 function validStreamTicket(req, secret, options = {}) {
   if (!req || !['GET', 'HEAD'].includes(req.method)) return false;
-  const requestPath = req.path;
-  if (typeof requestPath !== 'string' || !requestPath.startsWith('/stream/')) return false;
+  const requestPath = canonicalStreamRequestPath(req.path);
+  if (!requestPath) return false;
   const expiresText = req.query?.expires;
   const suppliedText = req.query?.signature;
   if (typeof expiresText !== 'string' || typeof suppliedText !== 'string') return false;

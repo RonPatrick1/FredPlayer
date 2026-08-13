@@ -5,6 +5,8 @@
 #include <sys/stat.h>
 #include <zlib.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <cmath>
 #include <fstream>
@@ -128,6 +130,47 @@ std::optional<TrackProfile> loadCachedTrackProfile(
         !value["rms"].is_number() || !value["peak"].is_number()) return std::nullopt;
     return TrackProfile{value["rms"].get<double>(), value["peak"].get<double>()};
   } catch (...) { return std::nullopt; }
+}
+
+std::string albumArtworkCacheKey(const std::string& artist, const std::string& album) {
+  auto normalize = [](const std::string& value) {
+    auto start = value.find_first_not_of(" \t\n\r");
+    if (start == std::string::npos) return std::string{};
+    auto end = value.find_last_not_of(" \t\n\r");
+    std::string trimmed = value.substr(start, end - start + 1);
+    std::transform(trimmed.begin(), trimmed.end(), trimmed.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return trimmed;
+  };
+  return sha256(normalize(artist) + "|" + normalize(album));
+}
+
+std::optional<std::filesystem::path> cachedArtworkPath(
+    const std::string& artist, const std::string& album, const std::filesystem::path& root) {
+  if (artist.empty() || album.empty()) return std::nullopt;
+  const auto path = root / "artwork" / (albumArtworkCacheKey(artist, album) + ".jpg");
+  std::error_code error;
+  if (!std::filesystem::exists(path, error) || error) return std::nullopt;
+  return path;
+}
+
+std::optional<std::filesystem::path> storeArtwork(
+    const std::string& artist, const std::string& album, const std::vector<std::uint8_t>& data,
+    const std::filesystem::path& root) {
+  if (artist.empty() || album.empty() || data.empty()) return std::nullopt;
+  std::error_code error;
+  const auto dir = root / "artwork";
+  std::filesystem::create_directories(dir, error);
+  const auto path = dir / (albumArtworkCacheKey(artist, album) + ".jpg");
+  const auto tempPath = dir / (albumArtworkCacheKey(artist, album) + ".jpg.tmp");
+  {
+    std::ofstream out(tempPath, std::ios::binary);
+    if (!out) return std::nullopt;
+    out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+  }
+  std::filesystem::rename(tempPath, path, error);
+  if (error) return std::nullopt;
+  return path;
 }
 
 LegacyVisualizationCache::LegacyVisualizationCache(std::filesystem::path root) : root_(std::move(root)) {}

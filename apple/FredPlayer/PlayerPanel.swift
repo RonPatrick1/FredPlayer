@@ -198,22 +198,46 @@ struct PlayerPanel: View {
 }
 
 private struct VisualizerView: View {
+    @Environment(\.colorScheme) private var colorScheme
     let waveform: [Float]
     let spectrum: [Float]
+
+    private var panelBackground: Color {
+        colorScheme == .dark
+            ? Color.black.opacity(0.90)
+            : Color(red: 0.93, green: 0.96, blue: 0.98)
+    }
+
+    private var panelOutline: Color {
+        colorScheme == .dark
+            ? Color.white.opacity(0.12)
+            : Color(red: 0.55, green: 0.67, blue: 0.75).opacity(0.55)
+    }
+
+    private var waveformColor: Color {
+        colorScheme == .dark
+            ? .cyan
+            : Color(red: 0.02, green: 0.42, blue: 0.66)
+    }
 
     var body: some View {
         VStack(spacing: 4) {
             Canvas { context, size in
                 guard waveform.count > 1 else { return }
+                var centerLine = Path()
+                centerLine.move(to: CGPoint(x: 0, y: size.height * 0.5))
+                centerLine.addLine(to: CGPoint(x: size.width, y: size.height * 0.5))
+                context.stroke(centerLine, with: .color(panelOutline), lineWidth: 1)
+
                 var path = Path()
                 for (index, value) in waveform.enumerated() {
                     let x = size.width * CGFloat(index) / CGFloat(waveform.count - 1)
                     let y = size.height * (0.5 - CGFloat(value) * 0.45)
                     index == 0 ? path.move(to: CGPoint(x: x, y: y)) : path.addLine(to: CGPoint(x: x, y: y))
                 }
-                context.stroke(path, with: .color(.cyan), lineWidth: 1.5)
+                context.stroke(path, with: .color(waveformColor), lineWidth: 1.5)
             }
-            .background(Color.black.opacity(0.9), in: RoundedRectangle(cornerRadius: 6))
+            .visualizerPanel(background: panelBackground, outline: panelOutline)
 
             GeometryReader { geometry in
                 HStack(alignment: .bottom, spacing: 1) {
@@ -222,8 +246,8 @@ private struct VisualizerView: View {
                             .fill(
                                 Color(
                                     hue: 0.72 - 0.72 * Double(index) / Double(max(1, spectrum.count - 1)),
-                                    saturation: 0.9,
-                                    brightness: 0.95
+                                    saturation: colorScheme == .dark ? 0.90 : 0.82,
+                                    brightness: colorScheme == .dark ? 0.95 : 0.68
                                 )
                             )
                             .frame(height: max(1, geometry.size.height * CGFloat(value)))
@@ -231,15 +255,26 @@ private struct VisualizerView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
             }
-            .background(Color.black.opacity(0.9), in: RoundedRectangle(cornerRadius: 6))
+            .visualizerPanel(background: panelBackground, outline: panelOutline)
         }
+    }
+}
+
+private extension View {
+    func visualizerPanel(background: Color, outline: Color) -> some View {
+        self
+            .background(background, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(outline, lineWidth: 1)
+            }
     }
 }
 
 struct PlayerSettingsView: View {
     @EnvironmentObject private var player: PlayerController
+    @EnvironmentObject private var appearance: AppAppearanceStore
     @Environment(\.dismiss) private var dismiss
-    @AppStorage("appearance") private var appearance = AppAppearance.system.rawValue
     let onManagePlaylists: () -> Void
     let onAddMusic: () -> Void
     let onServerSettings: () -> Void
@@ -251,9 +286,9 @@ struct PlayerSettingsView: View {
         NavigationStack {
             Form {
                 Section("Appearance") {
-                    Picker("Color Scheme", selection: $appearance) {
+                    Picker("Color Scheme", selection: $appearance.selection) {
                         ForEach(AppAppearance.allCases) { option in
-                            Text(option.title).tag(option.rawValue)
+                            Text(option.title).tag(option)
                         }
                     }
                     .pickerStyle(.segmented)

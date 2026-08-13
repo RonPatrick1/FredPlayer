@@ -11,7 +11,7 @@ struct ServerSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Fred Server") {
+                Section {
                     TextField("https://music.example.com", text: $player.serverBaseURL)
                         .textInputAutocapitalization(.never)
                         .keyboardType(.URL)
@@ -23,6 +23,8 @@ struct ServerSettingsView: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
+                } header: {
+                    Text("Fred Server")
                 } footer: {
                     Text("FredPlayer sends the token and playback requests only to the private server you configure. It may upload derived visualization, leveling, and shared-playlist data; microphone audio is never uploaded. The token is stored in Keychain.")
                 }

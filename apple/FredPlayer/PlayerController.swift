@@ -12,6 +12,30 @@ private enum PlaybackPreparationError: LocalizedError {
     }
 }
 
+#if DEBUG
+// A developer machine may provide this class in the ignored
+// FredPlayerDevelopmentServerDefaults.swift file. Looking it up at runtime
+// keeps private credentials out of source control and out of Release builds.
+@objc protocol FredPlayerDevelopmentServerProviding {
+    static var serverURL: String { get }
+    static var serverToken: String { get }
+}
+
+private func developmentServerDefaults() -> (url: String, token: String)? {
+    let classNames = [
+        "FredPlayer.FredPlayerDevelopmentServerDefaults",
+        "FredPlayerDevelopmentServerDefaults"
+    ]
+    for className in classNames {
+        if let provider = NSClassFromString(className)
+            as? FredPlayerDevelopmentServerProviding.Type {
+            return (provider.serverURL, provider.serverToken)
+        }
+    }
+    return nil
+}
+#endif
+
 enum RepeatMode: Int {
     case off = 0
     case all = 1
@@ -214,7 +238,17 @@ final class PlayerController: ObservableObject {
         playbackTask?.cancel()
         routeRecoveryTask?.cancel()
         progressTimer?.invalidate()
-        tearDownStreamingPlayer()
+        streamingVisualTask?.cancel()
+        streamingItemStatusObservation?.invalidate()
+        streamingTimeControlObservation?.invalidate()
+        if let streamingEndObserver {
+            NotificationCenter.default.removeObserver(streamingEndObserver)
+        }
+        if let streamingFailureObserver {
+            NotificationCenter.default.removeObserver(streamingFailureObserver)
+        }
+        streamingPlayer?.pause()
+        streamingPlayer?.replaceCurrentItem(with: nil)
         engine.mainMixerNode.removeTap(onBus: 0)
     }
 
@@ -1268,6 +1302,9 @@ final class PlayerController: ObservableObject {
     private func restoreSettings() {
         isRestoringSettings = true
         defer { isRestoringSettings = false }
+#if DEBUG
+        let developerServer = developmentServerDefaults()
+#endif
         settings.register(defaults: [
             "player.shuffleEnabled": true,
             "player.repeatMode": RepeatMode.all.rawValue,
@@ -1301,7 +1338,14 @@ final class PlayerController: ObservableObject {
         fftSmoothing = settings.float(forKey: "player.fftSmoothing")
         logarithmicFFT = settings.bool(forKey: "player.logarithmicFFT")
         startupScanSeconds = settings.double(forKey: "player.startupScanSeconds")
-        serverBaseURL = settings.string(forKey: "server.baseURL") ?? ""
+        let savedServerBaseURL = settings.string(forKey: "server.baseURL") ?? ""
+#if DEBUG
+        serverBaseURL = savedServerBaseURL.isEmpty
+            ? (developerServer?.url ?? "")
+            : savedServerBaseURL
+#else
+        serverBaseURL = savedServerBaseURL
+#endif
         if let protectedToken = KeychainStore.string(for: "server.token") {
             serverToken = protectedToken
             settings.removeObject(forKey: "server.token")
@@ -1313,6 +1357,11 @@ final class PlayerController: ObservableObject {
                 settings.removeObject(forKey: "server.token")
             }
         }
+#if DEBUG
+        if serverToken.isEmpty {
+            serverToken = developerServer?.token ?? ""
+        }
+#endif
         if let savedID = settings.string(forKey: "server.deviceID"), !savedID.isEmpty {
             deviceID = savedID.replacingOccurrences(of: "-", with: "").lowercased()
             settings.set(deviceID, forKey: "server.deviceID")

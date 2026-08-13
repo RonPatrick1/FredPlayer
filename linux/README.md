@@ -2,42 +2,28 @@
 
 Local desktop version of FredPlayer for shuffled baby sleep music playback on Ubuntu.
 
-## Native C++ preview
+## C++17/GTKmm implementation
 
-The replacement C++17/GTKmm implementation is under `linux/cpp`. It uses
-native GStreamer DSP/playback, FFTW, OpenGL/libepoxy, TagLib, libcurl, and
-PulseAudio/PipeWire integration, while reading the existing playlists,
-settings, profiles, and visualization caches. See `linux/cpp/README.md` for
-the headless build and manual test commands.
+The desktop app is native C++17/GTKmm, under `linux/cpp`. It uses native
+GStreamer DSP/playback, FFTW, OpenGL/libepoxy, TagLib, libcurl, and
+PulseAudio/PipeWire integration. See `linux/cpp/README.md` for build
+dependencies and headless build/test commands.
 
-The installed desktop entry intentionally remains on the Python build until
-the native preview has been manually approved. No preview build command opens
-or manipulates application windows.
+The earlier Python/PyGObject build has been removed — the C++ build is now
+the only Linux desktop implementation, reading the same playlists, settings,
+profiles, and visualization caches the Python build used.
 
 ## Run
 
 ```bash
-python3 run_fredplayer.py
+linux/cpp/build.sh                        # build + headless tests
+linux/cpp/build/fredplayer-native         # launch
 ```
 
-The repository includes `fredplayer.desktop`. It can be installed as a desktop shortcut by copying it to `~/Desktop` and `~/.local/share/applications`; this setup has already been done on this machine.
-
-The app uses Ubuntu system packages that are already present on this machine:
-
-- Python 3
-- PyGObject / GTK 3
-- GStreamer 1.0, including `plugins-base`, `plugins-good`, `plugins-ugly`, and `libav`
-- Mutagen for optional track display names
-- PyOpenGL and NumPy for GPU-rendered visualization and high-resolution FFT analysis
-
-On a fresh Ubuntu install, the equivalent packages are:
-
-```bash
-sudo apt install python3-gi python3-mutagen python3-opengl python3-numpy mesa-utils \
-  gir1.2-gtk-3.0 gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
-  gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good pulseaudio-utils \
-  gstreamer1.0-plugins-ugly gstreamer1.0-libav
-```
+The repository includes `fredplayer.desktop`, pointed at the built
+`fredplayer-native` binary. It can be installed as a desktop shortcut by
+copying it to `~/Desktop` and `~/.local/share/applications`; this setup has
+already been done on this machine.
 
 ## Features
 
@@ -53,6 +39,7 @@ sudo apt install python3-gi python3-mutagen python3-opengl python3-numpy mesa-ut
 - Multiple named playlists with create, switch, rename, and delete controls. The player summary shows the active playlist name and song count.
 - Remove individual files or folder groups from the playlist.
 - Displays track metadata from tags, including title, artist, and album, falling back to filenames only when tags are missing.
+- Shows album art for server-streamed tracks (fetched from the server's `/api/artwork/` endpoint, cached locally by artist+album), in the player header and exposed to the desktop session via MPRIS `mpris:artUrl`.
 - Remembers the last window size, position, monitor, and maximized state.
 - Startup loudness pre-scan from Off to 45 seconds, defaulting to 10 seconds.
 - Per-track loudness profile cache keyed by path plus file size and modified time.

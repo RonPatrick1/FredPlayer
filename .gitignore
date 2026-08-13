@@ -21,6 +21,7 @@ apple/**/DerivedData/
 apple/**/Pods/
 apple/**/.build/
 apple/*.xcworkspace/xcuserdata/
+apple/FredPlayer/FredPlayerDevelopmentServerDefaults.swift
 
 # Linux (linux/)
 linux/**/__pycache__/

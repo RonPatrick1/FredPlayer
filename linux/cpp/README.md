@@ -1,9 +1,9 @@
-# FredPlayer native Ubuntu preview
+# FredPlayer native Ubuntu build
 
-This is the C++17/GTKmm implementation being tested beside the currently
-installed Python build. It deliberately does not replace or launch the
-existing desktop entry. The final launcher cutover happens only after manual
-approval.
+This is the C++17/GTKmm implementation of the Ubuntu desktop app. It's the
+only Linux desktop build now — the earlier Python/PyGObject build was
+removed after manual parity approval, and `linux/fredplayer.desktop` launches
+this build directly.
 
 ## Dependencies
 
@@ -28,16 +28,12 @@ The script only compiles and runs headless tests. It does not open FredPlayer.
 
 ## Manual test
 
-After the build finishes, launch the preview yourself:
+After the build finishes, launch it yourself:
 
 ```bash
 linux/cpp/build/fredplayer-native
 ```
 
-The preview reads the existing `~/.config/fredplayer-ubuntu/state.json`,
-`profiles.json`, `.fsp`, and `.fwp` data. Its GTK application, desktop window,
-and MPRIS identities are separate, so the Python and C++ builds can run at the
-same time for parity testing.
-
-The normal `linux/fredplayer.desktop` entry remains pointed at Python until
-manual parity approval.
+It reads the existing `~/.config/fredplayer-ubuntu/state.json`,
+`profiles.json`, `.fsp`, and `.fwp` data — the same files the old Python
+build used.

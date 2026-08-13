@@ -25,7 +25,9 @@ class MprisServer {
   explicit MprisServer(MprisCallbacks callbacks = {});
   ~MprisServer();
   void update(const TrackEntry* track, bool playing, bool paused,
-              std::int64_t positionMs, std::int64_t durationMs);
+              std::int64_t positionMs, std::int64_t durationMs,
+              const std::string& artworkPath = {},
+              bool shuffleEnabled = false, RepeatMode repeatMode = RepeatMode::All);
 
  private:
   static void onBusAcquired(GDBusConnection* connection, const gchar* name,
@@ -46,11 +48,14 @@ class MprisServer {
   guint playerRegistration_{0};
   GDBusConnection* connection_{nullptr};
   TrackEntry track_;
+  std::string artworkPath_;
   bool hasTrack_{false};
   bool playing_{false};
   bool paused_{false};
   std::int64_t positionMs_{0};
   std::int64_t durationMs_{0};
+  bool shuffleEnabled_{false};
+  RepeatMode repeatMode_{RepeatMode::All};
 };
 
 }  // namespace fredplayer

@@ -36,6 +36,22 @@ test('stream tickets authorize only their exact encoded track', () => {
   assert.equal(validStreamTicket({ ...request, path: '/stream/Another.flac' }, SECRET, { nowMs: NOW }), false);
 });
 
+test('stream tickets survive reverse-proxy normalization of legal path punctuation', () => {
+  const ticket = issueStreamTicket("Artist's Name/Track (Live)!.flac", SECRET, {
+    nowMs: NOW,
+    ttlSeconds: 60,
+  });
+  const request = requestFor(ticket);
+  const proxyNormalizedPath = request.path
+    .replaceAll('%27', "'")
+    .replaceAll('%28', '(')
+    .replaceAll('%29', ')')
+    .replaceAll('%21', '!');
+
+  assert.equal(validStreamTicket({ ...request, path: proxyNormalizedPath }, SECRET, { nowMs: NOW }), true);
+  assert.equal(validStreamTicket({ ...request, path: proxyNormalizedPath.replace('Live', 'Studio') }, SECRET, { nowMs: NOW }), false);
+});
+
 test('stream tickets reject tampering and expiration', () => {
   const ticket = issueStreamTicket('Artist/Track.flac', SECRET, {
     nowMs: NOW,

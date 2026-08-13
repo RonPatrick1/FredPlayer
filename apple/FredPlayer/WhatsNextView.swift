@@ -3,12 +3,14 @@ import SwiftUI
 struct WhatsNextView: View {
     @EnvironmentObject private var player: PlayerController
     @Environment(\.dismiss) private var dismiss
+    @State private var searchText = ""
 
     var body: some View {
         NavigationStack {
             content
                 .navigationTitle("What's Next")
                 .navigationBarTitleDisplayMode(.inline)
+                .searchable(text: $searchText, prompt: "Search history and up next")
                 .toolbar {
                     ToolbarItem(placement: .confirmationAction) {
                         Button("Done") { dismiss() }
@@ -26,8 +28,12 @@ struct WhatsNextView: View {
                 description: Text("Add some tracks to see what's next.")
             )
         } else {
+            // Filters History/Up Next by title+artist. Now Playing always
+            // stays visible regardless of the query — it's a single
+            // status row, not part of the searchable list.
+            let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
             List {
-                let recent = player.recentTrackIDs
+                let recent = filtered(player.recentTrackIDs, query: query)
                 if !recent.isEmpty {
                     Section("History") {
                         ForEach(recent, id: \.self) { trackID in
@@ -45,10 +51,10 @@ struct WhatsNextView: View {
                     }
                 }
 
-                let upcoming = player.upNextTrackIDs
+                let upcoming = filtered(player.upNextTrackIDs, query: query)
                 Section("Up Next") {
                     if upcoming.isEmpty {
-                        Text("End of playlist.")
+                        Text(query.isEmpty ? "End of playlist." : "No matches.")
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(upcoming, id: \.self) { trackID in
@@ -58,6 +64,17 @@ struct WhatsNextView: View {
                 }
             }
         }
+    }
+
+    private func filtered(_ ids: [PlaylistTrack.ID], query: String) -> [PlaylistTrack.ID] {
+        guard !query.isEmpty else { return ids }
+        return ids.filter { matches($0, query: query) }
+    }
+
+    private func matches(_ trackID: PlaylistTrack.ID, query: String) -> Bool {
+        guard let track = player.playlist.tracks.first(where: { $0.id == trackID }) else { return false }
+        let haystack = track.displayTitle + "\n" + (track.displaySubtitle ?? "")
+        return haystack.range(of: query, options: .caseInsensitive) != nil
     }
 
     @ViewBuilder

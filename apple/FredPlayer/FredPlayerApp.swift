@@ -17,18 +17,31 @@ enum AppAppearance: String, CaseIterable, Identifiable {
     }
 }
 
+final class AppAppearanceStore: ObservableObject {
+    @Published var selection: AppAppearance {
+        didSet {
+            UserDefaults.standard.set(selection.rawValue, forKey: "appearance")
+        }
+    }
+
+    init(defaults: UserDefaults = .standard) {
+        selection = AppAppearance(
+            rawValue: defaults.string(forKey: "appearance") ?? ""
+        ) ?? .system
+    }
+}
+
 @main
 struct FredPlayerApp: App {
     @StateObject private var player = PlayerController.shared
-    @AppStorage("appearance") private var appearance = AppAppearance.system.rawValue
+    @StateObject private var appearance = AppAppearanceStore()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environmentObject(player)
-                .preferredColorScheme(
-                    AppAppearance(rawValue: appearance)?.colorScheme
-                )
+                .environmentObject(appearance)
+                .preferredColorScheme(appearance.selection.colorScheme)
         }
     }
 }

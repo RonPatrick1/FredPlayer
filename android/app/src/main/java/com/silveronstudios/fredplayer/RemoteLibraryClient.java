@@ -16,6 +16,7 @@ import java.nio.charset.StandardCharsets;
 final class RemoteLibraryClient {
     private static final int CONNECT_TIMEOUT_MS = 8000;
     private static final int READ_TIMEOUT_MS = 15000;
+    private static final int RESCAN_READ_TIMEOUT_MS = 120000;
     // This request goes through nginx (proxy_read_timeout), so it must stay
     // above that ceiling — bumped alongside it to give handle_fredplayer_ask's
     // up-to-3 retry attempts room to actually finish.
@@ -61,6 +62,15 @@ final class RemoteLibraryClient {
         return new JSONArray(body);
     }
 
+    static int rescanLibrary(String baseUrl, String token) throws IOException, JSONException {
+        String body = post(
+                requireSecureBaseUrl(baseUrl) + "/api/rescan",
+                token,
+                "{}",
+                RESCAN_READ_TIMEOUT_MS);
+        return new JSONObject(body).getInt("count");
+    }
+
     static JSONArray fetchPlaylists(String baseUrl, String token) throws IOException, JSONException {
         String body = get(requireSecureBaseUrl(baseUrl) + "/api/playlists", token);
         return new JSONArray(body);
@@ -82,6 +92,75 @@ final class RemoteLibraryClient {
                 token,
                 requestBody.toString(),
                 READ_TIMEOUT_MS);
+    }
+
+    static String artworkUrlFromTrackUri(String trackUriString) {
+        if (trackUriString == null) {
+            return null;
+        }
+        int index = trackUriString.indexOf("/stream/");
+        if (index < 0) {
+            return null;
+        }
+        return trackUriString.substring(0, index) + "/api/artwork/"
+                + trackUriString.substring(index + "/stream/".length());
+    }
+
+    static String lyricsUrlFromTrackUri(String trackUriString) {
+        if (trackUriString == null) {
+            return null;
+        }
+        int index = trackUriString.indexOf("/stream/");
+        if (index < 0) {
+            return null;
+        }
+        return trackUriString.substring(0, index) + "/api/lyrics/"
+                + trackUriString.substring(index + "/stream/".length());
+    }
+
+    // Returns null (not an exception) when the server has no lyrics for this
+    // track (HTTP 404) — that's an expected, common case, not an error.
+    static JSONObject fetchLyrics(String token, String trackUriString) throws IOException, JSONException {
+        String url = lyricsUrlFromTrackUri(trackUriString);
+        if (url == null) {
+            throw new IOException("Track is not from the configured server");
+        }
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
+        connection.setReadTimeout(READ_TIMEOUT_MS);
+        connection.setRequestMethod("GET");
+        connection.setRequestProperty("Authorization", "Bearer " + token);
+        try {
+            int code = connection.getResponseCode();
+            if (code == HttpURLConnection.HTTP_NOT_FOUND) {
+                return null;
+            }
+            if (code != HttpURLConnection.HTTP_OK) {
+                throw new IOException("Server returned HTTP " + code);
+            }
+            return new JSONObject(readAll(connection.getInputStream()));
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    static byte[] fetchBytes(String urlString, String token) throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) new URL(urlString).openConnection();
+        connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
+        connection.setReadTimeout(READ_TIMEOUT_MS);
+        connection.setRequestMethod("GET");
+        if (token != null && !token.isEmpty()) {
+            connection.setRequestProperty("Authorization", "Bearer " + token);
+        }
+        try {
+            int code = connection.getResponseCode();
+            if (code != HttpURLConnection.HTTP_OK) {
+                throw new IOException("Server returned HTTP " + code);
+            }
+            return readAllBytes(connection.getInputStream());
+        } finally {
+            connection.disconnect();
+        }
     }
 
     static String serverPath(String baseUrl, String uriString) {
@@ -161,12 +240,19 @@ final class RemoteLibraryClient {
         if (input == null) {
             return "";
         }
+        return new String(readAllBytes(input), StandardCharsets.UTF_8);
+    }
+
+    private static byte[] readAllBytes(InputStream input) throws IOException {
+        if (input == null) {
+            return new byte[0];
+        }
         ByteArrayOutputStream buffer = new ByteArrayOutputStream();
         byte[] chunk = new byte[8192];
         int read;
         while ((read = input.read(chunk)) != -1) {
             buffer.write(chunk, 0, read);
         }
-        return buffer.toString(StandardCharsets.UTF_8.name());
+        return buffer.toByteArray();
     }
 }

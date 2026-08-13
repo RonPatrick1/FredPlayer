@@ -73,4 +73,17 @@ struct LinuxVisualFile {
 
 std::optional<LinuxVisualFile> decodeFlv1(const std::vector<std::uint8_t>& bytes);
 
+// Album art cache, keyed by (artist, album) so every track on the same
+// album shares one cached JPEG instead of fetching it once per track —
+// matches the server's own artwork.js keying, though the two don't need
+// to agree on the exact hash since this is purely a local lookup.
+std::string albumArtworkCacheKey(const std::string& artist, const std::string& album);
+std::optional<std::filesystem::path> cachedArtworkPath(
+    const std::string& artist, const std::string& album,
+    const std::filesystem::path& root = dataDirectory());
+std::optional<std::filesystem::path> storeArtwork(
+    const std::string& artist, const std::string& album,
+    const std::vector<std::uint8_t>& data,
+    const std::filesystem::path& root = dataDirectory());
+
 }  // namespace fredplayer

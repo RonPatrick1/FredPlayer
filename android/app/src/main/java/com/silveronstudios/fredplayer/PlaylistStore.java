@@ -44,6 +44,7 @@ final class PlaylistStore {
     private static final String KEY_BLUETOOTH_VISUAL_DELAY_LABELS =
             "bluetooth_visual_delay_labels";
     private static final String KEY_SHUFFLE_ENABLED = "shuffle_enabled";
+    private static final String KEY_REPEAT_MODE = "repeat_mode";
     private static final String KEY_SERVER_BASE_URL = "server_base_url";
     private static final String KEY_SERVER_TOKEN = "server_token";
     private static final String KEY_TRACK_METADATA = "track_metadata";
@@ -394,9 +395,29 @@ final class PlaylistStore {
                 .apply();
     }
 
+    // 0 = off, 1 = all, 2 = one.
+    static int loadRepeatMode(Context context) {
+        int mode = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getInt(KEY_REPEAT_MODE, 1);
+        return mode >= 0 && mode <= 2 ? mode : 1;
+    }
+
+    static void saveRepeatMode(Context context, int mode) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putInt(KEY_REPEAT_MODE, mode)
+                .apply();
+    }
+
     static String loadServerBaseUrl(Context context) {
-        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        String saved = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .getString(KEY_SERVER_BASE_URL, "");
+        if ((saved == null || saved.trim().isEmpty())
+                && BuildConfig.DEBUG
+                && !BuildConfig.DEV_SERVER_URL.trim().isEmpty()) {
+            return BuildConfig.DEV_SERVER_URL.trim();
+        }
+        return saved == null ? "" : saved;
     }
 
     static void saveServerBaseUrl(Context context, String url) {
@@ -416,6 +437,11 @@ final class PlaylistStore {
         }
         if (preferences.contains(KEY_SERVER_TOKEN)) {
             preferences.edit().remove(KEY_SERVER_TOKEN).apply();
+        }
+        if (protectedToken.isEmpty()
+                && BuildConfig.DEBUG
+                && !BuildConfig.DEV_SERVER_TOKEN.isEmpty()) {
+            return BuildConfig.DEV_SERVER_TOKEN;
         }
         return protectedToken;
     }

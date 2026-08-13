@@ -9,6 +9,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
@@ -29,6 +31,7 @@ import androidx.media.MediaBrowserServiceCompat;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -42,11 +45,15 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
     private static final String PLAYLIST_ID_PREFIX = "playlist:";
     private static final String TRACK_ID_PREFIX = "track:";
     public static final String ACTION_SET_PLAYLIST = "com.silveronstudios.fredplayer.SET_PLAYLIST";
+    public static final String ACTION_PLAY_URI = "com.silveronstudios.fredplayer.PLAY_URI";
     public static final String ACTION_TOGGLE_PLAY = "com.silveronstudios.fredplayer.TOGGLE_PLAY";
     public static final String ACTION_SKIP = "com.silveronstudios.fredplayer.SKIP";
     public static final String ACTION_PREVIOUS = "com.silveronstudios.fredplayer.PREVIOUS";
     public static final String ACTION_STOP = "com.silveronstudios.fredplayer.STOP";
     public static final String ACTION_CLEAR = "com.silveronstudios.fredplayer.CLEAR";
+    public static final String ACTION_REMOVE_CURRENT = "com.silveronstudios.fredplayer.REMOVE_CURRENT";
+    public static final String ACTION_TOGGLE_SHUFFLE = "com.silveronstudios.fredplayer.TOGGLE_SHUFFLE";
+    public static final String ACTION_CYCLE_REPEAT = "com.silveronstudios.fredplayer.CYCLE_REPEAT";
     public static final String ACTION_SEEK = "com.silveronstudios.fredplayer.SEEK";
     public static final String ACTION_SET_OUTPUT_LEVEL = "com.silveronstudios.fredplayer.SET_OUTPUT_LEVEL";
     public static final String ACTION_SET_LEVELING_STRENGTH = "com.silveronstudios.fredplayer.SET_LEVELING_STRENGTH";
@@ -66,6 +73,7 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
     public static final String EXTRA_TRACK_NAME = "track_name";
     public static final String EXTRA_TRACK_ARTIST = "track_artist";
     public static final String EXTRA_TRACK_ALBUM = "track_album";
+    public static final String EXTRA_TRACK_URI = "track_uri";
     public static final String EXTRA_MESSAGE = "message";
     public static final String EXTRA_PLAYLIST_COUNT = "playlist_count";
     public static final String EXTRA_POSITION_MS = "position_ms";
@@ -103,31 +111,64 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
     public static final String EXTRA_VISUAL_CACHE_KEEP = "visual_cache_keep";
     public static final String EXTRA_VISUAL_CACHE_BYTES = "visual_cache_bytes";
     public static final String EXTRA_CONTROL_TOKEN = "control_token";
+    public static final String EXTRA_SHUFFLE_ENABLED = "shuffle_enabled";
+    public static final String EXTRA_REPEAT_MODE = "repeat_mode";
+    public static final String EXTRA_CURRENT_INDEX = "current_index";
+    public static final String EXTRA_SHUFFLE_BAG = "shuffle_bag";
+    public static final String EXTRA_PLAY_HISTORY = "play_history";
+    public static final String EXTRA_HISTORY_INDEX = "history_index";
+
+    public static final int REPEAT_OFF = 0;
+    public static final int REPEAT_ALL = 1;
+    public static final int REPEAT_ONE = 2;
 
     private static final String CHANNEL_ID = "fred_player_playback";
     private static final int NOTIFICATION_ID = 41;
     private static final int CACHE_LOOKAHEAD_TRACKS = 2;
+    // Small in-memory bound — this is a session-lifetime cache of decoded
+    // bitmaps (not the on-disk server cache), just enough to make repeat
+    // plays of recently-heard albums instant without holding onto every
+    // album ever played in this process's memory.
+    private static final int ARTWORK_MEMORY_CACHE_MAX = 24;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Random random = new Random();
     private final ArrayList<String> playlist = new ArrayList<>();
     private final ArrayList<Integer> shuffleBag = new ArrayList<>();
+    private final ArrayList<Integer> playHistory = new ArrayList<>();
+    private final Map<String, Bitmap> artworkMemoryCache = new LinkedHashMap<String, Bitmap>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Bitmap> eldest) {
+            return size() > ARTWORK_MEMORY_CACHE_MAX;
+        }
+    };
 
     private NormalizingAudioPlayer player;
     private AudioManager audioManager;
     private AudioFocusRequest focusRequest;
     private MediaSessionCompat mediaSession;
     private ExecutorService browseExecutor;
+    private ExecutorService artworkExecutor;
     private ExecutorService calibrationExecutor;
+    private volatile Bitmap currentArtworkBitmap;
+    private Bitmap placeholderArtworkBitmap;
+    private String artworkRequestKey = "";
     private String activePlaylistName = PlaylistStore.DEFAULT_PLAYLIST_NAME;
     private boolean shuffleEnabled = true;
+    private int repeatMode = REPEAT_ALL;
     private int currentIndex = -1;
-    private int previousIndex = -1;
+    // Position within playHistory that represents "what's currently
+    // playing" — browser-back/forward style, so Previous/Next can retrace
+    // actual play order instead of just picking an adjacent raw index
+    // (meaningless in shuffle mode) or drawing a fresh random pick every
+    // time Next is pressed after a Previous.
+    private int historyIndex = -1;
     private boolean playbackRequested;
     private boolean audioActuallyPlaying;
     private String currentTrackName = "";
     private String currentTrackArtist = "";
     private String currentTrackAlbum = "";
+    private String currentTrackUri = "";
     private String message = "Paused";
     private int cacheProgressDone;
     private int cacheProgressTotal;
@@ -149,6 +190,7 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
     public void onCreate() {
         super.onCreate();
         browseExecutor = Executors.newSingleThreadExecutor();
+        artworkExecutor = Executors.newSingleThreadExecutor();
         calibrationExecutor = Executors.newSingleThreadExecutor();
         LinkedHashMap<String, ArrayList<String>> playlists = PlaylistStore.loadPlaylists(this);
         activePlaylistName = PlaylistStore.loadActivePlaylistName(this, playlists);
@@ -157,6 +199,7 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
             playlist.addAll(activeTracks);
         }
         shuffleEnabled = PlaylistStore.loadShuffleEnabled(this);
+        repeatMode = PlaylistStore.loadRepeatMode(this);
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         createNotificationChannel();
         createMediaSession();
@@ -177,7 +220,7 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
                 mainHandler.post(() -> {
                     audioActuallyPlaying = false;
                     if (playbackRequested && !playlist.isEmpty()) {
-                        playRandomTrack();
+                        handleTrackFinished();
                     } else {
                         message = "Paused";
                         publishState();
@@ -253,6 +296,21 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
             // SharedPreferences access isn't a Binder IPC call.
             ArrayList<String> incoming = PlaylistStore.loadPlaylist(this);
             String currentItem = currentIndex >= 0 && currentIndex < playlist.size() ? playlist.get(currentIndex) : null;
+
+            // Diff against the outgoing playlist so playHistory (and the
+            // redo cursor) can drop/shift entries for whatever tracks are
+            // now gone, instead of silently pointing at the wrong song
+            // afterward. The shuffle bag doesn't need the same diffing —
+            // it's always rebuilt fresh below regardless of what changed.
+            HashSet<String> incomingSet = new HashSet<>(incoming);
+            ArrayList<Integer> removedAscending = new ArrayList<>();
+            for (int i = 0; i < playlist.size(); i++) {
+                if (!incomingSet.contains(playlist.get(i))) {
+                    removedAscending.add(i);
+                }
+            }
+            remapStoredIndicesAfterRemoval(removedAscending);
+
             playlist.clear();
             playlist.addAll(incoming);
             currentIndex = currentItem == null ? -1 : playlist.indexOf(currentItem);
@@ -263,10 +321,13 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
                 playbackRequested = false;
                 audioActuallyPlaying = false;
                 currentIndex = -1;
-                previousIndex = -1;
+                historyIndex = -1;
+                playHistory.clear();
                 currentTrackName = "";
                 currentTrackArtist = "";
                 currentTrackAlbum = "";
+                currentTrackUri = "";
+                currentArtworkBitmap = null;
                 if (player != null) {
                     player.stop();
                 }
@@ -286,6 +347,8 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
                 currentTrackName = "";
                 currentTrackArtist = "";
                 currentTrackAlbum = "";
+                currentTrackUri = "";
+                currentArtworkBitmap = null;
                 message = "Paused";
             }
             if (intent.getBooleanExtra(EXTRA_START_PLAYING, false)) {
@@ -316,6 +379,14 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
             stopPlayback();
         } else if (ACTION_CLEAR.equals(action)) {
             clearPlaylist();
+        } else if (ACTION_REMOVE_CURRENT.equals(action)) {
+            removeCurrentTrack();
+        } else if (ACTION_PLAY_URI.equals(action)) {
+            playSpecificUri(intent.getStringExtra(EXTRA_TRACK_URI));
+        } else if (ACTION_TOGGLE_SHUFFLE.equals(action)) {
+            toggleShuffle();
+        } else if (ACTION_CYCLE_REPEAT.equals(action)) {
+            cycleRepeatMode();
         } else if (ACTION_SEEK.equals(action)) {
             seekTo(intent.getLongExtra(EXTRA_POSITION_MS, 0L));
         } else if (ACTION_REQUEST_STATE.equals(action)) {
@@ -418,6 +489,10 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
             browseExecutor.shutdownNow();
             browseExecutor = null;
         }
+        if (artworkExecutor != null) {
+            artworkExecutor.shutdownNow();
+            artworkExecutor = null;
+        }
         if (calibrationExecutor != null) {
             calibrationExecutor.shutdownNow();
             calibrationExecutor = null;
@@ -473,12 +548,24 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
             ArrayList<MediaBrowserCompat.MediaItem> items = new ArrayList<>();
             for (int i = 0; i < snapshot.size(); i++) {
                 TrackMetadata metadata = resolveMetadata(snapshot.get(i));
-                MediaDescriptionCompat description = new MediaDescriptionCompat.Builder()
+                MediaDescriptionCompat.Builder descriptionBuilder = new MediaDescriptionCompat.Builder()
                         .setMediaId(TRACK_ID_PREFIX + playlistName + "#" + i)
                         .setTitle(metadata.title.isEmpty() ? "FredPlayer" : metadata.title)
-                        .setSubtitle(metadata.detailLine())
-                        .build();
-                items.add(new MediaBrowserCompat.MediaItem(description, MediaBrowserCompat.MediaItem.FLAG_PLAYABLE));
+                        .setSubtitle(metadata.detailLine());
+                // Only ever a synchronous in-memory lookup — browsing must stay
+                // fast for a whole playlist, so this never triggers a network
+                // fetch. Coverage grows naturally as albums get played and
+                // land in the cache; an uncached track just browses with no
+                // icon, which is fine.
+                Bitmap icon;
+                synchronized (artworkMemoryCache) {
+                    icon = artworkMemoryCache.get(artworkKey(metadata.artist, metadata.album));
+                }
+                if (icon != null) {
+                    descriptionBuilder.setIconBitmap(icon);
+                }
+                items.add(new MediaBrowserCompat.MediaItem(
+                        descriptionBuilder.build(), MediaBrowserCompat.MediaItem.FLAG_PLAYABLE));
             }
             result.sendResult(items);
         });
@@ -561,17 +648,96 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         audioActuallyPlaying = false;
         playlist.clear();
         shuffleBag.clear();
+        playHistory.clear();
         currentIndex = -1;
-        previousIndex = -1;
+        historyIndex = -1;
         currentTrackName = "";
         currentTrackArtist = "";
         currentTrackAlbum = "";
+        currentTrackUri = "";
+        currentArtworkBitmap = null;
         PlaylistStore.savePlaylist(this, playlist);
         if (player != null) {
             player.stop();
         }
         abandonAudioFocus();
         message = "No songs";
+        publishState();
+    }
+
+    private void playSpecificUri(String uri) {
+        if (uri == null || playlist.isEmpty()) {
+            return;
+        }
+        int index = playlist.indexOf(uri);
+        if (index < 0) {
+            return;
+        }
+        playbackRequested = true;
+        if (!requestAudioFocus()) {
+            playbackRequested = false;
+            message = "Audio focus unavailable";
+            publishState();
+            return;
+        }
+        // A manual jump (from the playlist editor or the What's Next list)
+        // pulls the track out of the remaining shuffle order so it doesn't
+        // also play again later this pass, and starts a fresh history
+        // branch — same as a browser tab navigating somewhere new drops
+        // whatever "forward" history it had.
+        shuffleBag.remove(Integer.valueOf(index));
+        recordHistory(index);
+        playTrackAt(index);
+    }
+
+    private void removeCurrentTrack() {
+        if (currentIndex < 0 || currentIndex >= playlist.size()) {
+            return;
+        }
+        int removedIndex = currentIndex;
+        playlist.remove(removedIndex);
+        // Surgical, not a wipe: only the deleted track drops out of the
+        // shuffle bag/history, everything else keeps its place — so
+        // deleting a song doesn't also reset your shuffle order/history.
+        remapStoredIndicesAfterRemoval(Collections.singletonList(removedIndex));
+        PlaylistStore.savePlaylist(this, playlist);
+        if (playlist.isEmpty()) {
+            playbackRequested = false;
+            audioActuallyPlaying = false;
+            currentIndex = -1;
+            currentTrackName = "";
+            currentTrackArtist = "";
+            currentTrackAlbum = "";
+            currentTrackUri = "";
+            currentArtworkBitmap = null;
+            if (player != null) {
+                player.stop();
+            }
+            abandonAudioFocus();
+            message = "No songs";
+            publishState();
+            return;
+        }
+        // With shuffle on, the next track after a deletion should be a new
+        // random pick, not just whatever slid into the deleted slot — that
+        // was always "the next sequential track" regardless of the shuffle
+        // setting, which is only correct when shuffle is off.
+        currentIndex = Math.min(removedIndex, playlist.size() - 1);
+        int nextIndex = shuffleEnabled ? chooseNextIndex() : currentIndex;
+        recordHistory(nextIndex);
+        if (playbackRequested) {
+            playTrackAt(nextIndex);
+            return;
+        }
+        currentIndex = nextIndex;
+        String item = playlist.get(nextIndex);
+        TrackMetadata metadata = resolveMetadata(item);
+        currentTrackName = metadata.title;
+        currentTrackArtist = metadata.artist;
+        currentTrackAlbum = metadata.album;
+        currentTrackUri = item;
+        updateArtworkForCurrentTrack(item, metadata.artist, metadata.album);
+        message = "Paused";
         publishState();
     }
 
@@ -598,11 +764,69 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         activePlaylistName = name;
         PlaylistStore.saveActivePlaylistName(this, name);
         currentIndex = -1;
-        previousIndex = -1;
+        historyIndex = -1;
         shuffleBag.clear();
+        playHistory.clear();
         warmCacheLookahead();
     }
 
+    private void toggleShuffle() {
+        shuffleEnabled = !shuffleEnabled;
+        // Re-shuffle immediately on toggle-on rather than leaving the bag
+        // empty until the next skip — otherwise the What's Next list would
+        // show nothing until then.
+        if (shuffleEnabled) {
+            refillShuffleBag();
+        } else {
+            shuffleBag.clear();
+        }
+        PlaylistStore.saveShuffleEnabled(this, shuffleEnabled);
+        mediaSession.setShuffleMode(shuffleEnabled
+                ? PlaybackStateCompat.SHUFFLE_MODE_ALL
+                : PlaybackStateCompat.SHUFFLE_MODE_NONE);
+        publishState();
+    }
+
+    private void cycleRepeatMode() {
+        repeatMode = repeatMode == REPEAT_OFF ? REPEAT_ALL
+                : repeatMode == REPEAT_ALL ? REPEAT_ONE : REPEAT_OFF;
+        PlaylistStore.saveRepeatMode(this, repeatMode);
+        mediaSession.setRepeatMode(toPlaybackRepeatMode(repeatMode));
+        publishState();
+    }
+
+    // Called only when a track finishes playing on its own — manual skip
+    // (ACTION_SKIP / MediaSession next) always advances and wraps regardless
+    // of repeat mode; only the natural end-of-track path should honor
+    // "repeat one" (replay) or "repeat off" (stop instead of wrapping).
+    private void handleTrackFinished() {
+        if (repeatMode == REPEAT_ONE) {
+            if (currentIndex >= 0 && currentIndex < playlist.size()) {
+                playTrackAt(currentIndex);
+            }
+            return;
+        }
+        if (repeatMode == REPEAT_OFF) {
+            boolean atEnd = shuffleEnabled
+                    ? shuffleBag.isEmpty()
+                    : currentIndex >= playlist.size() - 1;
+            if (atEnd) {
+                playbackRequested = false;
+                message = "Paused";
+                publishState();
+                return;
+            }
+        }
+        playRandomTrack();
+    }
+
+    // If Previous was pressed earlier and hasn't been followed by a new
+    // manual pick, historyIndex sits behind the end of playHistory — in
+    // that case this just replays forward through the same recorded path
+    // instead of drawing a fresh pick, so it actually undoes Previous
+    // rather than landing on an unrelated track. Only once we're back at
+    // the end of history does this fall through to a new shuffle/
+    // sequential pick.
     private void playRandomTrack() {
         if (playlist.isEmpty() || player == null) {
             playbackRequested = false;
@@ -610,14 +834,29 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
             publishState();
             return;
         }
-        playTrackAt(chooseNextIndex(), true);
+        int nextIndex;
+        if (historyIndex >= 0 && historyIndex < playHistory.size() - 1) {
+            historyIndex++;
+            nextIndex = playHistory.get(historyIndex);
+        } else {
+            nextIndex = chooseNextIndex();
+            recordHistory(nextIndex);
+        }
+        playTrackAt(nextIndex);
     }
 
+    // Walks back through the actual play history (the same list the What's
+    // Next screen's recently-played section shows) by moving historyIndex
+    // rather than recomputing an index — in shuffle mode currentIndex-1
+    // has no relation to what really played before this track.
     private void playPreviousTrack() {
         if (playlist.isEmpty() || player == null) {
             playbackRequested = false;
             message = "No songs";
             publishState();
+            return;
+        }
+        if (historyIndex <= 0) {
             return;
         }
         playbackRequested = true;
@@ -627,16 +866,12 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
             publishState();
             return;
         }
-        int target;
-        if (!shuffleEnabled) {
-            target = currentIndex < 0 ? 0 : (currentIndex - 1 + playlist.size()) % playlist.size();
-        } else {
-            target = previousIndex >= 0 && previousIndex < playlist.size()
-                    ? previousIndex
-                    : Math.max(0, currentIndex);
+        historyIndex--;
+        int target = playHistory.get(historyIndex);
+        if (shuffleEnabled) {
+            shuffleBag.remove(Integer.valueOf(target));
         }
-        previousIndex = -1;
-        playTrackAt(target, false);
+        playTrackAt(target);
     }
 
     private TrackMetadata resolveMetadata(String uri) {
@@ -647,15 +882,12 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         return TrackMetadata.from(this, uri);
     }
 
-    private void playTrackAt(int nextIndex, boolean rememberPrevious) {
+    private void playTrackAt(int nextIndex) {
         if (nextIndex < 0 || nextIndex >= playlist.size() || player == null) {
             playbackRequested = false;
             message = "No songs";
             publishState();
             return;
-        }
-        if (rememberPrevious && currentIndex >= 0 && currentIndex < playlist.size() && currentIndex != nextIndex) {
-            previousIndex = currentIndex;
         }
         currentIndex = nextIndex;
         String item = playlist.get(nextIndex);
@@ -663,11 +895,74 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         currentTrackName = metadata.title;
         currentTrackArtist = metadata.artist;
         currentTrackAlbum = metadata.album;
+        currentTrackUri = item;
         audioActuallyPlaying = false;
         message = "Leveling";
+        updateArtworkForCurrentTrack(item, metadata.artist, metadata.album);
         publishState();
         player.play(Uri.parse(item));
         warmCacheLookahead();
+    }
+
+    private static String artworkKey(String artist, String album) {
+        String normalizedArtist = artist == null ? "" : artist.trim().toLowerCase(Locale.US);
+        String normalizedAlbum = album == null ? "" : album.trim().toLowerCase(Locale.US);
+        return normalizedArtist + "|" + normalizedAlbum;
+    }
+
+    // Called on the main thread from playTrackAt(), right before the
+    // publishState() that pushes fresh MediaMetadata out — a synchronous
+    // cache hit lands in that same publish; a miss clears any stale art
+    // from the previous track and kicks off a background fetch that
+    // publishes again once (and only if) it lands before the user has
+    // already skipped to something else.
+    private void updateArtworkForCurrentTrack(String uriString, String artist, String album) {
+        String key = artworkKey(artist, album);
+        artworkRequestKey = key;
+        Bitmap cached;
+        synchronized (artworkMemoryCache) {
+            cached = artworkMemoryCache.get(key);
+        }
+        if (cached != null) {
+            currentArtworkBitmap = cached;
+            return;
+        }
+        currentArtworkBitmap = null;
+        if (artist == null || artist.isEmpty() || album == null || album.isEmpty()) {
+            return;
+        }
+        String artworkUrl = RemoteLibraryClient.artworkUrlFromTrackUri(uriString);
+        if (artworkUrl == null || artworkExecutor == null) {
+            return;
+        }
+        String token = PlaylistStore.loadServerToken(this);
+        artworkExecutor.execute(() -> fetchArtwork(artworkUrl, token, key));
+    }
+
+    private void fetchArtwork(String urlString, String token, String key) {
+        Bitmap bitmap = null;
+        try {
+            byte[] data = RemoteLibraryClient.fetchBytes(urlString, token);
+            bitmap = BitmapFactory.decodeByteArray(data, 0, data.length);
+        } catch (Exception ignored) {
+            // Best-effort — playback must not depend on this succeeding.
+        }
+        if (bitmap == null) {
+            return;
+        }
+        synchronized (artworkMemoryCache) {
+            artworkMemoryCache.put(key, bitmap);
+        }
+        Bitmap decoded = bitmap;
+        mainHandler.post(() -> {
+            // Staleness guard — the user may have already skipped to
+            // another track by the time this (server-fetched, so not
+            // instant on a cold miss) request comes back.
+            if (key.equals(artworkRequestKey)) {
+                currentArtworkBitmap = decoded;
+                publishState();
+            }
+        });
     }
 
     private void warmCacheLookahead() {
@@ -801,6 +1096,94 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         });
     }
 
+    // Appends a newly-started track to the play-history log, first
+    // discarding any stale "forward" entries beyond the current position —
+    // the same browser-back/forward-style branching used by manual jumps,
+    // so picking an out-of-order track (or advancing past a Previous)
+    // keeps the log consistent with what actually played instead of
+    // leaving a dangling, no-longer-true future behind.
+    private void recordHistory(int trackIndex) {
+        if (trackIndex < 0 || trackIndex >= playlist.size()) {
+            return;
+        }
+        while (playHistory.size() > historyIndex + 1) {
+            playHistory.remove(playHistory.size() - 1);
+        }
+        playHistory.add(trackIndex);
+        historyIndex = playHistory.size() - 1;
+        if (playHistory.size() > 200) {
+            playHistory.remove(0);
+            historyIndex--;
+        }
+    }
+
+    // Called right after tracks are erased from `playlist`. `removedAscending`
+    // holds their ORIGINAL indices, sorted ascending. Every other stored
+    // index (the shuffle bag, the play history log) needs the same
+    // treatment `playlist` just got: drop anything that pointed at a
+    // removed track, and shift everything above it down to match — that
+    // way a deletion only removes the deleted track from the What's Next
+    // order, instead of resetting the whole thing.
+    private void remapStoredIndicesAfterRemoval(List<Integer> removedAscending) {
+        ArrayList<Integer> newBag = new ArrayList<>(shuffleBag.size());
+        for (int idx : shuffleBag) {
+            int mapped = remapIndexAfterRemoval(idx, removedAscending);
+            if (mapped >= 0) {
+                newBag.add(mapped);
+            }
+        }
+        shuffleBag.clear();
+        shuffleBag.addAll(newBag);
+
+        // If the cursor's own entry (the currently-playing track) is one
+        // of the ones being removed, only the history *before* it can
+        // still be considered valid — any recorded "forward" entries past
+        // it get dropped along with it, same as a fresh manual pick would
+        // do. Stop remapping at that point rather than continuing past
+        // it, otherwise there's nothing left to point the cursor at and
+        // it falls back to -1, which then makes the next recordHistory()
+        // call think there's no history at all and erase the part that
+        // should have been preserved.
+        boolean currentEntryRemoved = historyIndex >= 0 && historyIndex < playHistory.size()
+                && remapIndexAfterRemoval(playHistory.get(historyIndex), removedAscending) < 0;
+        int scanLimit = currentEntryRemoved ? historyIndex : playHistory.size();
+
+        ArrayList<Integer> newHistory = new ArrayList<>(playHistory.size());
+        int newHistoryIndex = -1;
+        for (int i = 0; i < scanLimit; i++) {
+            int mapped = remapIndexAfterRemoval(playHistory.get(i), removedAscending);
+            if (mapped < 0) {
+                continue;
+            }
+            newHistory.add(mapped);
+            if (i == historyIndex) {
+                newHistoryIndex = newHistory.size() - 1;
+            }
+        }
+        if (currentEntryRemoved) {
+            newHistoryIndex = newHistory.size() - 1;
+        }
+        playHistory.clear();
+        playHistory.addAll(newHistory);
+        historyIndex = newHistoryIndex;
+    }
+
+    private static int remapIndexAfterRemoval(int index, List<Integer> removedAscending) {
+        if (index < 0) {
+            return -1;
+        }
+        int shift = 0;
+        for (int removed : removedAscending) {
+            if (removed == index) {
+                return -1;
+            }
+            if (removed < index) {
+                shift++;
+            }
+        }
+        return index - shift;
+    }
+
     private int chooseNextIndex() {
         if (playlist.size() == 1) {
             return 0;
@@ -867,6 +1250,7 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         state.putExtra(EXTRA_TRACK_NAME, currentTrackName);
         state.putExtra(EXTRA_TRACK_ARTIST, currentTrackArtist);
         state.putExtra(EXTRA_TRACK_ALBUM, currentTrackAlbum);
+        state.putExtra(EXTRA_TRACK_URI, currentTrackUri);
         state.putExtra(EXTRA_MESSAGE, message);
         state.putExtra(EXTRA_PLAYLIST_COUNT, playlist.size());
         state.putExtra(EXTRA_POSITION_MS, player == null ? 0L : player.getCurrentPositionMs());
@@ -883,8 +1267,22 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         state.putExtra(EXTRA_VISUAL_CACHE_BYTES, visualStats.approximateBytes);
         state.putExtra(EXTRA_CACHE_PROGRESS_DONE, cacheProgressDone);
         state.putExtra(EXTRA_CACHE_PROGRESS_TOTAL, cacheProgressTotal);
+        state.putExtra(EXTRA_SHUFFLE_ENABLED, shuffleEnabled);
+        state.putExtra(EXTRA_REPEAT_MODE, repeatMode);
+        state.putExtra(EXTRA_CURRENT_INDEX, currentIndex);
+        state.putExtra(EXTRA_SHUFFLE_BAG, toIntArray(shuffleBag));
+        state.putExtra(EXTRA_PLAY_HISTORY, toIntArray(playHistory));
+        state.putExtra(EXTRA_HISTORY_INDEX, historyIndex);
         putOutputRouteState(state);
         sendBroadcast(state);
+    }
+
+    private static int[] toIntArray(ArrayList<Integer> values) {
+        int[] result = new int[values.size()];
+        for (int i = 0; i < values.size(); i++) {
+            result[i] = values.get(i);
+        }
+        return result;
     }
 
     private void publishProgress() {
@@ -895,10 +1293,13 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         state.putExtra(EXTRA_TRACK_NAME, currentTrackName);
         state.putExtra(EXTRA_TRACK_ARTIST, currentTrackArtist);
         state.putExtra(EXTRA_TRACK_ALBUM, currentTrackAlbum);
+        state.putExtra(EXTRA_TRACK_URI, currentTrackUri);
         state.putExtra(EXTRA_MESSAGE, message);
         state.putExtra(EXTRA_PLAYLIST_COUNT, playlist.size());
         state.putExtra(EXTRA_POSITION_MS, player == null ? 0L : player.getCurrentPositionMs());
         state.putExtra(EXTRA_DURATION_MS, player == null ? 0L : player.getDurationMs());
+        state.putExtra(EXTRA_SHUFFLE_ENABLED, shuffleEnabled);
+        state.putExtra(EXTRA_REPEAT_MODE, repeatMode);
         putOutputRouteState(state);
         sendBroadcast(state);
     }
@@ -998,7 +1399,9 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
                         return;
                     }
                     playbackRequested = true;
-                    playTrackAt(index, true);
+                    shuffleBag.remove(Integer.valueOf(index));
+                    recordHistory(index);
+                    playTrackAt(index);
                 });
             }
 
@@ -1035,7 +1438,9 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
                             return;
                         }
                         playbackRequested = true;
-                        playTrackAt(matchedIndex, true);
+                        shuffleBag.remove(Integer.valueOf(matchedIndex));
+                        recordHistory(matchedIndex);
+                        playTrackAt(matchedIndex);
                     });
                 });
             }
@@ -1044,10 +1449,25 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
             public void onSetShuffleMode(int shuffleMode) {
                 mainHandler.post(() -> {
                     shuffleEnabled = shuffleMode != PlaybackStateCompat.SHUFFLE_MODE_NONE;
+                    if (shuffleEnabled) {
+                        refillShuffleBag();
+                    } else {
+                        shuffleBag.clear();
+                    }
                     PlaylistStore.saveShuffleEnabled(SleepMusicService.this, shuffleEnabled);
                     mediaSession.setShuffleMode(shuffleEnabled
                             ? PlaybackStateCompat.SHUFFLE_MODE_ALL
                             : PlaybackStateCompat.SHUFFLE_MODE_NONE);
+                    publishState();
+                });
+            }
+
+            @Override
+            public void onSetRepeatMode(int newRepeatMode) {
+                mainHandler.post(() -> {
+                    repeatMode = fromPlaybackRepeatMode(newRepeatMode);
+                    PlaylistStore.saveRepeatMode(SleepMusicService.this, repeatMode);
+                    mediaSession.setRepeatMode(toPlaybackRepeatMode(repeatMode));
                     publishState();
                 });
             }
@@ -1056,7 +1476,27 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         mediaSession.setShuffleMode(shuffleEnabled
                 ? PlaybackStateCompat.SHUFFLE_MODE_ALL
                 : PlaybackStateCompat.SHUFFLE_MODE_NONE);
+        mediaSession.setRepeatMode(toPlaybackRepeatMode(repeatMode));
         mediaSession.setActive(true);
+    }
+
+    private static int toPlaybackRepeatMode(int mode) {
+        if (mode == REPEAT_ONE) return PlaybackStateCompat.REPEAT_MODE_ONE;
+        if (mode == REPEAT_OFF) return PlaybackStateCompat.REPEAT_MODE_NONE;
+        return PlaybackStateCompat.REPEAT_MODE_ALL;
+    }
+
+    private static int fromPlaybackRepeatMode(int mode) {
+        if (mode == PlaybackStateCompat.REPEAT_MODE_ONE) return REPEAT_ONE;
+        if (mode == PlaybackStateCompat.REPEAT_MODE_NONE) return REPEAT_OFF;
+        return REPEAT_ALL;
+    }
+
+    private Bitmap placeholderArtwork() {
+        if (placeholderArtworkBitmap == null) {
+            placeholderArtworkBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.no_album_art);
+        }
+        return placeholderArtworkBitmap;
     }
 
     private void updateMediaSessionState() {
@@ -1073,7 +1513,8 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
                 | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
                 | PlaybackStateCompat.ACTION_PLAY_FROM_MEDIA_ID
                 | PlaybackStateCompat.ACTION_PLAY_FROM_SEARCH
-                | PlaybackStateCompat.ACTION_SET_SHUFFLE_MODE;
+                | PlaybackStateCompat.ACTION_SET_SHUFFLE_MODE
+                | PlaybackStateCompat.ACTION_SET_REPEAT_MODE;
         int state;
         if (playbackRequested && audioActuallyPlaying) {
             state = PlaybackStateCompat.STATE_PLAYING;
@@ -1103,6 +1544,15 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
         }
         if (player != null && player.getDurationMs() > 0L) {
             metadata.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, player.getDurationMs());
+        }
+        // Read straight from the lock screen / notification / Android
+        // Auto's now-playing template — none of those need any
+        // FredPlayer-specific code, they all already render whatever
+        // bitmap sits in this metadata key. Falls back to the branded
+        // placeholder so those surfaces never show a blank art slot.
+        Bitmap art = currentArtworkBitmap != null ? currentArtworkBitmap : placeholderArtwork();
+        if (art != null) {
+            metadata.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, art);
         }
         mediaSession.setMetadata(metadata.build());
     }

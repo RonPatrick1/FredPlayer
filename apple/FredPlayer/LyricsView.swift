@@ -1,5 +1,9 @@
 import SwiftUI
 
+#if os(iOS)
+import UIKit
+#endif
+
 struct LyricsView: View {
     @EnvironmentObject private var player: PlayerController
     @Environment(\.dismiss) private var dismiss
@@ -38,6 +42,10 @@ struct LyricsView: View {
                 }
                 .padding(.top, 4)
 
+                if showsPhoneTransportControls {
+                    phoneTransportControls
+                }
+
                 lyricsBody
             }
         } else {
@@ -47,6 +55,46 @@ struct LyricsView: View {
                 description: Text("Play a track to see its lyrics.")
             )
         }
+    }
+
+    private var showsPhoneTransportControls: Bool {
+        #if os(iOS)
+        UIDevice.current.userInterfaceIdiom == .phone
+        #else
+        false
+        #endif
+    }
+
+    private var phoneTransportControls: some View {
+        HStack(spacing: 32) {
+            Button {
+                player.previous()
+            } label: {
+                Image(systemName: "backward.fill")
+                    .frame(width: 44, height: 44)
+            }
+            .accessibilityLabel("Previous")
+
+            Button {
+                player.togglePlayback()
+            } label: {
+                Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
+                    .font(.title2)
+                    .frame(width: 56, height: 56)
+            }
+            .buttonStyle(.borderedProminent)
+            .clipShape(Circle())
+            .accessibilityLabel(player.isPlaying ? "Pause" : "Play")
+
+            Button {
+                player.next()
+            } label: {
+                Image(systemName: "forward.fill")
+                    .frame(width: 44, height: 44)
+            }
+            .accessibilityLabel("Next")
+        }
+        .buttonStyle(.bordered)
     }
 
     @ViewBuilder
@@ -66,7 +114,7 @@ struct LyricsView: View {
         } else {
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 26) {
+                    LazyVStack(alignment: .center, spacing: 26) {
                         ForEach(Array(phrases.enumerated()), id: \.offset) { index, phrase in
                             phraseView(phrase, index: index)
                                 .id(index)
@@ -74,11 +122,11 @@ struct LyricsView: View {
                     }
                     .padding(.horizontal, 24)
                     .padding(.vertical, 160)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .center)
                 }
                 .onChange(of: activeIndex) { _, newValue in
                     guard let newValue else { return }
-                    withAnimation(.easeInOut(duration: 0.35)) {
+                    withAnimation(.spring(response: 0.48, dampingFraction: 0.82)) {
                         proxy.scrollTo(newValue, anchor: UnitPoint(x: 0.5, y: 0.35))
                     }
                 }
@@ -88,8 +136,12 @@ struct LyricsView: View {
 
     @ViewBuilder
     private func phraseView(_ phrase: LyricsPhrase, index: Int) -> some View {
+        let current = activeIndex ?? -1
+        let distance = current < 0 ? 1 : index - current
         let isActive = index == activeIndex
-        let isPast = (activeIndex ?? -1) > index
+        let isPast = distance < 0
+        let isAdjacent = abs(distance) == 1
+
         Group {
             if isActive {
                 activeWords(phrase)
@@ -98,9 +150,30 @@ struct LyricsView: View {
             }
         }
         .font(isActive ? .title2.bold() : .title3)
-        .foregroundStyle(isActive ? Color.primary : Color.secondary.opacity(isPast ? 0.45 : 0.75))
-        .scaleEffect(isActive ? 1 : 0.97, anchor: .leading)
-        .animation(.easeInOut(duration: 0.25), value: isActive)
+        .foregroundStyle(
+            isActive
+                ? Color.primary
+                : Color.secondary.opacity(isPast ? 0.42 : 0.68)
+        )
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .fixedSize(horizontal: false, vertical: true)
+        .scaleEffect(
+            isActive ? 1.16 : (isAdjacent ? 0.90 : 0.82),
+            anchor: .center
+        )
+        .rotation3DEffect(
+            .degrees(isActive ? 0 : (isPast ? -24 : 24)),
+            axis: (x: 1, y: 0, z: 0),
+            anchor: isPast ? .bottom : .top,
+            perspective: 0.72
+        )
+        .offset(y: isActive ? 0 : (isPast ? -8 : 8))
+        .zIndex(isActive ? 2 : 0)
+        .animation(
+            .spring(response: 0.46, dampingFraction: 0.80),
+            value: activeIndex
+        )
     }
 
     // Builds one Text by concatenating per-word segments, each with its own

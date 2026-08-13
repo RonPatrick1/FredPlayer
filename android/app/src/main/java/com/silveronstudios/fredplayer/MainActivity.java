@@ -4,31 +4,50 @@ import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.Dialog;
 import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.content.res.Configuration;
 import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
+import android.graphics.Outline;
+import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.DocumentsContract;
 import android.text.Editable;
 import android.text.InputType;
+import android.text.Spannable;
+import android.text.SpannableStringBuilder;
+import android.text.TextUtils;
 import android.text.TextWatcher;
+import android.text.style.ForegroundColorSpan;
 import android.view.DisplayCutout;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewOutlineProvider;
+import android.view.Window;
 import android.view.WindowInsets;
 import android.widget.Button;
 import android.widget.ArrayAdapter;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.ImageButton;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.ScrollView;
@@ -37,6 +56,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
@@ -46,6 +66,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
@@ -81,17 +102,70 @@ public class MainActivity extends Activity {
         }
     }
 
+    private static final String STATE_SHOWING_PHONE_LYRICS = "showingPhoneLyrics";
+
     private final ArrayList<String> playlist = new ArrayList<>();
     private final LinkedHashMap<String, ArrayList<String>> playlists = new LinkedHashMap<>();
     private String activePlaylistName = PlaylistStore.DEFAULT_PLAYLIST_NAME;
     private boolean receiverRegistered;
     private boolean playing;
+    private boolean shuffleEnabled = true;
+    private String currentTrackUri = "";
+    private String currentTrackName = "";
+    private String currentTrackArtist = "";
+    private String currentTrackAlbum = "";
+    private int repeatMode = SleepMusicService.REPEAT_ALL;
+    private int currentIndex = -1;
+    private int[] shuffleBag = new int[0];
+    private int[] playHistory = new int[0];
+    private int historyIndex = -1;
     private boolean showingSettings;
+    private boolean showingLyrics;
+    private boolean showingWhatsNext;
+    private boolean showingPlaylistEditor;
+    private boolean showingPlaylistMenu;
+    private boolean showingSharedPlaylists;
+    private LinearLayout lyricsPhrasesContainer;
+    private ScrollView lyricsScrollView;
+    private TextView lyricsStatusText;
+    private TextView lyricsSubtitleView;
+    private ImageButton lyricsPlayButton;
+    private List<LyricsPhrase> lyricsPhrases = new ArrayList<>();
+    private List<TextView> lyricsPhraseViews = new ArrayList<>();
+    private int lyricsActivePhraseIndex = -1;
+    private LinearLayout whatsNextListContainer;
+    private EditText whatsNextSearch;
+    private ScrollView whatsNextScroll;
+    // Only materializes this many "Up Next" rows as real views at a time —
+    // building one per remaining track (thousands, for a large playlist)
+    // is what made this screen slow to open/refresh. Scrolling near the
+    // bottom grows the limit and re-renders, so the extra work only
+    // happens once the user actually asks to see further ahead.
+    private int whatsNextUpcomingLimit = 50;
+    private int whatsNextUpcomingTotal = 0;
+    private String lyricsLoadedForTrackUri = "";
+    private long lyricsLastKnownPositionMs;
+    private long lyricsLastKnownElapsedRealtime;
+    private boolean lyricsLastKnownPlaying;
+    private final Handler lyricsTickHandler = new Handler(Looper.getMainLooper());
+    private final Runnable lyricsTick = this::updateLyricsHighlightTick;
     private boolean userSeeking;
     private boolean metadataRefreshStarted;
 
+    private static final int ARTWORK_MEMORY_CACHE_MAX = 24;
+    private final Map<String, Bitmap> artworkMemoryCache = new LinkedHashMap<String, Bitmap>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Bitmap> eldest) {
+            return size() > ARTWORK_MEMORY_CACHE_MAX;
+        }
+    };
+    private String artworkRequestKey = "";
+
+    private ImageView artImageView;
+    private View artScrim;
     private TextView nowPlayingText;
     private TextView playlistText;
+    private TextView settingsPlaylistLabel;
     private TextView elapsedTimeText;
     private TextView durationTimeText;
     private TextView stateText;
@@ -99,12 +173,11 @@ public class MainActivity extends Activity {
     private TextView levelingText;
     private TextView cacheText;
     private ImageButton playButton;
+    private ImageButton shuffleButton;
+    private ImageButton repeatButton;
     private SeekBar outputSlider;
     private SeekBar levelingSlider;
     private SeekBar trackSeekBar;
-    private TextView playlistEditorTitle;
-    private LinearLayout playlistFoldersContainer;
-    private LinearLayout playlistFilesContainer;
     private VisualizerView visualizerView;
     private TextView bluetoothRouteText;
     private TextView bluetoothDelayText;
@@ -138,6 +211,20 @@ public class MainActivity extends Activity {
             String track = intent.getStringExtra(SleepMusicService.EXTRA_TRACK_NAME);
             String artist = intent.getStringExtra(SleepMusicService.EXTRA_TRACK_ARTIST);
             String album = intent.getStringExtra(SleepMusicService.EXTRA_TRACK_ALBUM);
+            String trackUri = intent.getStringExtra(SleepMusicService.EXTRA_TRACK_URI);
+            currentTrackName = track == null ? "" : track;
+            currentTrackArtist = artist == null ? "" : artist;
+            currentTrackAlbum = album == null ? "" : album;
+            currentTrackUri = trackUri == null ? "" : trackUri;
+            lyricsLastKnownPositionMs = intent.getLongExtra(SleepMusicService.EXTRA_POSITION_MS, 0L);
+            lyricsLastKnownElapsedRealtime = SystemClock.elapsedRealtime();
+            lyricsLastKnownPlaying = playing;
+            if (showingLyrics) {
+                updateLyricsSubtitle();
+                if (!currentTrackUri.equals(lyricsLoadedForTrackUri)) {
+                    loadLyricsForCurrentTrack();
+                }
+            }
             String message = intent.getStringExtra(SleepMusicService.EXTRA_MESSAGE);
             int count = intent.getIntExtra(SleepMusicService.EXTRA_PLAYLIST_COUNT, playlist.size());
             int cacheCount = intent.getIntExtra(SleepMusicService.EXTRA_CACHE_COUNT, -1);
@@ -169,11 +256,28 @@ public class MainActivity extends Activity {
             outputDelayCalibrating = intent.getBooleanExtra(
                     SleepMusicService.EXTRA_OUTPUT_DELAY_CALIBRATING,
                     false);
+            shuffleEnabled = intent.getBooleanExtra(SleepMusicService.EXTRA_SHUFFLE_ENABLED, shuffleEnabled);
+            repeatMode = intent.getIntExtra(SleepMusicService.EXTRA_REPEAT_MODE, repeatMode);
+            currentIndex = intent.getIntExtra(SleepMusicService.EXTRA_CURRENT_INDEX, currentIndex);
+            int[] receivedShuffleBag = intent.getIntArrayExtra(SleepMusicService.EXTRA_SHUFFLE_BAG);
+            if (receivedShuffleBag != null) {
+                shuffleBag = receivedShuffleBag;
+            }
+            int[] receivedPlayHistory = intent.getIntArrayExtra(SleepMusicService.EXTRA_PLAY_HISTORY);
+            if (receivedPlayHistory != null) {
+                playHistory = receivedPlayHistory;
+            }
+            historyIndex = intent.getIntExtra(SleepMusicService.EXTRA_HISTORY_INDEX, historyIndex);
+            if (showingWhatsNext) {
+                refreshWhatsNextList(true);
+            }
 
             updatePlayButtonIcon();
+            updateShuffleRepeatButtons();
             if (nowPlayingText != null) {
                 nowPlayingText.setText(formatTrackText(track, artist, album));
             }
+            updateArtwork(trackUri, artist, album);
             if (stateText != null) {
                 stateText.setText(message == null || message.isEmpty() ? (playing ? "Playing" : "Paused") : message);
             }
@@ -209,13 +313,30 @@ public class MainActivity extends Activity {
         }
         levelingSettings = PlaylistStore.loadLevelingSettings(this);
         visualizationSettings = PlaylistStore.loadVisualizationSettings(this);
-        setContentView(buildContentView());
-        updatePlaylistText();
+        showingLyrics = savedInstanceState != null
+                && savedInstanceState.getBoolean(STATE_SHOWING_PHONE_LYRICS, false)
+                && !isTabletConfiguration();
+        setContentView(showingLyrics ? buildLyricsView() : buildContentView());
+        if (!showingLyrics) {
+            updatePlaylistText();
+        }
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        outState.putBoolean(
+                STATE_SHOWING_PHONE_LYRICS,
+                showingLyrics && !isTabletConfiguration());
+        super.onSaveInstanceState(outState);
     }
 
     @Override
     public void onBackPressed() {
-        if (showingSettings) {
+        if (showingPlaylistEditor || showingPlaylistMenu || showingSharedPlaylists) {
+            showSettingsScreen();
+            return;
+        }
+        if (showingSettings || showingLyrics || showingWhatsNext) {
             showPlayerScreen();
             return;
         }
@@ -240,6 +361,11 @@ public class MainActivity extends Activity {
             sendVisualizationSettingsToService();
         }
         refreshRemoteMetadataIfNeeded();
+        if (showingLyrics) {
+            sendServiceCommand(SleepMusicService.ACTION_REQUEST_STATE);
+            lyricsTickHandler.removeCallbacks(lyricsTick);
+            lyricsTickHandler.post(lyricsTick);
+        }
     }
 
     @Override
@@ -248,6 +374,7 @@ public class MainActivity extends Activity {
             unregisterReceiver(stateReceiver);
             receiverRegistered = false;
         }
+        lyricsTickHandler.removeCallbacks(lyricsTick);
         super.onStop();
     }
 
@@ -342,6 +469,15 @@ public class MainActivity extends Activity {
     }
 
     private void openServerLibraryDialog() {
+        String savedUrl = PlaylistStore.loadServerBaseUrl(this);
+        if (!savedUrl.isEmpty()) {
+            fetchServerLibrary(savedUrl, PlaylistStore.loadServerToken(this));
+            return;
+        }
+        openServerConnectionDialog();
+    }
+
+    private void openServerConnectionDialog() {
         LinearLayout container = new LinearLayout(this);
         container.setOrientation(LinearLayout.VERTICAL);
         int horizontal = dp(20);
@@ -367,7 +503,7 @@ public class MainActivity extends Activity {
         container.addView(tokenInput, topMargin(10));
 
         new AlertDialog.Builder(this)
-                .setTitle("Add from server")
+                .setTitle("Server connection")
                 .setView(container)
                 .setPositiveButton("Fetch", (dialog, which) -> {
                     String url = urlInput.getText().toString().trim();
@@ -391,7 +527,6 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     PlaylistStore.saveServerBaseUrl(this, url);
                     PlaylistStore.saveServerToken(this, token);
-                    updatePlaylistEditor();
                     if (tracks.length() == 0) {
                         Toast.makeText(this, "Server library is empty", Toast.LENGTH_SHORT).show();
                         return;
@@ -410,22 +545,37 @@ public class MainActivity extends Activity {
         ArrayList<ServerBrowserEntry> entries = new ArrayList<>();
         String[] currentFolder = {""};
 
-        LinearLayout container = new LinearLayout(this);
-        container.setOrientation(LinearLayout.VERTICAL);
-        container.setPadding(dp(16), dp(4), dp(16), 0);
+        // A plain AlertDialog puts its action buttons in a bar below the
+        // custom view, and when that view (a whole server library browser)
+        // is taller than the available space, the button bar can end up
+        // scrolled off-screen along with the list instead of staying put.
+        // Using a plain Dialog with the button row as a fixed, non-scrolling
+        // sibling of a weighted ListView guarantees "Add selected"/"Add all
+        // music"/"Cancel" are always visible without scrolling past tracks.
+        Dialog dialog = new Dialog(this);
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout container = settingsCard();
+        container.setPadding(dp(16), dp(16), dp(16), dp(14));
+
+        TextView dialogTitle = text("Add from server", 20, Color.rgb(245, 243, 237));
+        container.addView(dialogTitle, matchWrap());
 
         LinearLayout folderRow = new LinearLayout(this);
         folderRow.setOrientation(LinearLayout.HORIZONTAL);
         folderRow.setGravity(Gravity.CENTER_VERTICAL);
-        Button upButton = button("Up");
-        folderRow.addView(upButton, inlineButton());
+        ImageButton dialogBackButton = transportButton(R.drawable.ic_back_arrow, "Close");
+        dialogBackButton.setOnClickListener(view -> dialog.dismiss());
+        folderRow.addView(dialogBackButton, headerIconButtonParams());
+        ImageButton upButton = transportButton(R.drawable.ic_folder_up, "Up a folder");
+        folderRow.addView(upButton, headerIconButtonParams());
         TextView folderLabel = text("All music", 16, Color.rgb(245, 243, 237));
         folderLabel.setSingleLine(true);
         folderRow.addView(folderLabel, new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         TextView selectionLabel = text("0 selected", 13, Color.rgb(183, 182, 173));
         folderRow.addView(selectionLabel);
-        container.addView(folderRow);
+        container.addView(folderRow, topMargin(14));
 
         EditText search = new EditText(this);
         search.setSingleLine(true);
@@ -433,10 +583,8 @@ public class MainActivity extends Activity {
         container.addView(search, topMargin(6));
 
         ListView list = new ListView(this);
-        int listHeight = Math.min(dp(520),
-                Math.max(dp(260), (int) (getResources().getDisplayMetrics().heightPixels * 0.56f)));
         container.addView(list, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, listHeight));
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         ArrayAdapter<ServerBrowserEntry> adapter = new ArrayAdapter<ServerBrowserEntry>(
                 this, android.R.layout.simple_list_item_2, android.R.id.text1, entries) {
@@ -475,31 +623,41 @@ public class MainActivity extends Activity {
         };
         list.setAdapter(adapter);
 
-        AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("Add from server")
-                .setView(container)
-                .setPositiveButton("Add selected tracks", null)
-                .setNeutralButton("Add all music", null)
-                .setNegativeButton("Cancel", null)
-                .create();
+        // Side by side (each taking half the row) instead of stacked, so
+        // the button area takes less vertical space and leaves more room
+        // for the file/folder list above. Wrap-content text inside a weighted
+        // half-width slot will wrap to a second line rather than clip if a
+        // folder name/count makes the label long.
+        LinearLayout buttonRow = new LinearLayout(this);
+        buttonRow.setOrientation(LinearLayout.HORIZONTAL);
+        buttonRow.setGravity(Gravity.CENTER_VERTICAL);
+        container.addView(buttonRow, topMargin(14));
+
+        Button addSelectedButton = settingsButton("Add selected tracks", SETTINGS_STYLE_PRIMARY);
+        LinearLayout.LayoutParams addSelectedParams =
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        addSelectedParams.rightMargin = dp(8);
+        buttonRow.addView(addSelectedButton, addSelectedParams);
+
+        Button addFolderButton = settingsButton("Add all music", SETTINGS_STYLE_SECONDARY);
+        buttonRow.addView(addFolderButton,
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        dialog.setContentView(container);
 
         Runnable updateActions = () -> {
             selectionLabel.setText(selectedTracks.size() + " selected");
-            Button addSelected = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
-            Button addFolder = dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
-            if (addSelected != null) {
-                addSelected.setText(selectedTracks.isEmpty()
-                        ? "Add selected tracks"
-                        : "Add selected (" + selectedTracks.size() + ")");
-                addSelected.setEnabled(!selectedTracks.isEmpty());
-            }
-            if (addFolder != null) {
-                int count = countServerTracksInFolder(tracks, currentFolder[0]);
-                addFolder.setText(currentFolder[0].isEmpty()
-                        ? "Add all music (" + count + ")"
-                        : "Add folder (" + count + ")");
-                addFolder.setEnabled(count > 0);
-            }
+            addSelectedButton.setText(selectedTracks.isEmpty()
+                    ? "Add selected tracks"
+                    : "Add selected (" + selectedTracks.size() + ")");
+            addSelectedButton.setEnabled(!selectedTracks.isEmpty());
+            addSelectedButton.setAlpha(selectedTracks.isEmpty() ? 0.5f : 1f);
+            int count = countServerTracksInFolder(tracks, currentFolder[0]);
+            addFolderButton.setText(currentFolder[0].isEmpty()
+                    ? "Add all music (" + count + ")"
+                    : "Add folder (" + count + ")");
+            addFolderButton.setEnabled(count > 0);
+            addFolderButton.setAlpha(count > 0 ? 1f : 0.5f);
         };
 
         Runnable refreshBrowser = () -> {
@@ -570,26 +728,34 @@ public class MainActivity extends Activity {
             }
             @Override public void afterTextChanged(Editable s) {}
         });
-        dialog.setOnShowListener(ignored -> {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
-                addServerTrackIndices(tracks, baseUrl, new ArrayList<>(selectedTracks));
-                dialog.dismiss();
-            });
-            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
-                ArrayList<Integer> folderTracks = new ArrayList<>();
-                for (int i = 0; i < tracks.length(); i++) {
-                    JSONObject track = tracks.optJSONObject(i);
-                    String path = track == null ? "" : track.optString("path", "");
-                    if (serverTrackIsInFolder(path, currentFolder[0])) {
-                        folderTracks.add(i);
-                    }
-                }
-                addServerTrackIndices(tracks, baseUrl, folderTracks);
-                dialog.dismiss();
-            });
-            refreshBrowser.run();
+        addSelectedButton.setOnClickListener(view -> {
+            addServerTrackIndices(tracks, baseUrl, new ArrayList<>(selectedTracks));
+            dialog.dismiss();
         });
+        addFolderButton.setOnClickListener(view -> {
+            ArrayList<Integer> folderTracks = new ArrayList<>();
+            for (int i = 0; i < tracks.length(); i++) {
+                JSONObject track = tracks.optJSONObject(i);
+                String path = track == null ? "" : track.optString("path", "");
+                if (serverTrackIsInFolder(path, currentFolder[0])) {
+                    folderTracks.add(i);
+                }
+            }
+            addServerTrackIndices(tracks, baseUrl, folderTracks);
+            dialog.dismiss();
+        });
+        refreshBrowser.run();
+
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        }
         dialog.show();
+        if (window != null) {
+            int width = (int) (getResources().getDisplayMetrics().widthPixels * 0.94f);
+            int height = (int) (getResources().getDisplayMetrics().heightPixels * 0.85f);
+            window.setLayout(width, height);
+        }
     }
 
     private String serverTrackFolder(String path) {
@@ -690,7 +856,6 @@ public class MainActivity extends Activity {
 
     private void reportServerAdd(LinkedHashSet<String> merged, int added) {
         if (added == 0) {
-            updatePlaylistEditor();
             Toast.makeText(this, "No new songs were added", Toast.LENGTH_SHORT).show();
             return;
         }
@@ -734,7 +899,7 @@ public class MainActivity extends Activity {
                 JSONArray summaries = RemoteLibraryClient.fetchPlaylists(baseUrl, token);
                 JSONArray library = RemoteLibraryClient.fetchLibrary(baseUrl, token);
                 PlaylistStore.saveTrackMetadata(this, serverMetadata(library, baseUrl));
-                runOnUiThread(() -> showSharedPlaylists(summaries, library, baseUrl, token));
+                runOnUiThread(() -> showSharedPlaylistsScreen(summaries, library, baseUrl, token));
             } catch (Exception e) {
                 runOnUiThread(() -> Toast.makeText(
                         this,
@@ -744,41 +909,74 @@ public class MainActivity extends Activity {
         }, "FredPlayerSharedPlaylists").start();
     }
 
-    private void showSharedPlaylists(
+    private View buildSharedPlaylistsView(
             JSONArray summaries,
             JSONArray library,
             String baseUrl,
             String token) {
-        String[] labels = new String[summaries.length()];
+        ArrayList<String> labels = new ArrayList<>();
         for (int i = 0; i < summaries.length(); i++) {
             JSONObject summary = summaries.optJSONObject(i);
             String name = summary == null ? "" : summary.optString("name", "");
             int count = summary == null ? 0 : summary.optInt("count", 0);
-            labels[i] = name + "  •  " + count + (count == 1 ? " song" : " songs");
+            labels.add(name + "  •  " + count + (count == 1 ? " song" : " songs"));
         }
 
-        AlertDialog.Builder builder = new AlertDialog.Builder(this)
-                .setTitle("Shared playlists")
-                .setPositiveButton("Share current", (dialog, which) ->
-                        confirmShareCurrentPlaylist(summaries, baseUrl, token))
-                .setNegativeButton("Close", null);
-        if (labels.length == 0) {
-            builder.setMessage("No playlists have been shared yet. Share the current playlist to publish a server copy.");
-        } else {
-            builder.setItems(labels, (dialog, which) -> {
-                JSONObject summary = summaries.optJSONObject(which);
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.rgb(17, 19, 21));
+        applySystemBarInsets(root, dp(20), dp(24), dp(20), dp(24));
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        root.addView(header, matchWrap());
+
+        ImageButton backButton = transportButton(R.drawable.ic_back_arrow, "Back");
+        backButton.setOnClickListener(view -> showSettingsScreen());
+        header.addView(backButton, headerIconButtonParams());
+
+        TextView title = text("Shared playlists", 26, Color.rgb(245, 243, 237));
+        title.setGravity(Gravity.END);
+        header.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        boolean hasShared = !labels.isEmpty();
+        if (hasShared) {
+            ListView list = new ListView(this);
+            LinearLayout.LayoutParams listParams =
+                    new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+            listParams.topMargin = dp(14);
+            root.addView(list, listParams);
+            ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                    this, android.R.layout.simple_list_item_1, android.R.id.text1, labels);
+            list.setAdapter(adapter);
+            list.setOnItemClickListener((parent, view, position, id) -> {
+                JSONObject summary = summaries.optJSONObject(position);
+                showSettingsScreen();
                 if (summary != null) {
                     downloadSharedPlaylist(summary.optString("name", ""), library, baseUrl, token);
                 }
             });
+        } else {
+            TextView emptyText = text(
+                    "No playlists have been shared yet. Share \"" + activePlaylistName
+                            + "\" to publish a server copy.",
+                    14, Color.rgb(183, 182, 173));
+            root.addView(emptyText, topMargin(16));
         }
-        builder.show();
+
+        Button shareButton = settingsButton("Share \"" + activePlaylistName + "\"", SETTINGS_STYLE_PRIMARY);
+        shareButton.setOnClickListener(view -> confirmShareCurrentPlaylist(summaries, baseUrl, token));
+        root.addView(shareButton, actionButtonParams(16));
+
+        return root;
     }
 
     private void confirmShareCurrentPlaylist(JSONArray summaries, String baseUrl, String token) {
         persistActivePlaylist();
         if (playlist.isEmpty()) {
-            Toast.makeText(this, "Add songs before sharing this playlist", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Add songs to \"" + activePlaylistName + "\" before sharing",
+                    Toast.LENGTH_LONG).show();
             return;
         }
 
@@ -787,7 +985,7 @@ public class MainActivity extends Activity {
             String path = RemoteLibraryClient.serverPath(baseUrl, item);
             if (path == null) {
                 new AlertDialog.Builder(this)
-                        .setTitle("Can’t share this playlist")
+                        .setTitle("Can’t share \"" + activePlaylistName + "\"")
                         .setMessage("Every song must come from this Fred Server. Local files and songs from another server cannot be played by the other devices.")
                         .setPositiveButton("OK", null)
                         .show();
@@ -898,7 +1096,6 @@ public class MainActivity extends Activity {
         playlists.put(localName, new ArrayList<>(urls));
         PlaylistStore.savePlaylists(this, playlists);
         switchPlaylist(localName);
-        updatePlaylistEditor();
         new AlertDialog.Builder(this)
                 .setTitle("Playlist downloaded")
                 .setMessage("Saved \"" + localName + "\" on this device. You can change or delete it without changing the shared server copy.")
@@ -934,7 +1131,6 @@ public class MainActivity extends Activity {
             try {
                 JSONArray tracks = RemoteLibraryClient.fetchLibrary(baseUrl, token);
                 PlaylistStore.saveTrackMetadata(this, serverMetadata(tracks, baseUrl));
-                runOnUiThread(this::updatePlaylistEditor);
             } catch (Exception ignored) {
                 // Playback metadata still falls back to the filename when the server is unavailable.
             }
@@ -1090,47 +1286,60 @@ public class MainActivity extends Activity {
     }
 
     private View buildContentView() {
-        ScrollView scrollView = new ScrollView(this);
-        scrollView.setFillViewport(true);
-        scrollView.setBackgroundColor(Color.rgb(17, 19, 21));
-        applySystemBarInsets(scrollView);
-
+        // Deliberately not a ScrollView — every element on this page is
+        // sized (including the compact/landscape trims above) to always
+        // fit the viewport, so this page never scrolls, in either
+        // orientation. A ScrollView here would just be a way for a future
+        // layout tweak to silently reintroduce spillover.
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setGravity(Gravity.CENTER_HORIZONTAL);
-        root.setPadding(dp(20), dp(28), dp(20), dp(28));
-        scrollView.addView(root, new ScrollView.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
+        root.setBackgroundColor(Color.rgb(17, 19, 21));
+        applySystemBarInsets(root, dp(20), dp(28), dp(20), dp(28));
+
+        boolean compactHeader = isCompactLandscapePhone();
 
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
-        root.addView(header, matchWrap());
+        if (!compactHeader) {
+            root.addView(header, matchWrap());
+        }
+        // In compact landscape, buildNowPlayingSection places header itself
+        // — floated over the art instead of in normal flow above it, so
+        // the art fills that vertical space too instead of losing it.
 
-        TextView title = text("FredPlayer", 32, Color.rgb(245, 243, 237));
-        header.addView(title, new LinearLayout.LayoutParams(
-                0,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                1f));
+        TextView title = text("FredPlayer", compactHeader ? 20 : 32, Color.rgb(245, 243, 237));
+        if (compactHeader) {
+            // Slid over next to Settings instead of anchored on the left.
+            View headerSpacer = new View(this);
+            header.addView(headerSpacer, new LinearLayout.LayoutParams(0, 0, 1f));
+            LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            titleParams.rightMargin = dp(14);
+            header.addView(title, titleParams);
+        } else {
+            header.addView(title, new LinearLayout.LayoutParams(
+                    0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    1f));
+        }
 
-        Button settingsButton = button("Settings");
-        settingsButton.setContentDescription("Open settings");
+        ImageButton lyricsButton = transportButton(R.drawable.ic_lyrics, "Lyrics");
+        lyricsButton.setOnClickListener(view -> showLyricsScreen());
+        header.addView(lyricsButton, headerIconButtonParams());
+
+        ImageButton whatsNextButton = transportButton(R.drawable.ic_whats_next, "What's Next");
+        whatsNextButton.setOnClickListener(view -> showWhatsNextScreen());
+        header.addView(whatsNextButton, headerIconButtonParams());
+
+        ImageButton settingsButton = transportButton(R.drawable.ic_settings_gear, "Settings");
         settingsButton.setOnClickListener(view -> showSettingsScreen());
-        header.addView(settingsButton, inlineButton());
+        header.addView(settingsButton, headerIconButtonParams());
 
         stateText = text("Paused", 17, Color.rgb(183, 182, 173));
         stateText.setGravity(Gravity.CENTER);
-        root.addView(stateText, topMargin(8));
-
-        nowPlayingText = text("No song selected", 20, Color.rgb(245, 243, 237));
-        nowPlayingText.setGravity(Gravity.CENTER);
-        nowPlayingText.setSingleLine(false);
-        root.addView(nowPlayingText, topMargin(28));
-
-        playlistText = text("", 15, Color.rgb(183, 182, 173));
-        playlistText.setGravity(Gravity.CENTER);
-        root.addView(playlistText, topMargin(8));
 
         trackSeekBar = new SeekBar(this);
         trackSeekBar.setMax(1);
@@ -1157,7 +1366,6 @@ public class MainActivity extends Activity {
                 sendSeekCommand(positionMs);
             }
         });
-        root.addView(trackSeekBar, topMargin(14));
 
         LinearLayout timeRow = new LinearLayout(this);
         timeRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -1172,22 +1380,30 @@ public class MainActivity extends Activity {
                 0,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 1f));
-        root.addView(timeRow, matchWrap());
+
+        boolean compactLandscape = isCompactLandscapePhone();
+        boolean isTablet = isTabletConfiguration();
+        // Tablets have room to spare (168dp). A landscape phone puts the
+        // visualizer beside the art/track-info column instead of stacking
+        // it below (see buildNowPlayingSection), so it just fills whatever
+        // height that row ends up with. A portrait phone only needs a
+        // modest trim — just enough to cover the full-width square art
+        // above without pushing the transport buttons off screen.
+        int visualizerMinDp = isTablet ? 168 : (compactLandscape ? 72 : 130);
 
         visualizerView = new VisualizerView(this);
         visualizerView.setSmoothing(visualizationSettings.smoothing);
-        visualizerView.setMinimumHeight(dp(168));
-        LinearLayout.LayoutParams visualizerParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                0,
-                1f);
-        visualizerParams.topMargin = dp(18);
-        root.addView(visualizerView, visualizerParams);
+        visualizerView.setMinimumHeight(dp(visualizerMinDp));
 
         LinearLayout mainButtons = new LinearLayout(this);
         mainButtons.setOrientation(LinearLayout.HORIZONTAL);
         mainButtons.setGravity(Gravity.CENTER);
-        root.addView(mainButtons, topMargin(28));
+
+        computeTransportButtonSizes();
+
+        shuffleButton = transportButton(R.drawable.ic_shuffle, "Shuffle");
+        shuffleButton.setOnClickListener(view -> sendServiceCommand(SleepMusicService.ACTION_TOGGLE_SHUFFLE));
+        mainButtons.addView(shuffleButton, transportButtonParams(false));
 
         ImageButton previousButton = transportButton(android.R.drawable.ic_media_previous, "Previous");
         previousButton.setOnClickListener(view -> sendServiceCommand(SleepMusicService.ACTION_PREVIOUS));
@@ -1215,20 +1431,888 @@ public class MainActivity extends Activity {
         stopButton.setOnClickListener(view -> sendServiceCommand(SleepMusicService.ACTION_STOP));
         mainButtons.addView(stopButton, transportButtonParams(false));
 
-        return scrollView;
+        repeatButton = transportButton(R.drawable.ic_repeat, "Repeat");
+        repeatButton.setOnClickListener(view -> sendServiceCommand(SleepMusicService.ACTION_CYCLE_REPEAT));
+        mainButtons.addView(repeatButton, transportButtonParams(false));
+
+        ImageButton removeButton = transportButton(android.R.drawable.ic_menu_delete, "Remove from playlist");
+        removeButton.setOnClickListener(view -> confirmRemoveCurrentTrack());
+        mainButtons.addView(removeButton, transportButtonParams(false));
+
+        updateShuffleRepeatButtons();
+
+        if (!compactLandscape) {
+            root.addView(mainButtons, topMargin(28));
+        }
+        // In compact landscape, buildNowPlayingSection places mainButtons
+        // itself — floated over the art/visualizer block's bottom edge
+        // instead of in its own row below it, same idea as the header.
+
+        // buildNowPlayingSection owns placement of timeRow, visualizerView,
+        // header, and mainButtons (not just the art/title/seek bar)
+        // because the landscape-phone layout floats the header and
+        // transport buttons over one shared art+visualizer block instead
+        // of stacking everything in separate rows, which the tablet and
+        // portrait-phone layouts don't need.
+        buildNowPlayingSection(root, header, mainButtons, stateText, trackSeekBar, timeRow, visualizerView);
+
+        return root;
     }
 
     private void showPlayerScreen() {
+        lyricsTickHandler.removeCallbacks(lyricsTick);
         showingSettings = false;
+        showingLyrics = false;
+        showingPlaylistEditor = false;
+        showingPlaylistMenu = false;
+        showingSharedPlaylists = false;
+        showingWhatsNext = false;
+        lyricsSubtitleView = null;
+        lyricsPlayButton = null;
+        whatsNextListContainer = null;
+        whatsNextSearch = null;
+        whatsNextScroll = null;
         setContentView(buildContentView());
         updatePlaylistText();
         sendServiceCommand(SleepMusicService.ACTION_REQUEST_STATE);
     }
 
     private void showSettingsScreen() {
+        lyricsTickHandler.removeCallbacks(lyricsTick);
         showingSettings = true;
+        showingLyrics = false;
+        showingPlaylistEditor = false;
+        showingPlaylistMenu = false;
+        showingSharedPlaylists = false;
+        showingWhatsNext = false;
+        lyricsSubtitleView = null;
+        lyricsPlayButton = null;
+        whatsNextListContainer = null;
+        whatsNextSearch = null;
+        whatsNextScroll = null;
         setContentView(buildSettingsView());
         sendServiceCommand(SleepMusicService.ACTION_REQUEST_STATE);
+    }
+
+    private void showPlaylistEditorScreen() {
+        lyricsTickHandler.removeCallbacks(lyricsTick);
+        showingSettings = false;
+        showingLyrics = false;
+        showingPlaylistEditor = true;
+        showingPlaylistMenu = false;
+        showingSharedPlaylists = false;
+        showingWhatsNext = false;
+        whatsNextListContainer = null;
+        whatsNextSearch = null;
+        whatsNextScroll = null;
+        setContentView(buildPlaylistEditorView());
+    }
+
+    private void showPlaylistMenuScreen() {
+        lyricsTickHandler.removeCallbacks(lyricsTick);
+        showingSettings = false;
+        showingLyrics = false;
+        showingPlaylistEditor = false;
+        showingPlaylistMenu = true;
+        showingSharedPlaylists = false;
+        showingWhatsNext = false;
+        whatsNextListContainer = null;
+        whatsNextSearch = null;
+        whatsNextScroll = null;
+        setContentView(buildPlaylistMenuView());
+    }
+
+    private void showSharedPlaylistsScreen(
+            JSONArray summaries, JSONArray library, String baseUrl, String token) {
+        lyricsTickHandler.removeCallbacks(lyricsTick);
+        showingSettings = false;
+        showingLyrics = false;
+        showingPlaylistEditor = false;
+        showingPlaylistMenu = false;
+        showingSharedPlaylists = true;
+        showingWhatsNext = false;
+        whatsNextListContainer = null;
+        whatsNextSearch = null;
+        whatsNextScroll = null;
+        setContentView(buildSharedPlaylistsView(summaries, library, baseUrl, token));
+    }
+
+    private void showWhatsNextScreen() {
+        lyricsTickHandler.removeCallbacks(lyricsTick);
+        showingSettings = false;
+        showingLyrics = false;
+        showingPlaylistEditor = false;
+        showingPlaylistMenu = false;
+        showingSharedPlaylists = false;
+        showingWhatsNext = true;
+        lyricsSubtitleView = null;
+        lyricsPlayButton = null;
+        // On tablet the main player stays visible, shrunk to make room —
+        // same side-panel treatment and same right-panel slot as Lyrics,
+        // so swapping between the two just replaces what's in that slot
+        // instead of the whole player jumping sides.
+        setContentView(isTabletConfiguration() ? buildTabletWhatsNextSplitView() : buildWhatsNextView());
+        sendServiceCommand(SleepMusicService.ACTION_REQUEST_STATE);
+        refreshWhatsNextList(true);
+    }
+
+    private View buildPlaylistEditorView() {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.rgb(17, 19, 21));
+        applySystemBarInsets(root, dp(20), dp(24), dp(20), dp(24));
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        root.addView(header, matchWrap());
+
+        ImageButton backButton = transportButton(R.drawable.ic_back_arrow, "Back");
+        backButton.setOnClickListener(view -> showSettingsScreen());
+        header.addView(backButton, headerIconButtonParams());
+
+        LinearLayout titleColumn = new LinearLayout(this);
+        titleColumn.setOrientation(LinearLayout.VERTICAL);
+        titleColumn.setGravity(Gravity.END);
+        header.addView(titleColumn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView title = text("Edit Playlist", 26, Color.rgb(245, 243, 237));
+        title.setGravity(Gravity.END);
+        titleColumn.addView(title, matchWrap());
+
+        TextView subtitle = text(
+                activePlaylistName + " · " + playlist.size() + (playlist.size() == 1 ? " song" : " songs"),
+                14, Color.rgb(183, 182, 173));
+        subtitle.setGravity(Gravity.END);
+        titleColumn.addView(subtitle, matchWrap());
+
+        EditText search = new EditText(this);
+        search.setSingleLine(true);
+        search.setHint("Search this playlist");
+        root.addView(search, topMargin(14));
+
+        TextView emptyText = text("No songs match your search", 15, Color.rgb(183, 182, 173));
+        emptyText.setGravity(Gravity.CENTER);
+        emptyText.setVisibility(View.GONE);
+        root.addView(emptyText, topMargin(24));
+
+        ListView list = new ListView(this);
+        LinearLayout.LayoutParams listParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+        listParams.topMargin = dp(10);
+        root.addView(list, listParams);
+
+        Map<String, String[]> metadata = PlaylistStore.loadAllTrackMetadata(this);
+        List<String> fullOrder = new ArrayList<>(playlist);
+        List<String> filtered = new ArrayList<>(fullOrder);
+
+        ArrayAdapter<String> adapter = new ArrayAdapter<String>(
+                this, android.R.layout.simple_list_item_2, android.R.id.text1, filtered) {
+            @Override
+            public View getView(int position, View convertView, ViewGroup parent) {
+                View row = super.getView(position, convertView, parent);
+                TextView primary = row.findViewById(android.R.id.text1);
+                TextView secondary = row.findViewById(android.R.id.text2);
+                String uri = getItem(position);
+                String[] entry = uri == null ? null : metadata.get(uri);
+                String trackTitle = entry != null && entry.length > 0 && !entry[0].trim().isEmpty()
+                        ? entry[0].trim() : PlaylistStore.displayName(MainActivity.this, uri);
+                String artist = entry != null && entry.length > 1 ? entry[1].trim() : "";
+                String album = entry != null && entry.length > 2 ? entry[2].trim() : "";
+                String detail = artist.isEmpty() ? album : album.isEmpty() ? artist : artist + " — " + album;
+                primary.setText(trackTitle);
+                secondary.setText(detail);
+                return row;
+            }
+        };
+        list.setAdapter(adapter);
+
+        list.setOnItemClickListener((parent, view, position, id) -> {
+            String uri = adapter.getItem(position);
+            if (uri == null) {
+                return;
+            }
+            Intent intent = new Intent(this, SleepMusicService.class);
+            intent.setAction(SleepMusicService.ACTION_PLAY_URI);
+            intent.putExtra(SleepMusicService.EXTRA_TRACK_URI, uri);
+            startServiceCompat(intent);
+            showPlayerScreen();
+        });
+
+        list.setOnItemLongClickListener((parent, view, position, id) -> {
+            String uri = adapter.getItem(position);
+            if (uri == null) {
+                return true;
+            }
+            String label = PlaylistStore.displayName(this, uri);
+            new AlertDialog.Builder(this)
+                    .setTitle("Remove from playlist")
+                    .setMessage("Remove \"" + label + "\" from this playlist?")
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Remove", (dialog, which) -> {
+                        fullOrder.remove(uri);
+                        removePlaylistFile(uri);
+                        filtered.remove(uri);
+                        adapter.notifyDataSetChanged();
+                        subtitle.setText(activePlaylistName + " · " + playlist.size()
+                                + (playlist.size() == 1 ? " song" : " songs"));
+                        emptyText.setVisibility(filtered.isEmpty() ? View.VISIBLE : View.GONE);
+                    })
+                    .show();
+            return true;
+        });
+
+        search.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void afterTextChanged(Editable s) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                String query = s.toString().trim().toLowerCase(Locale.US);
+                filtered.clear();
+                for (String uri : fullOrder) {
+                    if (query.isEmpty()) {
+                        filtered.add(uri);
+                        continue;
+                    }
+                    String[] entry = metadata.get(uri);
+                    String haystack = PlaylistStore.displayName(MainActivity.this, uri).toLowerCase(Locale.US);
+                    if (entry != null) {
+                        for (String field : entry) {
+                            if (field != null) {
+                                haystack += " " + field.toLowerCase(Locale.US);
+                            }
+                        }
+                    }
+                    if (haystack.contains(query)) {
+                        filtered.add(uri);
+                    }
+                }
+                adapter.notifyDataSetChanged();
+                emptyText.setVisibility(filtered.isEmpty() ? View.VISIBLE : View.GONE);
+            }
+        });
+
+        return root;
+    }
+
+    private void showLyricsScreen() {
+        showingSettings = false;
+        showingLyrics = true;
+        showingPlaylistEditor = false;
+        showingWhatsNext = false;
+        whatsNextListContainer = null;
+        whatsNextSearch = null;
+        whatsNextScroll = null;
+        // On tablet the main player stays visible, shrunk to make room —
+        // matches Settings' full-screen swap on phone, but a phone-style
+        // full replacement would waste most of a tablet's width when a
+        // side-by-side panel fits comfortably instead.
+        setContentView(isTabletConfiguration() ? buildTabletLyricsSplitView() : buildLyricsView());
+        sendServiceCommand(SleepMusicService.ACTION_REQUEST_STATE);
+        loadLyricsForCurrentTrack();
+        lyricsTickHandler.removeCallbacks(lyricsTick);
+        lyricsTickHandler.post(lyricsTick);
+    }
+
+    private View buildTabletLyricsSplitView() {
+        // Same right-panel/left-content arrangement as the What's Next
+        // split (buildTabletWhatsNextSplitView) so toggling between the
+        // two just swaps what's in the side panel in place, instead of
+        // the whole player jumping from one side of the screen to the
+        // other depending on which was opened.
+        LinearLayout split = new LinearLayout(this);
+        split.setOrientation(LinearLayout.HORIZONTAL);
+        split.addView(buildContentView(), new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 2f));
+        View divider = new View(this);
+        divider.setBackgroundColor(Color.rgb(45, 51, 56));
+        split.addView(divider, new LinearLayout.LayoutParams(dp(1), ViewGroup.LayoutParams.MATCH_PARENT));
+        split.addView(buildLyricsView(), new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        return split;
+    }
+
+    private View buildTabletWhatsNextSplitView() {
+        LinearLayout split = new LinearLayout(this);
+        split.setOrientation(LinearLayout.HORIZONTAL);
+        split.addView(buildContentView(), new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 2f));
+        View divider = new View(this);
+        divider.setBackgroundColor(Color.rgb(45, 51, 56));
+        split.addView(divider, new LinearLayout.LayoutParams(dp(1), ViewGroup.LayoutParams.MATCH_PARENT));
+        split.addView(buildWhatsNextView(), new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        return split;
+    }
+
+    private View buildWhatsNextView() {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.rgb(17, 19, 21));
+        applySystemBarInsets(root, dp(20), dp(24), dp(20), dp(24));
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        root.addView(header, matchWrap());
+
+        ImageButton backButton = transportButton(R.drawable.ic_back_arrow, "Back");
+        backButton.setOnClickListener(view -> showPlayerScreen());
+        header.addView(backButton, headerIconButtonParams());
+
+        TextView title = text("What's Next", 26, Color.rgb(245, 243, 237));
+        title.setGravity(Gravity.END);
+        header.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        whatsNextSearch = new EditText(this);
+        whatsNextSearch.setSingleLine(true);
+        whatsNextSearch.setHint("Search history and up next");
+        root.addView(whatsNextSearch, topMargin(14));
+        whatsNextSearch.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
+            @Override public void afterTextChanged(Editable s) {
+                refreshWhatsNextList(true);
+            }
+        });
+
+        whatsNextScroll = new ScrollView(this);
+        LinearLayout.LayoutParams scrollParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+        scrollParams.topMargin = dp(10);
+        root.addView(whatsNextScroll, scrollParams);
+
+        whatsNextListContainer = new LinearLayout(this);
+        whatsNextListContainer.setOrientation(LinearLayout.VERTICAL);
+        whatsNextScroll.addView(whatsNextListContainer, matchWrap());
+
+        whatsNextScroll.setOnScrollChangeListener((View v, int scrollX, int scrollY, int oldScrollX, int oldScrollY) -> {
+            if (whatsNextUpcomingLimit >= whatsNextUpcomingTotal) {
+                return;
+            }
+            int remaining = whatsNextListContainer.getHeight() - (scrollY + whatsNextScroll.getHeight());
+            if (remaining > dp(200)) {
+                return;
+            }
+            whatsNextUpcomingLimit += 50;
+            refreshWhatsNextList(false);
+        });
+
+        refreshWhatsNextList(true);
+        return root;
+    }
+
+    private void refreshWhatsNextList(boolean resetLimit) {
+        if (whatsNextListContainer == null) {
+            return;
+        }
+        if (resetLimit) {
+            whatsNextUpcomingLimit = 50;
+        }
+        whatsNextListContainer.removeAllViews();
+        if (playlist.isEmpty()) {
+            TextView empty = text("Nothing queued.", 15, Color.rgb(183, 182, 173));
+            empty.setGravity(Gravity.CENTER);
+            whatsNextListContainer.addView(empty, topMargin(24));
+            return;
+        }
+
+        Map<String, String[]> metadata = PlaylistStore.loadAllTrackMetadata(this);
+
+        // playHistory[0..historyIndex) is everything played before the
+        // current track, oldest-first already (it's an append-only log) —
+        // cap to the most recent 20 for display.
+        List<Integer> history = new ArrayList<>();
+        for (int i = Math.max(0, historyIndex - 20); i < historyIndex && i < playHistory.length; i++) {
+            int index = playHistory[i];
+            if (index >= 0 && index < playlist.size()) {
+                history.add(index);
+            }
+        }
+
+        List<Integer> upcoming = new ArrayList<>();
+        if (shuffleEnabled) {
+            // If Previous was pressed earlier, playHistory already knows
+            // exactly what played after this point — show that first
+            // (it's what Next will actually replay), then keep going with
+            // the rest of the predicted shuffle order. Anything already
+            // in that forward slice was removed from the bag when it was
+            // first picked, so this can't show the same track twice.
+            for (int i = historyIndex + 1; i < playHistory.length; i++) {
+                int index = playHistory[i];
+                if (index >= 0 && index < playlist.size()) {
+                    upcoming.add(index);
+                }
+            }
+            for (int index : shuffleBag) {
+                if (index >= 0 && index < playlist.size()) {
+                    upcoming.add(index);
+                }
+            }
+        } else if (currentIndex >= 0) {
+            // Sequential order is fully determined by currentIndex alone,
+            // so there's no separate "known forward history" case to
+            // special-case here the way shuffle mode needs.
+            for (int i = currentIndex + 1; i < playlist.size(); i++) {
+                upcoming.add(i);
+            }
+            if (repeatMode == SleepMusicService.REPEAT_ALL) {
+                for (int i = 0; i < currentIndex; i++) {
+                    upcoming.add(i);
+                }
+            }
+        }
+
+        // Filters HISTORY/UP NEXT by title+artist. NOW PLAYING always
+        // stays visible regardless of the query — it's a single status
+        // row, not part of the searchable list.
+        String query = whatsNextSearch == null || whatsNextSearch.getText() == null
+                ? "" : whatsNextSearch.getText().toString().trim().toLowerCase(Locale.US);
+        boolean searching = !query.isEmpty();
+        if (searching) {
+            history.removeIf(index -> !whatsNextMatchesQuery(index, metadata, query));
+            upcoming.removeIf(index -> !whatsNextMatchesQuery(index, metadata, query));
+        }
+        whatsNextUpcomingTotal = upcoming.size();
+
+        addWhatsNextSection("HISTORY");
+        if (history.isEmpty()) {
+            addWhatsNextEmptyRow(searching ? "No matches." : "No history yet.");
+        } else {
+            for (int index : history) {
+                addWhatsNextRow(index, metadata, false);
+            }
+        }
+
+        addWhatsNextSection("NOW PLAYING");
+        if (currentIndex >= 0 && currentIndex < playlist.size()) {
+            addWhatsNextRow(currentIndex, metadata, true);
+        } else {
+            addWhatsNextEmptyRow("Nothing playing.");
+        }
+
+        addWhatsNextSection("UP NEXT");
+        if (upcoming.isEmpty()) {
+            addWhatsNextEmptyRow(searching ? "No matches." : "End of playlist.");
+        } else {
+            int shown = searching ? upcoming.size() : Math.min(whatsNextUpcomingLimit, upcoming.size());
+            for (int i = 0; i < shown; i++) {
+                addWhatsNextRow(upcoming.get(i), metadata, false);
+            }
+        }
+    }
+
+    private void addWhatsNextSection(String label) {
+        TextView section = text(label, 12, Color.rgb(183, 182, 173));
+        section.setLetterSpacing(0.08f);
+        whatsNextListContainer.addView(section, topMargin(18));
+    }
+
+    private void addWhatsNextEmptyRow(String message) {
+        TextView row = text(message, 14, Color.rgb(183, 182, 173));
+        whatsNextListContainer.addView(row, topMargin(6));
+    }
+
+    private boolean whatsNextMatchesQuery(int index, Map<String, String[]> metadata, String query) {
+        if (index < 0 || index >= playlist.size()) {
+            return false;
+        }
+        String uri = playlist.get(index);
+        String[] entry = metadata.get(uri);
+        String trackTitle = entry != null && entry.length > 0 && !entry[0].trim().isEmpty()
+                ? entry[0].trim() : PlaylistStore.displayName(this, uri);
+        String artist = entry != null && entry.length > 1 ? entry[1].trim() : "";
+        return (trackTitle + "\n" + artist).toLowerCase(Locale.US).contains(query);
+    }
+
+    private void addWhatsNextRow(int index, Map<String, String[]> metadata, boolean current) {
+        String uri = playlist.get(index);
+        String[] entry = metadata.get(uri);
+        String trackTitle = entry != null && entry.length > 0 && !entry[0].trim().isEmpty()
+                ? entry[0].trim() : PlaylistStore.displayName(this, uri);
+        String artist = entry != null && entry.length > 1 ? entry[1].trim() : "";
+
+        // Same pill-shaped card treatment as the Settings buttons
+        // (settingsButtonBackground) rather than bare rows, matching the
+        // rounded button-style rows the Ubuntu What's Next window uses.
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setBackground(settingsButtonBackground(current ? SETTINGS_STYLE_PRIMARY : SETTINGS_STYLE_SECONDARY));
+        row.setPadding(dp(16), dp(12), dp(16), dp(12));
+
+        TextView titleView = text(trackTitle, 16, current ? Color.rgb(118, 222, 190) : Color.rgb(245, 243, 237));
+        row.addView(titleView, matchWrap());
+        if (!artist.isEmpty()) {
+            TextView artistView = text(artist, 13, Color.rgb(183, 182, 173));
+            row.addView(artistView, topMargin(2));
+        }
+
+        if (!current) {
+            row.setClickable(true);
+            row.setFocusable(true);
+            row.setOnClickListener(view -> {
+                Intent intent = new Intent(this, SleepMusicService.class);
+                intent.setAction(SleepMusicService.ACTION_PLAY_URI);
+                intent.putExtra(SleepMusicService.EXTRA_TRACK_URI, uri);
+                startServiceCompat(intent);
+            });
+        }
+
+        whatsNextListContainer.addView(row, topMargin(8));
+    }
+
+    private View buildLyricsView() {
+        boolean compactPhoneLandscape = isCompactLandscapePhone();
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.rgb(17, 19, 21));
+        applySystemBarInsets(
+                root,
+                dp(compactPhoneLandscape ? 10 : 20),
+                dp(compactPhoneLandscape ? 6 : 24),
+                dp(compactPhoneLandscape ? 10 : 20),
+                dp(compactPhoneLandscape ? 6 : 24));
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        root.addView(header, matchWrap());
+
+        ImageButton backButton = transportButton(R.drawable.ic_back_arrow, "Back");
+        if (compactPhoneLandscape) {
+            backButton.setPadding(dp(6), dp(6), dp(6), dp(6));
+        }
+        backButton.setOnClickListener(view -> showPlayerScreen());
+        header.addView(backButton, lyricsHeaderButtonParams(compactPhoneLandscape));
+
+        LinearLayout titleColumn = new LinearLayout(this);
+        titleColumn.setOrientation(LinearLayout.VERTICAL);
+        titleColumn.setGravity(Gravity.CENTER);
+        header.addView(
+                titleColumn,
+                new LinearLayout.LayoutParams(
+                        0,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        1f));
+
+        TextView title = text(
+                "Lyrics",
+                compactPhoneLandscape ? 19 : 26,
+                Color.rgb(245, 243, 237));
+        title.setGravity(Gravity.CENTER);
+        titleColumn.addView(title, matchWrap());
+
+        lyricsSubtitleView = text(
+                "",
+                compactPhoneLandscape ? 11 : 14,
+                Color.rgb(183, 182, 173));
+        lyricsSubtitleView.setGravity(Gravity.CENTER);
+        lyricsSubtitleView.setMaxLines(compactPhoneLandscape ? 1 : 2);
+        lyricsSubtitleView.setEllipsize(TextUtils.TruncateAt.END);
+        titleColumn.addView(lyricsSubtitleView, matchWrap());
+        updateLyricsSubtitle();
+
+        if (!isTabletConfiguration()) {
+            if (compactPhoneLandscape) {
+                addLyricsTransportButtons(header, true);
+            } else {
+                LinearLayout lyricsTransportRow = new LinearLayout(this);
+                lyricsTransportRow.setOrientation(LinearLayout.HORIZONTAL);
+                lyricsTransportRow.setGravity(Gravity.CENTER);
+                addLyricsTransportButtons(lyricsTransportRow, false);
+                root.addView(lyricsTransportRow, topMargin(18));
+            }
+        }
+
+        lyricsStatusText = text(
+                "Loading lyrics…",
+                compactPhoneLandscape ? 14 : 16,
+                Color.rgb(183, 182, 173));
+        lyricsStatusText.setGravity(Gravity.CENTER);
+        root.addView(
+                lyricsStatusText,
+                topMargin(compactPhoneLandscape ? 6 : 40));
+
+        lyricsScrollView = new ScrollView(this);
+        lyricsScrollView.setFillViewport(true);
+        lyricsScrollView.setClipToPadding(false);
+        root.addView(
+                lyricsScrollView,
+                new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        0,
+                        1f));
+
+        lyricsPhrasesContainer = new LinearLayout(this);
+        lyricsPhrasesContainer.setOrientation(LinearLayout.VERTICAL);
+        lyricsPhrasesContainer.setGravity(Gravity.CENTER_HORIZONTAL);
+        lyricsPhrasesContainer.setClipChildren(false);
+        lyricsPhrasesContainer.setClipToPadding(false);
+
+        int horizontalPadding = dp(compactPhoneLandscape ? 64 : 44);
+        lyricsPhrasesContainer.setPadding(
+                horizontalPadding,
+                dp(compactPhoneLandscape ? 24 : 120),
+                horizontalPadding,
+                dp(compactPhoneLandscape ? 64 : 220));
+
+        lyricsScrollView.addView(
+                lyricsPhrasesContainer,
+                new ScrollView.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        return root;
+    }
+
+    private void addLyricsTransportButtons(
+            LinearLayout row,
+            boolean compactPhoneLandscape) {
+        ImageButton previousButton = transportButton(
+                android.R.drawable.ic_media_previous,
+                "Previous");
+        ImageButton playPauseButton = transportButton(
+                android.R.drawable.ic_media_play,
+                "Play");
+        ImageButton nextButton = transportButton(
+                android.R.drawable.ic_media_next,
+                "Next");
+
+        if (compactPhoneLandscape) {
+            int padding = dp(5);
+            previousButton.setPadding(padding, padding, padding, padding);
+            playPauseButton.setPadding(padding, padding, padding, padding);
+            nextButton.setPadding(padding, padding, padding, padding);
+        }
+
+        previousButton.setOnClickListener(
+                view -> sendServiceCommand(SleepMusicService.ACTION_PREVIOUS));
+        playPauseButton.setOnClickListener(
+                view -> sendServiceCommand(SleepMusicService.ACTION_TOGGLE_PLAY));
+        nextButton.setOnClickListener(
+                view -> sendServiceCommand(SleepMusicService.ACTION_SKIP));
+
+        lyricsPlayButton = playPauseButton;
+        row.addView(
+                previousButton,
+                lyricsTransportButtonParams(false, compactPhoneLandscape));
+        row.addView(
+                playPauseButton,
+                lyricsTransportButtonParams(true, compactPhoneLandscape));
+        row.addView(
+                nextButton,
+                lyricsTransportButtonParams(false, compactPhoneLandscape));
+        updatePlayButtonIcon();
+    }
+
+    // The track just fetched for may no longer be current by the time the
+    // background request returns (user hit next/previous while lyrics were
+    // loading) — lyricsLoadedForTrackUri is rechecked before touching any
+    // view so a stale response can never overwrite a newer request's UI.
+    private void loadLyricsForCurrentTrack() {
+        String trackUri = currentTrackUri;
+        lyricsLoadedForTrackUri = trackUri;
+        lyricsPhrases = new ArrayList<>();
+        lyricsPhraseViews = new ArrayList<>();
+        lyricsActivePhraseIndex = -1;
+        if (lyricsPhrasesContainer != null) {
+            lyricsPhrasesContainer.removeAllViews();
+        }
+        if (lyricsStatusText != null) {
+            lyricsStatusText.setVisibility(View.VISIBLE);
+            lyricsStatusText.setText(trackUri.isEmpty() ? "No song is currently playing" : "Loading lyrics…");
+        }
+        if (trackUri.isEmpty()) {
+            return;
+        }
+        String token = PlaylistStore.loadServerToken(this);
+        new Thread(() -> {
+            JSONObject response = null;
+            String error = null;
+            try {
+                response = RemoteLibraryClient.fetchLyrics(token, trackUri);
+            } catch (Exception e) {
+                error = e.getMessage();
+            }
+            List<LyricsPhrase> phrases = new ArrayList<>();
+            if (response != null) {
+                try {
+                    phrases = LyricsPhrase.pickDisplaySection(response);
+                } catch (JSONException e) {
+                    error = "Malformed lyrics data";
+                }
+            }
+            boolean noLyrics = response == null;
+            String finalError = error;
+            List<LyricsPhrase> finalPhrases = phrases;
+            runOnUiThread(() -> {
+                if (!showingLyrics || !trackUri.equals(lyricsLoadedForTrackUri)) {
+                    return;
+                }
+                if (finalError != null) {
+                    lyricsStatusText.setText("Couldn't load lyrics: " + finalError);
+                    return;
+                }
+                if (noLyrics || finalPhrases.isEmpty()) {
+                    lyricsStatusText.setText("No lyrics available for this track");
+                    return;
+                }
+                lyricsStatusText.setVisibility(View.GONE);
+                lyricsPhrases = finalPhrases;
+                lyricsPhraseViews = new ArrayList<>();
+                for (LyricsPhrase phrase : lyricsPhrases) {
+                    TextView phraseView = new TextView(this);
+                    phraseView.setText(phrase.text);
+                    phraseView.setTextColor(Color.rgb(150, 150, 150));
+                    phraseView.setTextSize(LYRICS_BASE_TEXT_SIZE_SP);
+                    phraseView.setGravity(Gravity.CENTER);
+                    phraseView.setTextAlignment(View.TEXT_ALIGNMENT_CENTER);
+                    phraseView.setAlpha(LYRICS_INACTIVE_ALPHA);
+                    phraseView.setScaleX(LYRICS_INACTIVE_SCALE);
+                    phraseView.setScaleY(LYRICS_INACTIVE_SCALE);
+                    phraseView.setPadding(0, dp(14), 0, dp(14));
+                    lyricsPhrasesContainer.addView(phraseView, matchWrap());
+                    lyricsPhraseViews.add(phraseView);
+                }
+            });
+        }).start();
+    }
+
+    private void updateLyricsHighlightTick() {
+        if (!showingLyrics) {
+            return;
+        }
+        long estimatedPositionMs = lyricsLastKnownPositionMs;
+        if (lyricsLastKnownPlaying) {
+            estimatedPositionMs += SystemClock.elapsedRealtime() - lyricsLastKnownElapsedRealtime;
+        }
+        // Same calibrated output-route delay the visualizer already
+        // compensates with (Bluetooth etc. have real audible latency past
+        // what's been decoded) — without it lyrics highlight ahead of what's
+        // actually audible, same class of bug already solved for the visualizer.
+        long compensatedPositionMs = Math.max(0L, estimatedPositionMs - outputVisualDelayMs);
+        applyLyricsHighlight(compensatedPositionMs / 1000.0);
+        lyricsTickHandler.postDelayed(lyricsTick, 100L);
+    }
+
+    private static final float LYRICS_BASE_TEXT_SIZE_SP = 20f;
+    private static final float LYRICS_INACTIVE_SCALE = 0.82f;
+    private static final float LYRICS_ACTIVE_SCALE = 1.22f;
+    private static final float LYRICS_INACTIVE_ALPHA = 0.6f;
+    private static final float LYRICS_PAST_ALPHA = 0.4f;
+
+    private void applyLyricsHighlight(double positionSeconds) {
+        if (lyricsPhrases.isEmpty() || lyricsPhraseViews.size() != lyricsPhrases.size()) {
+            return;
+        }
+        int activeIndex = -1;
+        for (int i = 0; i < lyricsPhrases.size(); i++) {
+            LyricsPhrase phrase = lyricsPhrases.get(i);
+            if (phrase.startSeconds <= positionSeconds) {
+                activeIndex = i;
+            } else {
+                break;
+            }
+        }
+        if (activeIndex >= 0 && activeIndex < lyricsPhraseViews.size()) {
+            lyricsPhraseViews.get(activeIndex).setText(
+                    buildWordHighlightSpan(lyricsPhrases.get(activeIndex), positionSeconds));
+        }
+        if (activeIndex != lyricsActivePhraseIndex) {
+            animateLyricsLineTransition(lyricsActivePhraseIndex, activeIndex);
+            lyricsActivePhraseIndex = activeIndex;
+            scrollToActiveLyricsPhrase();
+        }
+    }
+
+
+    private void animateLyricsLineTransition(int oldIndex, int newIndex) {
+        for (int i = 0; i < lyricsPhraseViews.size(); i++) {
+            TextView view = lyricsPhraseViews.get(i);
+            view.animate().cancel();
+            view.setCameraDistance(getResources().getDisplayMetrics().density * 8000f);
+            view.setPivotX(view.getWidth() / 2f);
+            view.setPivotY(view.getHeight() / 2f);
+
+            if (i != newIndex) {
+                view.setText(lyricsPhrases.get(i).text);
+            }
+
+            boolean isPast = newIndex >= 0 && i < newIndex;
+            float targetRotation = newIndex < 0 ? 0f : (isPast ? -18f : 18f);
+            float targetTranslationY = newIndex < 0 ? 0f : (isPast ? -dp(8) : dp(8));
+            float targetAlpha = isPast ? LYRICS_PAST_ALPHA : LYRICS_INACTIVE_ALPHA;
+
+            if (i == newIndex) {
+                view.setRotationX(65f);
+                view.setTranslationY(dp(42));
+                view.setTranslationZ(-dp(2));
+                view.setScaleX(LYRICS_INACTIVE_SCALE);
+                view.setScaleY(LYRICS_INACTIVE_SCALE);
+                view.setAlpha(0.2f);
+                view.animate()
+                        .rotationX(0f)
+                        .translationY(0f)
+                        .translationZ(dp(8))
+                        .scaleX(LYRICS_ACTIVE_SCALE)
+                        .scaleY(LYRICS_ACTIVE_SCALE)
+                        .alpha(1f)
+                        .setDuration(420L)
+                        .start();
+            } else {
+                long duration = i == oldIndex ? 420L : 300L;
+                view.animate()
+                        .rotationX(targetRotation)
+                        .translationY(targetTranslationY)
+                        .translationZ(-dp(2))
+                        .scaleX(LYRICS_INACTIVE_SCALE)
+                        .scaleY(LYRICS_INACTIVE_SCALE)
+                        .alpha(targetAlpha)
+                        .setDuration(duration)
+                        .start();
+            }
+        }
+    }
+
+    private CharSequence buildWordHighlightSpan(LyricsPhrase phrase, double positionSeconds) {
+        SpannableStringBuilder builder = new SpannableStringBuilder();
+        for (int i = 0; i < phrase.words.size(); i++) {
+            LyricsPhrase.Word word = phrase.words.get(i);
+            if (i > 0) {
+                builder.append(' ');
+            }
+            int start = builder.length();
+            builder.append(word.text);
+            int end = builder.length();
+            // A word's own timestamp marks when Whisper detected it
+            // starting, but that timestamp has a known tendency to
+            // anticipate the word slightly rather than land exactly on its
+            // audible onset. Using the NEXT word's start (or the phrase's
+            // end for the last word) as the "fully sung" boundary instead
+            // removes that early bias — matching when the word has
+            // actually finished, not just begun.
+            double sungBoundarySeconds = i + 1 < phrase.words.size()
+                    ? phrase.words.get(i + 1).timeSeconds
+                    : phrase.endSeconds;
+            boolean sung = sungBoundarySeconds <= positionSeconds;
+            builder.setSpan(
+                    new ForegroundColorSpan(sung ? Color.rgb(245, 243, 237) : Color.rgb(120, 120, 120)),
+                    start, end, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        return builder;
+    }
+
+    private void scrollToActiveLyricsPhrase() {
+        if (lyricsScrollView == null || lyricsActivePhraseIndex < 0
+                || lyricsActivePhraseIndex >= lyricsPhraseViews.size()) {
+            return;
+        }
+        TextView activeView = lyricsPhraseViews.get(lyricsActivePhraseIndex);
+        lyricsScrollView.post(() -> {
+            int anchorOffset = isCompactLandscapePhone() ? dp(48) : dp(140);
+            int targetY = Math.max(0, activeView.getTop() - anchorOffset);
+            lyricsScrollView.smoothScrollTo(0, targetY);
+        });
     }
 
     private View buildSettingsView() {
@@ -1249,9 +2333,9 @@ public class MainActivity extends Activity {
         header.setGravity(Gravity.CENTER_VERTICAL);
         root.addView(header, matchWrap());
 
-        Button backButton = button("Back");
+        ImageButton backButton = transportButton(R.drawable.ic_back_arrow, "Back");
         backButton.setOnClickListener(view -> showPlayerScreen());
-        header.addView(backButton, inlineButton());
+        header.addView(backButton, headerIconButtonParams());
 
         TextView title = text("Settings", 28, Color.rgb(245, 243, 237));
         title.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
@@ -1262,27 +2346,33 @@ public class MainActivity extends Activity {
 
         TextView playlistTitle = text("Playlist & library", 20, Color.rgb(245, 243, 237));
         root.addView(playlistTitle, topMargin(30));
-        addPlaylistManagementControls(root);
+        LinearLayout playlistCard = settingsCard();
+        root.addView(playlistCard, topMargin(10));
+        addPlaylistManagementControls(playlistCard);
 
         TextView playbackTitle = text("Playback", 20, Color.rgb(245, 243, 237));
         root.addView(playbackTitle, topMargin(30));
-        addPrimarySettingsControls(root);
-        addAdvancedLevelingControls(root);
-        addVisualizationControls(root);
+        LinearLayout playbackCard = settingsCard();
+        root.addView(playbackCard, topMargin(10));
+        addPrimarySettingsControls(playbackCard);
+        addAdvancedLevelingControls(playbackCard);
+        addVisualizationControls(playbackCard);
 
         TextView aboutTitle = text("About", 20, Color.rgb(245, 243, 237));
         root.addView(aboutTitle, topMargin(30));
-        Button privacyButton = button("Privacy policy");
+        LinearLayout aboutCard = settingsCard();
+        root.addView(aboutCard, topMargin(10));
+        Button privacyButton = settingsButton("Privacy policy", SETTINGS_STYLE_SECONDARY);
         privacyButton.setOnClickListener(view -> openWebPage(
                 "https://patrick-lamphier.com/fredplayer-privacy"));
-        root.addView(privacyButton, actionButtonParams(10));
-        Button supportButton = button("Support");
+        aboutCard.addView(privacyButton, actionButtonParams(0));
+        Button supportButton = settingsButton("Support", SETTINGS_STYLE_SECONDARY);
         supportButton.setOnClickListener(view -> openWebPage(
                 "https://patrick-lamphier.com/fredplayer-support"));
-        root.addView(supportButton, actionButtonParams(10));
+        aboutCard.addView(supportButton, actionButtonParams(8));
 
         cacheText = text("", 13, Color.rgb(183, 182, 173));
-        root.addView(cacheText, topMargin(22));
+        aboutCard.addView(cacheText, topMargin(16));
         NormalizingAudioPlayer.CacheStats stats = NormalizingAudioPlayer.profileCacheStats(this);
         NormalizingAudioPlayer.CacheStats visualStats = NormalizingAudioPlayer.visualCacheStats(this);
         updateCacheText(
@@ -1296,55 +2386,105 @@ public class MainActivity extends Activity {
                 visualStats.approximateBytes,
                 0,
                 0);
-
-        TextView editorTitle = text("Playlist editor", 20, Color.rgb(245, 243, 237));
-        root.addView(editorTitle, topMargin(30));
-        addPlaylistEditor(root);
         return scrollView;
     }
 
     private void addPlaylistManagementControls(LinearLayout root) {
-        Button playlistsButton = button("Choose or manage playlists");
-        playlistsButton.setOnClickListener(view -> showPlaylistMenu());
-        root.addView(playlistsButton, actionButtonParams(12));
+        addSettingsGroupLabel(root, "This playlist", 4);
+        settingsPlaylistLabel = text(playlistSummary(playlist.size()), 15, Color.rgb(245, 243, 237));
+        root.addView(settingsPlaylistLabel, topMargin(2));
+        Button editButton = settingsButton(
+                "Edit current playlist", R.drawable.ic_playlist_bars, SETTINGS_STYLE_PRIMARY);
+        editButton.setOnClickListener(view -> showPlaylistEditorScreen());
+        root.addView(editButton, actionButtonParams(8));
 
-        LinearLayout addButtons = new LinearLayout(this);
-        addButtons.setOrientation(LinearLayout.HORIZONTAL);
-        addButtons.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-        root.addView(addButtons, topMargin(10));
+        Button playlistsButton = settingsButton("Choose or manage playlists", SETTINGS_STYLE_SECONDARY);
+        playlistsButton.setOnClickListener(view -> showPlaylistMenuScreen());
+        root.addView(playlistsButton, actionButtonParams(8));
 
-        Button addButton = button("Add files");
-        addButton.setOnClickListener(view -> openAudioPicker());
-        addButtons.addView(addButton, inlineButton());
-
-        Button addFolderButton = button("Add folder");
-        addFolderButton.setOnClickListener(view -> openFolderPicker());
-        addButtons.addView(addFolderButton, inlineButton());
-
-        Button addFromServerButton = button("Add from server");
-        addFromServerButton.setOnClickListener(view -> openServerLibraryDialog());
-        root.addView(addFromServerButton, actionButtonParams(10));
-
-        Button sharedPlaylistsButton = button("Shared playlists");
-        sharedPlaylistsButton.setOnClickListener(view -> openSharedPlaylists());
-        root.addView(sharedPlaylistsButton, actionButtonParams(10));
-
-        Button askLiamButton = button("Ask Liam");
-        askLiamButton.setOnClickListener(view -> openAskLiamDialog());
-        root.addView(askLiamButton, actionButtonParams(10));
-
-        Button clearButton = button("Clear list");
+        Button clearButton = settingsButton("Clear list", R.drawable.ic_trash, SETTINGS_STYLE_DESTRUCTIVE);
         clearButton.setOnClickListener(view -> {
             playlist.clear();
             persistActivePlaylist();
             updatePlaylistText();
             sendServiceCommand(SleepMusicService.ACTION_CLEAR);
         });
-        root.addView(clearButton, actionButtonParams(10));
+        root.addView(clearButton, actionButtonParams(8));
 
-        Button shuffleButton = button("Shuffle list");
-        shuffleButton.setOnClickListener(view -> shufflePlaylist());
-        root.addView(shuffleButton, actionButtonParams(10));
+        addSettingsGroupLabel(root, "Add music", 22);
+        LinearLayout addButtons = new LinearLayout(this);
+        addButtons.setOrientation(LinearLayout.HORIZONTAL);
+        addButtons.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        root.addView(addButtons, topMargin(4));
+
+        Button addButton = settingsButton("Add files", R.drawable.ic_add_simple, SETTINGS_STYLE_SECONDARY);
+        addButton.setOnClickListener(view -> openAudioPicker());
+        addButtons.addView(addButton, settingsInlineParams());
+
+        Button addFolderButton = settingsButton("Add folder", R.drawable.ic_add_simple, SETTINGS_STYLE_SECONDARY);
+        addFolderButton.setOnClickListener(view -> openFolderPicker());
+        addButtons.addView(addFolderButton, settingsInlineParams());
+
+        Button addFromServerButton = settingsButton(
+                "Add from server", R.drawable.ic_add_simple, SETTINGS_STYLE_SECONDARY);
+        addFromServerButton.setOnClickListener(view -> openServerLibraryDialog());
+        addFromServerButton.setOnLongClickListener(view -> {
+            openServerConnectionDialog();
+            return true;
+        });
+        root.addView(addFromServerButton, actionButtonParams(8));
+        TextView addFromServerHint = text("Long-press to change the server URL or token", 12, Color.rgb(140, 138, 130));
+        root.addView(addFromServerHint, topMargin(4));
+
+        addSettingsGroupLabel(root, "Server", 22);
+        Button rescanServerButton = settingsButton("Rescan server library", SETTINGS_STYLE_SECONDARY);
+        rescanServerButton.setOnClickListener(view -> rescanServerLibrary());
+        root.addView(rescanServerButton, actionButtonParams(8));
+
+        Button sharedPlaylistsButton = settingsButton("Shared playlists", SETTINGS_STYLE_SECONDARY);
+        sharedPlaylistsButton.setOnClickListener(view -> openSharedPlaylists());
+        root.addView(sharedPlaylistsButton, actionButtonParams(8));
+
+        Button askLiamButton = settingsButton("Ask Liam", SETTINGS_STYLE_SECONDARY);
+        askLiamButton.setOnClickListener(view -> openAskLiamDialog());
+        root.addView(askLiamButton, actionButtonParams(8));
+    }
+
+    // Small muted subheading used to break up a settings section into
+    // clearly labeled groups instead of one undifferentiated stack of
+    // identically-styled buttons.
+    private void addSettingsGroupLabel(LinearLayout root, String label, int topMarginDp) {
+        TextView groupLabel = text(label.toUpperCase(Locale.US), 12, Color.rgb(140, 138, 130));
+        groupLabel.setLetterSpacing(0.08f);
+        root.addView(groupLabel, topMargin(topMarginDp));
+    }
+
+    private void rescanServerLibrary() {
+        String baseUrl = PlaylistStore.loadServerBaseUrl(this);
+        String token = PlaylistStore.loadServerToken(this);
+        if (baseUrl.isEmpty()) {
+            Toast.makeText(
+                    this,
+                    "Set up the Fred Server first with Add from server",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        Toast.makeText(this, "Rescanning server library…", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            try {
+                int count = RemoteLibraryClient.rescanLibrary(baseUrl, token);
+                runOnUiThread(() -> Toast.makeText(
+                        this,
+                        "Rescanned " + count + " tracks; missing playback data is queued",
+                        Toast.LENGTH_LONG).show());
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(
+                        this,
+                        "Could not rescan server: " + e.getMessage(),
+                        Toast.LENGTH_LONG).show());
+            }
+        }, "FredPlayerServerRescan").start();
     }
 
     private void addPrimarySettingsControls(LinearLayout root) {
@@ -1546,7 +2686,7 @@ public class MainActivity extends Activity {
                         value / 100f,
                         visualizationSettings.logScale)));
 
-        Button scaleButton = button(scaleButtonText());
+        Button scaleButton = settingsButton(scaleButtonText(), SETTINGS_STYLE_SECONDARY);
         scaleButton.setOnClickListener(view -> {
             updateVisualizationSettings(new VisualizationSettings(
                     visualizationSettings.fps,
@@ -1595,7 +2735,7 @@ public class MainActivity extends Activity {
             });
             root.addView(bluetoothDelaySlider, matchWrap());
 
-            bluetoothCalibrateButton = button("Calibrate with microphone");
+            bluetoothCalibrateButton = settingsButton("Calibrate with microphone", SETTINGS_STYLE_SECONDARY);
             bluetoothCalibrateButton.setOnClickListener(view -> confirmBluetoothCalibration());
             root.addView(bluetoothCalibrateButton, actionButtonParams(10));
 
@@ -1690,12 +2830,12 @@ public class MainActivity extends Activity {
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     1f));
 
-            Button clear = button("Clear");
+            Button clear = settingsButton("Clear", SETTINGS_STYLE_DESTRUCTIVE);
             clear.setOnClickListener(view -> confirmClearBluetoothCalibration(entry));
             row.addView(clear, inlineButton());
         }
 
-        Button clearAll = button("Clear all speaker calibrations");
+        Button clearAll = settingsButton("Clear all speaker calibrations", SETTINGS_STYLE_DESTRUCTIVE);
         clearAll.setOnClickListener(view -> confirmClearAllBluetoothCalibrations());
         bluetoothSavedListContainer.addView(clearAll, actionButtonParams(12));
     }
@@ -1758,38 +2898,77 @@ public class MainActivity extends Activity {
                 REQUEST_AUDIO_CALIBRATION);
     }
 
-    private void addPlaylistEditor(LinearLayout root) {
-        playlistEditorTitle = text(activePlaylistName, 18, Color.rgb(245, 243, 237));
-        root.addView(playlistEditorTitle, topMargin(28));
-
-        TextView foldersTitle = text("Folders", 15, Color.rgb(183, 182, 173));
-        root.addView(foldersTitle, topMargin(12));
-        playlistFoldersContainer = new LinearLayout(this);
-        playlistFoldersContainer.setOrientation(LinearLayout.VERTICAL);
-        root.addView(playlistFoldersContainer, matchWrap());
-
-        TextView filesTitle = text("Files", 15, Color.rgb(183, 182, 173));
-        root.addView(filesTitle, topMargin(12));
-        playlistFilesContainer = new LinearLayout(this);
-        playlistFilesContainer.setOrientation(LinearLayout.VERTICAL);
-        root.addView(playlistFilesContainer, matchWrap());
-
-        updatePlaylistEditor();
-    }
-
-    private void showPlaylistMenu() {
+    private View buildPlaylistMenuView() {
         ArrayList<String> names = new ArrayList<>(playlists.keySet());
-        new AlertDialog.Builder(this)
-                .setTitle("Playlists")
-                .setItems(names.toArray(new String[0]), (dialog, which) -> {
-                    if (which >= 0 && which < names.size()) {
-                        switchPlaylist(names.get(which));
-                    }
-                })
-                .setPositiveButton("New", (dialog, which) -> showCreatePlaylistDialog())
-                .setNeutralButton("Rename", (dialog, which) -> showRenamePlaylistDialog())
-                .setNegativeButton("Delete", (dialog, which) -> confirmDeletePlaylist())
-                .show();
+        ArrayList<String> labels = new ArrayList<>();
+        for (String name : names) {
+            labels.add(name.equals(activePlaylistName) ? name + "  (current)" : name);
+        }
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.rgb(17, 19, 21));
+        applySystemBarInsets(root, dp(20), dp(24), dp(20), dp(24));
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        root.addView(header, matchWrap());
+
+        ImageButton backButton = transportButton(R.drawable.ic_back_arrow, "Back");
+        backButton.setOnClickListener(view -> showSettingsScreen());
+        header.addView(backButton, headerIconButtonParams());
+
+        TextView title = text("Playlists", 26, Color.rgb(245, 243, 237));
+        title.setGravity(Gravity.END);
+        header.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        ListView list = new ListView(this);
+        LinearLayout.LayoutParams listParams =
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+        listParams.topMargin = dp(14);
+        root.addView(list, listParams);
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                this, android.R.layout.simple_list_item_1, android.R.id.text1, labels);
+        list.setAdapter(adapter);
+        list.setOnItemClickListener((parent, view, position, id) -> {
+            switchPlaylist(names.get(position));
+            showSettingsScreen();
+        });
+
+        LinearLayout buttonRow = new LinearLayout(this);
+        buttonRow.setOrientation(LinearLayout.HORIZONTAL);
+        buttonRow.setGravity(Gravity.CENTER_VERTICAL);
+        root.addView(buttonRow, topMargin(14));
+
+        Button newButton = settingsButton("New", SETTINGS_STYLE_PRIMARY);
+        newButton.setOnClickListener(view -> {
+            showSettingsScreen();
+            showCreatePlaylistDialog();
+        });
+        LinearLayout.LayoutParams newParams =
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        newParams.rightMargin = dp(8);
+        buttonRow.addView(newButton, newParams);
+
+        Button renameButton = settingsButton("Rename", SETTINGS_STYLE_SECONDARY);
+        renameButton.setOnClickListener(view -> {
+            showSettingsScreen();
+            showRenamePlaylistDialog();
+        });
+        LinearLayout.LayoutParams renameParams =
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        renameParams.rightMargin = dp(8);
+        buttonRow.addView(renameButton, renameParams);
+
+        Button deleteButton = settingsButton("Delete", SETTINGS_STYLE_DESTRUCTIVE);
+        deleteButton.setOnClickListener(view -> {
+            showSettingsScreen();
+            confirmDeletePlaylist();
+        });
+        buttonRow.addView(deleteButton, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        return root;
     }
 
     private void showCreatePlaylistDialog() {
@@ -2003,29 +3182,6 @@ public class MainActivity extends Activity {
                 || lower.endsWith(".opus");
     }
 
-    private void shufflePlaylist() {
-        if (playlist.size() < 2) {
-            Toast.makeText(this, "Add at least two files first", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        Collections.shuffle(playlist);
-        savePlaylistChange("Playlist shuffled");
-    }
-
-    private void removePlaylistFolder(String folderKey) {
-        int before = playlist.size();
-        Iterator<String> iterator = playlist.iterator();
-        while (iterator.hasNext()) {
-            if (folderKey.equals(playlistFolderKey(iterator.next()))) {
-                iterator.remove();
-            }
-        }
-        int removed = before - playlist.size();
-        if (removed > 0) {
-            savePlaylistChange("Removed " + removed + " files");
-        }
-    }
-
     private void removePlaylistFile(String uriString) {
         if (playlist.remove(uriString)) {
             savePlaylistChange("Removed file");
@@ -2041,117 +3197,6 @@ public class MainActivity extends Activity {
             sendPlaylistToService(false);
         }
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
-    }
-
-    private void updatePlaylistEditor() {
-        if (playlistFoldersContainer == null || playlistFilesContainer == null) {
-            return;
-        }
-        if (playlistEditorTitle != null) {
-            playlistEditorTitle.setText(activePlaylistName);
-        }
-        playlistFoldersContainer.removeAllViews();
-        playlistFilesContainer.removeAllViews();
-
-        if (playlist.isEmpty()) {
-            playlistFoldersContainer.addView(text("No folders in playlist", 14, Color.rgb(183, 182, 173)), matchWrap());
-            playlistFilesContainer.addView(text("No files in playlist", 14, Color.rgb(183, 182, 173)), matchWrap());
-            return;
-        }
-
-        LinkedHashMap<String, Integer> folderCounts = new LinkedHashMap<>();
-        for (String item : playlist) {
-            String folderKey = playlistFolderKey(item);
-            Integer count = folderCounts.get(folderKey);
-            folderCounts.put(folderKey, count == null ? 1 : count + 1);
-        }
-
-        for (Map.Entry<String, Integer> entry : folderCounts.entrySet()) {
-            String folderKey = entry.getKey();
-            String label = friendlyFolderLabel(folderKey) + " (" + entry.getValue() + ")";
-            addActionRow(playlistFoldersContainer, label, "Remove", view -> removePlaylistFolder(folderKey));
-        }
-
-        Map<String, String[]> metadata = PlaylistStore.loadAllTrackMetadata(this);
-        for (String item : new ArrayList<>(playlist)) {
-            addActionRow(playlistFilesContainer, playlistTrackLabel(item, metadata.get(item)), "Remove",
-                    view -> removePlaylistFile(item));
-        }
-    }
-
-    private String playlistTrackLabel(String uriString, String[] metadata) {
-        if (metadata == null) {
-            return PlaylistStore.displayName(this, uriString);
-        }
-        String title = metadata.length > 0 ? metadata[0].trim() : "";
-        String artist = metadata.length > 1 ? metadata[1].trim() : "";
-        String album = metadata.length > 2 ? metadata[2].trim() : "";
-        if (title.isEmpty()) {
-            title = PlaylistStore.displayName(this, uriString);
-        }
-        String detail = artist;
-        if (!album.isEmpty()) {
-            detail = detail.isEmpty() ? album : detail + " — " + album;
-        }
-        return detail.isEmpty() ? title : title + "\n" + detail;
-    }
-
-    private void addActionRow(LinearLayout parent, String label, String action, View.OnClickListener listener) {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(0, dp(3), 0, dp(3));
-
-        TextView labelView = text(label, 13, Color.rgb(245, 243, 237));
-        labelView.setSingleLine(false);
-        row.addView(labelView, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-
-        Button button = button(action);
-        button.setTextSize(13);
-        button.setMinHeight(dp(38));
-        button.setOnClickListener(listener);
-        row.addView(button, inlineButton());
-
-        parent.addView(row, matchWrap());
-    }
-
-    private String playlistFolderKey(String uriString) {
-        Uri uri = Uri.parse(uriString);
-        String documentId = null;
-        try {
-            documentId = DocumentsContract.getDocumentId(uri);
-        } catch (RuntimeException ignored) {
-        }
-
-        String path = documentId;
-        if (path == null || path.isEmpty()) {
-            path = uri.getLastPathSegment();
-        }
-        if (path == null || path.isEmpty()) {
-            return "Selected files";
-        }
-
-        path = Uri.decode(path);
-        int colon = path.indexOf(':');
-        if (colon >= 0 && colon < path.length() - 1) {
-            path = path.substring(colon + 1);
-        }
-        int slash = path.lastIndexOf('/');
-        if (slash <= 0) {
-            return "Selected files";
-        }
-        return path.substring(0, slash);
-    }
-
-    private String friendlyFolderLabel(String folderKey) {
-        if (folderKey == null || folderKey.trim().isEmpty()) {
-            return "Selected files";
-        }
-        String label = folderKey;
-        if (label.startsWith("Music/")) {
-            label = label.substring("Music/".length());
-        }
-        return label.isEmpty() ? "Music" : label;
     }
 
     private void addSettingsSlider(
@@ -2244,6 +3289,335 @@ public class MainActivity extends Activity {
         return detail.isEmpty() ? title : title + "\n" + detail;
     }
 
+    // Tablets (and phones in landscape, which have the same wide/short
+    // shape) put art beside the title/artist/album text — there's enough
+    // width for both. Phones in portrait are narrow and tall, so instead
+    // the art sits full-width behind the (still-centered) text with a
+    // dark scrim, matching how most streaming apps handle a portrait
+    // now-playing header rather than squeezing a side-by-side row into a
+    // narrow column.
+    private boolean isTabletConfiguration() {
+        return getResources().getConfiguration().smallestScreenWidthDp >= 600;
+    }
+
+    private boolean isLandscapeConfiguration() {
+        return getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
+    }
+
+    private boolean sideBySideArtLayout() {
+        return isTabletConfiguration() || isLandscapeConfiguration();
+    }
+
+    // A phone in landscape has a tablet's aspect ratio but not its actual
+    // height — often under 400dp usable. The spacious tablet sizing (168dp
+    // art, an 168dp-minimum visualizer, generous margins) doesn't fit that
+    // budget at all, so this scales everything below down specifically for
+    // that one case rather than for tablets, which have room to spare.
+    private boolean isCompactLandscapePhone() {
+        return isLandscapeConfiguration() && !isTabletConfiguration();
+    }
+
+    private ViewOutlineProvider roundedOutline(int radiusDp) {
+        return new ViewOutlineProvider() {
+            @Override
+            public void getOutline(View view, Outline outline) {
+                outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), dp(radiusDp));
+            }
+        };
+    }
+
+    private void buildNowPlayingSection(
+            LinearLayout root, LinearLayout header, LinearLayout mainButtons,
+            TextView stateTextView, SeekBar seekBar,
+            LinearLayout timeRow, VisualizerView visualizer) {
+        artImageView = new ImageView(this);
+        artImageView.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        artImageView.setContentDescription("Album art");
+        artImageView.setImageResource(R.drawable.no_album_art);
+        artImageView.setClipToOutline(true);
+        artImageView.setOutlineProvider(roundedOutline(14));
+        artScrim = null;
+
+        if (isCompactLandscapePhone()) {
+            // A landscape phone is wide but short. The art fills the
+            // entire left half as a background (not a small thumbnail
+            // beside the text) — state line, title/artist/album, seek bar,
+            // and elapsed time all overlay on top of it, centered, the
+            // same "art behind everything" idea as the portrait layout
+            // above but split left/right instead of stacked. The
+            // visualizer takes the right half, so it gets real width
+            // instead of a squashed sliver below everything.
+            //
+            // The header (FredPlayer/Settings) and the transport buttons
+            // both float on top of this whole block instead of sitting in
+            // their own rows above/below it, so the art extends behind
+            // both of them too rather than losing that height.
+            FrameLayout topFrame = new FrameLayout(this);
+            LinearLayout.LayoutParams topFrameParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+            root.addView(topFrame, topFrameParams);
+
+            LinearLayout contentRow = new LinearLayout(this);
+            contentRow.setOrientation(LinearLayout.HORIZONTAL);
+            topFrame.addView(contentRow, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+            FrameLayout.LayoutParams headerParams = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            headerParams.gravity = Gravity.TOP;
+            topFrame.addView(header, headerParams);
+
+            FrameLayout artFrame = new FrameLayout(this);
+            LinearLayout.LayoutParams artFrameParams = new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+            contentRow.addView(artFrame, artFrameParams);
+
+            artFrame.addView(artImageView, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+            artScrim = new View(this);
+            artScrim.setBackgroundColor(Color.argb(150, 0, 0, 0));
+            artFrame.addView(artScrim, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+            // The transport buttons float over the bottom of this same art
+            // frame (not the visualizer's half — that stays clear), so the
+            // overlay column below gets top/bottom clearance sized to the
+            // header and button rows to avoid the text and buttons
+            // colliding.
+            // MATCH_PARENT (not WRAP_CONTENT) so the weight-based button
+            // widths in transportButtonParams() have a definite width to
+            // divide up — with WRAP_CONTENT here, 0dp-width weighted
+            // children would have nothing to distribute and collapse.
+            FrameLayout.LayoutParams mainButtonsParams = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            mainButtonsParams.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+            mainButtonsParams.bottomMargin = dp(6);
+            artFrame.addView(mainButtons, mainButtonsParams);
+
+            LinearLayout overlayColumn = new LinearLayout(this);
+            overlayColumn.setOrientation(LinearLayout.VERTICAL);
+            overlayColumn.setGravity(Gravity.CENTER_HORIZONTAL);
+            FrameLayout.LayoutParams overlayColumnParams = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            overlayColumnParams.gravity = Gravity.CENTER;
+            overlayColumnParams.leftMargin = dp(14);
+            overlayColumnParams.rightMargin = dp(14);
+            overlayColumnParams.topMargin = dp(46);
+            overlayColumnParams.bottomMargin = dp(66);
+            artFrame.addView(overlayColumn, overlayColumnParams);
+
+            overlayColumn.addView(stateTextView, matchWrap());
+
+            // Wider overlay column than the old beside-a-thumbnail layout
+            // had, and no artificially small line cap — that combination
+            // is what was truncating titles that had plenty of room.
+            nowPlayingText = text("No song selected", 17, Color.rgb(245, 243, 237));
+            nowPlayingText.setGravity(Gravity.CENTER);
+            nowPlayingText.setMaxLines(3);
+            nowPlayingText.setEllipsize(TextUtils.TruncateAt.END);
+            overlayColumn.addView(nowPlayingText, topMargin(4));
+
+            playlistText = text("", 13, Color.rgb(183, 182, 173));
+            playlistText.setGravity(Gravity.CENTER);
+            playlistText.setMaxLines(1);
+            playlistText.setEllipsize(TextUtils.TruncateAt.END);
+            overlayColumn.addView(playlistText, topMargin(4));
+
+            overlayColumn.addView(seekBar, topMargin(6));
+            overlayColumn.addView(timeRow, matchWrap());
+
+            LinearLayout.LayoutParams visualizerParams = new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+            visualizerParams.leftMargin = dp(14);
+            contentRow.addView(visualizer, visualizerParams);
+            return;
+        }
+
+        if (sideBySideArtLayout()) {
+            // Tablet only at this point — isCompactLandscapePhone() above
+            // already claimed the landscape-phone case.
+            root.addView(stateTextView, topMargin(8));
+
+            LinearLayout nowPlayingRow = new LinearLayout(this);
+            nowPlayingRow.setOrientation(LinearLayout.HORIZONTAL);
+            nowPlayingRow.setGravity(Gravity.CENTER_VERTICAL);
+            root.addView(nowPlayingRow, topMargin(24));
+
+            int artSize = dp(168);
+            nowPlayingRow.addView(artImageView, new LinearLayout.LayoutParams(artSize, artSize));
+
+            LinearLayout nowPlayingColumn = new LinearLayout(this);
+            nowPlayingColumn.setOrientation(LinearLayout.VERTICAL);
+            LinearLayout.LayoutParams columnParams = new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            columnParams.leftMargin = dp(18);
+            nowPlayingRow.addView(nowPlayingColumn, columnParams);
+
+            nowPlayingText = text("No song selected", 20, Color.rgb(245, 243, 237));
+            nowPlayingText.setGravity(Gravity.START);
+            nowPlayingText.setMaxLines(4);
+            nowPlayingText.setEllipsize(TextUtils.TruncateAt.END);
+            nowPlayingColumn.addView(nowPlayingText, matchWrap());
+
+            playlistText = text("", 15, Color.rgb(183, 182, 173));
+            playlistText.setGravity(Gravity.START);
+            playlistText.setMaxLines(1);
+            playlistText.setEllipsize(TextUtils.TruncateAt.END);
+            nowPlayingColumn.addView(playlistText, topMargin(8));
+
+            root.addView(seekBar, topMargin(14));
+            root.addView(timeRow, matchWrap());
+
+            LinearLayout.LayoutParams visualizerParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+            visualizerParams.topMargin = dp(18);
+            root.addView(visualizer, visualizerParams);
+            return;
+        }
+
+        // Portrait phone: art is a full-width square — the actual point is
+        // to give the art real presence on screen, not just a band sized
+        // to hug the text. The "Playing"/"Leveling" state line, title/
+        // artist/album, and the seek bar all overlay on top of it, centered
+        // in whatever extra room the square has beyond what they need.
+        //
+        // A square this size necessarily eats into the rest of the page's
+        // budget, so the visualizer's minimum height is trimmed for this
+        // case (see buildContentView) to keep the transport buttons on
+        // screen without scrolling — a deliberate trade the user asked for.
+        int squareSize = dp(getResources().getConfiguration().screenWidthDp) - dp(40);
+        FrameLayout nowPlayingFrame = new FrameLayout(this);
+        root.addView(nowPlayingFrame, topMargin(16));
+
+        FrameLayout.LayoutParams artFrameParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, squareSize);
+        nowPlayingFrame.addView(artImageView, artFrameParams);
+
+        artScrim = new View(this);
+        artScrim.setBackgroundColor(Color.argb(150, 0, 0, 0));
+        FrameLayout.LayoutParams scrimParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, squareSize);
+        nowPlayingFrame.addView(artScrim, scrimParams);
+
+        LinearLayout overlayColumn = new LinearLayout(this);
+        overlayColumn.setOrientation(LinearLayout.VERTICAL);
+        overlayColumn.setGravity(Gravity.CENTER_HORIZONTAL);
+        FrameLayout.LayoutParams columnFrameParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        columnFrameParams.gravity = Gravity.CENTER;
+        columnFrameParams.leftMargin = dp(20);
+        columnFrameParams.rightMargin = dp(20);
+        nowPlayingFrame.addView(overlayColumn, columnFrameParams);
+
+        overlayColumn.addView(stateTextView, matchWrap());
+
+        nowPlayingText = text("No song selected", 20, Color.rgb(245, 243, 237));
+        nowPlayingText.setGravity(Gravity.CENTER);
+        nowPlayingText.setMaxLines(4);
+        nowPlayingText.setEllipsize(TextUtils.TruncateAt.END);
+        overlayColumn.addView(nowPlayingText, topMargin(6));
+
+        playlistText = text("", 15, Color.rgb(183, 182, 173));
+        playlistText.setGravity(Gravity.CENTER);
+        playlistText.setMaxLines(1);
+        playlistText.setEllipsize(TextUtils.TruncateAt.END);
+        overlayColumn.addView(playlistText, topMargin(4));
+
+        overlayColumn.addView(seekBar, topMargin(10));
+
+        root.addView(timeRow, matchWrap());
+
+        LinearLayout.LayoutParams visualizerParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+        visualizerParams.topMargin = dp(18);
+        root.addView(visualizer, visualizerParams);
+    }
+
+    private static String artworkKey(String artist, String album) {
+        String normalizedArtist = artist == null ? "" : artist.trim().toLowerCase(Locale.US);
+        String normalizedAlbum = album == null ? "" : album.trim().toLowerCase(Locale.US);
+        return normalizedArtist + "|" + normalizedAlbum;
+    }
+
+    // Independent of SleepMusicService's own artwork fetch/cache — same
+    // server endpoint, same (artist, album) cache key, but this activity
+    // and the service are only loosely coupled via broadcasts (per this
+    // app's existing pattern), so each fetches and decodes its own copy
+    // rather than trying to share a Bitmap across process/component
+    // boundaries.
+    private void updateArtwork(String trackUri, String artist, String album) {
+        if (artImageView == null) {
+            return;
+        }
+        String key = artworkKey(artist, album);
+        artworkRequestKey = key;
+        Bitmap cached;
+        synchronized (artworkMemoryCache) {
+            cached = artworkMemoryCache.get(key);
+        }
+        if (cached != null) {
+            showArtwork(cached);
+            return;
+        }
+        showPlaceholderArtwork();
+        if (artist == null || artist.isEmpty() || album == null || album.isEmpty()) {
+            return;
+        }
+        String artworkUrl = RemoteLibraryClient.artworkUrlFromTrackUri(trackUri);
+        if (artworkUrl == null) {
+            return;
+        }
+        String token = PlaylistStore.loadServerToken(this);
+        new Thread(() -> fetchArtwork(artworkUrl, token, key), "FredPlayerArtworkFetch").start();
+    }
+
+    private void showArtwork(Bitmap bitmap) {
+        if (artImageView == null) {
+            return;
+        }
+        artImageView.setImageBitmap(bitmap);
+        artImageView.setVisibility(View.VISIBLE);
+        if (artScrim != null) {
+            artScrim.setVisibility(View.VISIBLE);
+        }
+    }
+
+    private void showPlaceholderArtwork() {
+        if (artImageView == null) {
+            return;
+        }
+        artImageView.setImageResource(R.drawable.no_album_art);
+        artImageView.setVisibility(View.VISIBLE);
+        if (artScrim != null) {
+            artScrim.setVisibility(View.VISIBLE);
+        }
+    }
+
+    private void fetchArtwork(String urlString, String token, String key) {
+        Bitmap bitmap = null;
+        try {
+            byte[] data = RemoteLibraryClient.fetchBytes(urlString, token);
+            bitmap = BitmapFactory.decodeByteArray(data, 0, data.length);
+        } catch (Exception ignored) {
+            // Best-effort — the player screen just stays without art.
+        }
+        if (bitmap == null) {
+            return;
+        }
+        synchronized (artworkMemoryCache) {
+            artworkMemoryCache.put(key, bitmap);
+        }
+        Bitmap decoded = bitmap;
+        runOnUiThread(() -> {
+            // Staleness guard — the user may have already skipped to
+            // another track by the time this comes back.
+            if (key.equals(artworkRequestKey)) {
+                showArtwork(decoded);
+            }
+        });
+    }
+
     private void updateCacheText(
             int count,
             int pruneAbove,
@@ -2324,6 +3698,19 @@ public class MainActivity extends Activity {
         startServiceCompat(intent);
     }
 
+    private void confirmRemoveCurrentTrack() {
+        if (playlist.isEmpty()) {
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Remove track")
+                .setMessage("Remove the current track from \"" + activePlaylistName + "\"?")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Remove", (dialog, which) ->
+                        sendServiceCommand(SleepMusicService.ACTION_REMOVE_CURRENT))
+                .show();
+    }
+
     private void sendSeekCommand(long positionMs) {
         Intent intent = new Intent(this, SleepMusicService.class);
         intent.setAction(SleepMusicService.ACTION_SEEK);
@@ -2364,15 +3751,18 @@ public class MainActivity extends Activity {
         if (playlistText != null) {
             playlistText.setText(playlistSummary(playlist.size()));
         }
+        if (settingsPlaylistLabel != null) {
+            settingsPlaylistLabel.setText(playlistSummary(playlist.size()));
+        }
         if (playlist.isEmpty()) {
             if (nowPlayingText != null) {
                 nowPlayingText.setText("No song selected");
             }
+            showPlaceholderArtwork();
             playing = false;
             updatePlayButtonIcon();
             updateTrackProgress(0L, 0L);
         }
-        updatePlaylistEditor();
     }
 
     private String playlistSummary(int count) {
@@ -2442,7 +3832,77 @@ public class MainActivity extends Activity {
         return button;
     }
 
+    private static final int SETTINGS_STYLE_PRIMARY = 0;
+    private static final int SETTINGS_STYLE_SECONDARY = 1;
+    private static final int SETTINGS_STYLE_DESTRUCTIVE = 2;
+
+    // Pill-shaped action buttons for the Settings screen, styled with the
+    // same teal-accent/slate palette as the transport controls (see
+    // transportBackground()) instead of the stock gray Button chrome, so
+    // Settings feels like part of the same app rather than a bare form.
+    private Button settingsButton(String label, int style) {
+        return settingsButton(label, 0, style);
+    }
+
+    private Button settingsButton(String label, int iconResId, int style) {
+        Button button = button(label);
+        button.setBackground(settingsButtonBackground(style));
+        button.setTextColor(Color.rgb(245, 243, 237));
+        button.setPadding(dp(16), dp(12), dp(16), dp(12));
+        button.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        if (iconResId != 0) {
+            Drawable icon = getDrawable(iconResId);
+            if (icon != null) {
+                icon = icon.mutate();
+                icon.setTint(Color.rgb(245, 243, 237));
+                button.setCompoundDrawablesWithIntrinsicBounds(icon, null, null, null);
+                button.setCompoundDrawablePadding(dp(12));
+            }
+        }
+        return button;
+    }
+
+    private GradientDrawable settingsButtonBackground(int style) {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setCornerRadius(dp(14));
+        if (style == SETTINGS_STYLE_PRIMARY) {
+            drawable.setColor(Color.rgb(45, 112, 91));
+            drawable.setStroke(dp(1), Color.rgb(118, 222, 190));
+        } else if (style == SETTINGS_STYLE_DESTRUCTIVE) {
+            drawable.setColor(Color.rgb(107, 45, 42));
+            drawable.setStroke(dp(1), Color.rgb(214, 120, 110));
+        } else {
+            drawable.setColor(Color.rgb(35, 41, 46));
+            drawable.setStroke(dp(1), Color.rgb(82, 91, 99));
+        }
+        return drawable;
+    }
+
+    // Rounded card surface used to visually separate each Settings section
+    // from the plain background, instead of every section's controls
+    // floating directly on the screen with only a text label between them.
+    private LinearLayout settingsCard() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        GradientDrawable background = new GradientDrawable();
+        background.setCornerRadius(dp(18));
+        background.setColor(Color.rgb(24, 27, 30));
+        background.setStroke(dp(1), Color.rgb(41, 46, 51));
+        card.setBackground(background);
+        card.setPadding(dp(14), dp(14), dp(14), dp(16));
+        return card;
+    }
+
     private void applySystemBarInsets(View view) {
+        applySystemBarInsets(view, 0, 0, 0, 0);
+    }
+
+    // basePadding is the view's own desired padding — setPadding() alone
+    // isn't enough here because the returned listener below replaces
+    // whatever padding is currently set every time insets are dispatched
+    // (attach, rotation, ...), so any padding set separately would just get
+    // silently wiped out the first time that fires.
+    private void applySystemBarInsets(View view, int baseLeft, int baseTop, int baseRight, int baseBottom) {
         view.setOnApplyWindowInsetsListener((target, windowInsets) -> {
             int left;
             int top;
@@ -2470,7 +3930,7 @@ public class MainActivity extends Activity {
                     }
                 }
             }
-            target.setPadding(left, top, right, bottom);
+            target.setPadding(baseLeft + left, baseTop + top, baseRight + right, baseBottom + bottom);
             return windowInsets;
         });
         view.requestApplyInsets();
@@ -2487,13 +3947,42 @@ public class MainActivity extends Activity {
         return button;
     }
 
+
     private void updatePlayButtonIcon() {
-        if (playButton == null) {
+        if (playButton != null) {
+            playButton.setImageResource(playing ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play);
+            playButton.setContentDescription(playing ? "Pause" : "Play");
+            playButton.setBackground(transportBackground(true));
+        }
+        if (lyricsPlayButton != null) {
+            lyricsPlayButton.setImageResource(playing ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play);
+            lyricsPlayButton.setContentDescription(playing ? "Pause" : "Play");
+            lyricsPlayButton.setBackground(transportBackground(true));
+        }
+    }
+
+    private void updateLyricsSubtitle() {
+        if (lyricsSubtitleView == null) {
             return;
         }
-        playButton.setImageResource(playing ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play);
-        playButton.setContentDescription(playing ? "Pause" : "Play");
-        playButton.setBackground(transportBackground(true));
+        String subtitle = currentTrackName.isEmpty() ? ""
+                : currentTrackArtist.isEmpty() ? currentTrackName : currentTrackArtist + " – " + currentTrackName;
+        lyricsSubtitleView.setText(subtitle);
+    }
+
+    private void updateShuffleRepeatButtons() {
+        if (shuffleButton != null) {
+            shuffleButton.setBackground(transportBackground(shuffleEnabled));
+            shuffleButton.setContentDescription(shuffleEnabled ? "Shuffle: on" : "Shuffle: off");
+        }
+        if (repeatButton != null) {
+            repeatButton.setImageResource(
+                    repeatMode == SleepMusicService.REPEAT_ONE ? R.drawable.ic_repeat_one : R.drawable.ic_repeat);
+            repeatButton.setBackground(transportBackground(repeatMode != SleepMusicService.REPEAT_OFF));
+            repeatButton.setContentDescription(
+                    repeatMode == SleepMusicService.REPEAT_OFF ? "Repeat: off"
+                            : repeatMode == SleepMusicService.REPEAT_ONE ? "Repeat: one track" : "Repeat: all");
+        }
     }
 
     private GradientDrawable transportBackground(boolean primary) {
@@ -2525,12 +4014,58 @@ public class MainActivity extends Activity {
         return params;
     }
 
+    private LinearLayout.LayoutParams lyricsHeaderButtonParams(
+            boolean compactPhoneLandscape) {
+        int size = dp(compactPhoneLandscape ? 36 : 48);
+        LinearLayout.LayoutParams params =
+                new LinearLayout.LayoutParams(size, size);
+        params.leftMargin = dp(compactPhoneLandscape ? 2 : 5);
+        params.rightMargin = dp(compactPhoneLandscape ? 2 : 5);
+        return params;
+    }
+
+    private LinearLayout.LayoutParams lyricsTransportButtonParams(
+            boolean primary,
+            boolean compactPhoneLandscape) {
+        int sizeDp;
+        if (compactPhoneLandscape) {
+            sizeDp = primary ? 42 : 34;
+        } else {
+            sizeDp = primary ? 60 : 48;
+        }
+        LinearLayout.LayoutParams params =
+                new LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp));
+        int margin = dp(compactPhoneLandscape ? 2 : 5);
+        params.leftMargin = margin;
+        params.rightMargin = margin;
+        return params;
+    }
+
+    private LinearLayout.LayoutParams headerIconButtonParams() {
+        int size = dp(isCompactLandscapePhone() ? 40 : 48);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(size, size);
+        params.leftMargin = dp(5);
+        params.rightMargin = dp(5);
+        return params;
+    }
+
     private LinearLayout.LayoutParams inlineButton() {
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
         params.leftMargin = dp(5);
         params.rightMargin = dp(5);
+        return params;
+    }
+
+    // Right-margin-only spacing for a row of Settings pill buttons, so the
+    // first button stays flush with the single-button rows above/below it
+    // instead of picking up inlineButton()'s extra 5dp leading inset.
+    private LinearLayout.LayoutParams settingsInlineParams() {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.rightMargin = dp(10);
         return params;
     }
 
@@ -2543,11 +4078,37 @@ public class MainActivity extends Activity {
         return params;
     }
 
+    private int transportRegularSizePx;
+    private int transportPrimarySizePx;
+
+    // Computes a fixed button size that's guaranteed to fit the row (now 7
+    // buttons: shuffle, previous, play, next, stop, repeat, remove) in
+    // whatever width is actually available, instead of a hardcoded
+    // compact/non-compact size pair — a fixed pair tuned for the old
+    // 5-button row overflowed off-screen on phones once shuffle/repeat were
+    // added. Deliberately NOT weight-based stretch-to-fill: that fixed the
+    // phone overflow but made the row stretch into oversized ovals spanning
+    // the full width on tablets. Clamping to a max keeps buttons a normal,
+    // compact, centered cluster on wide screens instead.
+    private void computeTransportButtonSizes() {
+        boolean compact = isCompactLandscapePhone();
+        int screenWidthDp = getResources().getConfiguration().screenWidthDp;
+        // Compact landscape splits the screen into an art half and a
+        // visualizer half — mainButtons only gets the art half's width.
+        int availableDp = compact ? (screenWidthDp - 40) / 2 : screenWidthDp - 40;
+        int marginBudgetDp = 7 * 8;
+        int regularDp = (int) Math.floor((availableDp - marginBudgetDp - 14) / 7.0);
+        regularDp = Math.max(36, Math.min(58, regularDp));
+        int primaryDp = Math.max(50, Math.min(72, regularDp + 14));
+        transportRegularSizePx = dp(regularDp);
+        transportPrimarySizePx = dp(primaryDp);
+    }
+
     private LinearLayout.LayoutParams transportButtonParams(boolean primary) {
-        int size = primary ? dp(72) : dp(58);
+        int size = primary ? transportPrimarySizePx : transportRegularSizePx;
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(size, size);
-        params.leftMargin = dp(7);
-        params.rightMargin = dp(7);
+        params.leftMargin = dp(4);
+        params.rightMargin = dp(4);
         return params;
     }
 

@@ -51,6 +51,10 @@ class AudioEngine {
   [[nodiscard]] VisualizationEngine& visualizer() { return visualizer_; }
 
  private:
+  bool playInternal(const TrackEntry& track, std::int64_t positionMs,
+                    bool initiallyPaused, bool isRetry);
+  void scheduleStreamRetry(TrackEntry track, std::int64_t positionMs,
+                           std::uint64_t generationAtFailure);
   static gboolean busMessageThunk(GstBus* bus, GstMessage* message, gpointer data);
   gboolean onBusMessage(GstMessage* message);
   static void padAddedThunk(GstElement* source, GstPad* pad, gpointer data);
@@ -91,6 +95,7 @@ class AudioEngine {
   std::atomic<bool> paused_{false};
   std::atomic<bool> playing_{false};
   std::atomic<std::uint64_t> generation_{0};
+  std::atomic<int> streamRetryCount_{0};
   std::atomic<bool> clockStopping_{false};
   std::mutex clockWaitMutex_;
   std::condition_variable clockCv_;

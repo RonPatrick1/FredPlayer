@@ -80,6 +80,12 @@ void AudioEngine::configureServer(std::string baseUrl, std::string token) {
 
 bool AudioEngine::play(const TrackEntry& track, std::int64_t positionMs,
                        bool initiallyPaused) {
+  return playInternal(track, positionMs, initiallyPaused, false);
+}
+
+bool AudioEngine::playInternal(const TrackEntry& track, std::int64_t positionMs,
+                               bool initiallyPaused, bool isRetry) {
+  if (!isRetry) streamRetryCount_.store(0);
   stop();
   if (cacheFetchThread_.joinable()) cacheFetchThread_.join();
   const auto generation = generation_.fetch_add(1) + 1;
@@ -166,6 +172,28 @@ bool AudioEngine::play(const TrackEntry& track, std::int64_t positionMs,
   startServerVisualFetch(track, generation);
   if (callbacks_.onStateChanged) callbacks_.onStateChanged();
   return true;
+}
+
+// Waits briefly before retrying rather than hammering the server again
+// immediately, and bails out if the user has already skipped to
+// something else while the retry was pending (generationAtFailure won't
+// match the live generation_ anymore).
+void AudioEngine::scheduleStreamRetry(TrackEntry track, std::int64_t positionMs,
+                                      std::uint64_t generationAtFailure) {
+  struct RetryContext {
+    AudioEngine* engine;
+    TrackEntry track;
+    std::int64_t positionMs;
+    std::uint64_t generation;
+  };
+  auto* context = new RetryContext{this, std::move(track), positionMs, generationAtFailure};
+  g_timeout_add(500, [](gpointer data) -> gboolean {
+    std::unique_ptr<RetryContext> context(static_cast<RetryContext*>(data));
+    if (context->engine->generation_.load() == context->generation) {
+      context->engine->playInternal(context->track, context->positionMs, false, true);
+    }
+    return G_SOURCE_REMOVE;
+  }, context);
 }
 
 void AudioEngine::pause() {
@@ -313,6 +341,26 @@ gboolean AudioEngine::onBusMessage(GstMessage* message) {
     const std::string text = error ? error->message : "Unknown playback error";
     g_clear_error(&error); g_free(debug);
     playing_.store(false);
+
+    // Remote streaming errors are usually a transient hiccup talking to
+    // the Fred Server (a dropped connection, a slow/short first read)
+    // rather than a real playback problem — retry a few times with a
+    // fresh stream ticket before surfacing anything to the user, the
+    // same tolerance Android's system media stack already gives this for
+    // free.
+    bool remote = false;
+    TrackEntry track;
+    {
+      std::lock_guard lock(mutex_);
+      remote = currentTrack_.remote;
+      track = currentTrack_;
+    }
+    static constexpr int kMaxStreamRetries = 3;
+    if (remote && streamRetryCount_.fetch_add(1) < kMaxStreamRetries) {
+      scheduleStreamRetry(track, positionMs(), generation_.load());
+      return G_SOURCE_CONTINUE;
+    }
+    streamRetryCount_.store(0);
     if (callbacks_.onError) invokeOnMain([callback = callbacks_.onError, text] { callback(text); });
   } else if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_STATE_CHANGED &&
              GST_MESSAGE_SRC(message) == GST_OBJECT(pipeline_)) {

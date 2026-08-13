@@ -86,6 +86,20 @@ json playlistToJson(const std::vector<TrackEntry>& entries) {
 
 }  // namespace
 
+std::string repeatModeToString(RepeatMode mode) {
+  switch (mode) {
+    case RepeatMode::Off: return "off";
+    case RepeatMode::One: return "one";
+    case RepeatMode::All: default: return "all";
+  }
+}
+
+RepeatMode repeatModeFromString(const std::string& value) {
+  if (value == "off") return RepeatMode::Off;
+  if (value == "one") return RepeatMode::One;
+  return RepeatMode::All;
+}
+
 void LevelingSettings::normalize() {
   analysisSeconds = clamp(analysisSeconds, 0.0, 45.0);
   levelAttackMs = clamp(levelAttackMs, 1.0, 250.0);
@@ -241,10 +255,33 @@ AppState StateStore::load() const {
     state.window.monitorWidth = std::max(0, integer(value, "monitor_width", 0));
     state.window.monitorHeight = std::max(0, integer(value, "monitor_height", 0));
   }
+  if (const auto& value = root.value("lyrics_window_state", json::object()); value.is_object()) {
+    state.lyricsWindow.x = integer(value, "x", 80); state.lyricsWindow.y = integer(value, "y", 80);
+    state.lyricsWindow.width = std::max(320, integer(value, "width", 480));
+    state.lyricsWindow.height = std::max(360, integer(value, "height", 680));
+    state.lyricsWindow.maximized = value.value("maximized", false);
+    state.lyricsWindow.monitorX = integer(value, "monitor_x", 0);
+    state.lyricsWindow.monitorY = integer(value, "monitor_y", 0);
+    state.lyricsWindow.monitorWidth = std::max(0, integer(value, "monitor_width", 0));
+    state.lyricsWindow.monitorHeight = std::max(0, integer(value, "monitor_height", 0));
+  }
+  state.lyricsWindowOpen = root.value("lyrics_window_open", false);
+  if (const auto& value = root.value("queue_window_state", json::object()); value.is_object()) {
+    state.queueWindow.x = integer(value, "x", 80); state.queueWindow.y = integer(value, "y", 80);
+    state.queueWindow.width = std::max(320, integer(value, "width", 420));
+    state.queueWindow.height = std::max(360, integer(value, "height", 640));
+    state.queueWindow.maximized = value.value("maximized", false);
+    state.queueWindow.monitorX = integer(value, "monitor_x", 0);
+    state.queueWindow.monitorY = integer(value, "monitor_y", 0);
+    state.queueWindow.monitorWidth = std::max(0, integer(value, "monitor_width", 0));
+    state.queueWindow.monitorHeight = std::max(0, integer(value, "monitor_height", 0));
+  }
+  state.queueWindowOpen = root.value("queue_window_open", false);
   state.serverBaseUrl = text(root, "server_base_url");
   while (!state.serverBaseUrl.empty() && state.serverBaseUrl.back() == '/') state.serverBaseUrl.pop_back();
   state.serverToken = text(root, "server_token");
   state.shuffleEnabled = root.value("shuffle_enabled", true);
+  state.repeatMode = repeatModeFromString(text(root, "repeat_mode", "all"));
   state.selectedMicrophone = text(root, "selected_microphone");
   if (const auto& values = root.value("speaker_latencies", json::object()); values.is_object()) {
     for (auto item = values.begin(); item != values.end(); ++item) {
@@ -296,8 +333,27 @@ void StateStore::save(const AppState& source) const {
       {"maximized", state.window.maximized},
       {"monitor_x", state.window.monitorX}, {"monitor_y", state.window.monitorY},
       {"monitor_width", state.window.monitorWidth}, {"monitor_height", state.window.monitorHeight}}},
+    {"lyrics_window_state", {
+      {"x", state.lyricsWindow.x}, {"y", state.lyricsWindow.y},
+      {"width", state.lyricsWindow.width}, {"height", state.lyricsWindow.height},
+      {"maximized", state.lyricsWindow.maximized},
+      {"monitor_x", state.lyricsWindow.monitorX},
+      {"monitor_y", state.lyricsWindow.monitorY},
+      {"monitor_width", state.lyricsWindow.monitorWidth},
+      {"monitor_height", state.lyricsWindow.monitorHeight}}},
+    {"lyrics_window_open", state.lyricsWindowOpen},
+    {"queue_window_state", {
+      {"x", state.queueWindow.x}, {"y", state.queueWindow.y},
+      {"width", state.queueWindow.width}, {"height", state.queueWindow.height},
+      {"maximized", state.queueWindow.maximized},
+      {"monitor_x", state.queueWindow.monitorX},
+      {"monitor_y", state.queueWindow.monitorY},
+      {"monitor_width", state.queueWindow.monitorWidth},
+      {"monitor_height", state.queueWindow.monitorHeight}}},
+    {"queue_window_open", state.queueWindowOpen},
     {"server_base_url", state.serverBaseUrl}, {"server_token", state.serverToken},
-    {"shuffle_enabled", state.shuffleEnabled}, {"speaker_latencies", speakers},
+    {"shuffle_enabled", state.shuffleEnabled},
+    {"repeat_mode", repeatModeToString(state.repeatMode)}, {"speaker_latencies", speakers},
     {"selected_microphone", state.selectedMicrophone}
   };
   std::error_code error;

@@ -10,12 +10,18 @@ const express = require('express');
 const mm = require('music-metadata');
 const precomputeCache = require('./precompute-cache.js');
 const sharedPlaylists = require('./shared-playlists.js');
+const artwork = require('./artwork.js');
+const lyrics = require('./lyrics.js');
 const { issueStreamTicket, validStreamTicket } = require('./stream-tickets.js');
+const webAuth = require('./web-auth.js');
+const webLeveling = require('./web-leveling.js');
 
 const MUSIC_DIR = path.resolve(process.env.MUSIC_DIR || '');
 const PORT = parseInt(process.env.PORT || '8790', 10);
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.join(__dirname, 'data');
 const PROFILES_DIR = path.join(DATA_DIR, 'profiles');
 const VISUAL_DIR = path.join(DATA_DIR, 'visual');
 const ANDROID_VISUAL_DIR = path.join(DATA_DIR, 'android-visual');
@@ -23,12 +29,30 @@ const APPLE_VISUAL_DIR = path.join(DATA_DIR, 'apple-visual');
 const APPLE_VISUAL_VARIANT_DIR = path.join(DATA_DIR, 'apple-visual-variant');
 const LINUX_VISUAL_VARIANT_DIR = path.join(DATA_DIR, 'linux-visual-variant');
 const LINUX_VISUAL_USAGE_PATH = path.join(DATA_DIR, 'linux-visual-usage.json');
+const ARTWORK_DIR = path.join(DATA_DIR, 'artwork');
+// Small per-pass cap: MusicBrainz's usage policy asks for ~1 request/sec, and
+// the auto-precompute loop already retriggers every 15s while work remains,
+// so a big backlog just gets worked through incrementally across ticks
+// rather than one pass blocking everything else for minutes.
+const ARTWORK_PASS_LIMIT = 5;
+const ARTWORK_PASS_INTERVAL_MS = 5 * 60 * 1000;
 const PLAYLISTS_DIR = path.join(DATA_DIR, 'playlists');
 const LIAM_ASK_URL = process.env.LIAM_ASK_URL || 'http://127.0.0.1:8787/fredplayer-ask';
+const REVIEW_PROXY_PORT = parseInt(process.env.REVIEW_PROXY_PORT || '0', 10);
 // This hop is localhost-only (Node -> LiamAgent), not through nginx, so it
 // can afford real headroom for handle_fredplayer_ask's up-to-3 retry
 // attempts against a slow local model.
 const LIAM_ASK_TIMEOUT_MS = 550000;
+const WEB_ENABLED = process.env.WEB_ENABLED === '1';
+const WEB_USERNAME = process.env.WEB_USERNAME || '';
+const WEB_PASSWORD_HASH = process.env.WEB_PASSWORD_HASH || '';
+const WEB_SESSION_SECRET = process.env.WEB_SESSION_SECRET || '';
+const WEB_SESSION_VERSION = parseInt(process.env.WEB_SESSION_VERSION || '1', 10);
+const WEB_COOKIE_NAME = '__Secure-fredplayer_session';
+const WEB_COOKIE_PATH = process.env.WEB_COOKIE_PATH || '/fredplayer-media/web';
+const WEB_DIR = path.join(__dirname, 'web');
+const WEB_DIAGNOSTICS_PATH = path.join(DATA_DIR, 'web-diagnostics.jsonl');
+const WEB_AUDIO_STREAM_SCRIPT = path.join(__dirname, 'web-audio-stream.js');
 
 const AUDIO_EXTENSIONS = new Set([
   '.mp3', '.flac', '.m4a', '.wav', '.ogg', '.aac', '.wma', '.opus', '.alac',
@@ -68,6 +92,497 @@ if (!AUTH_TOKEN) {
 }
 
 const app = express();
+let libraryPromise;
+const webDurationCache = new Map();
+const fluxaGrants = new Map();
+const fluxaLaunchTickets = new Map();
+
+function issueFluxaGrant() {
+  const grant = crypto.randomBytes(32).toString('base64url');
+  const expiresAt = Date.now() + 2 * 60 * 1000;
+  fluxaGrants.set(grant, expiresAt);
+  for (const [candidate, expiry] of fluxaGrants) {
+    if (expiry <= Date.now()) fluxaGrants.delete(candidate);
+  }
+  return grant;
+}
+
+function issueFluxaLaunchTicket(trackPath, returnUrl) {
+  const ticket = crypto.randomBytes(32).toString('base64url');
+  fluxaLaunchTickets.set(ticket, {
+    trackPath,
+    returnUrl,
+    expiresAt: Date.now() + 2 * 60 * 1000,
+  });
+  return ticket;
+}
+
+function probeAudioDuration(filePath) {
+  const cached = webDurationCache.get(filePath);
+  if (cached) return cached;
+  const pending = new Promise((resolve, reject) => {
+    const probe = spawn('ffprobe', [
+      '-v', 'error', '-show_entries', 'format=duration',
+      '-of', 'default=noprint_wrappers=1:nokey=1', filePath,
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    let errorOutput = '';
+    probe.stdout.setEncoding('utf8');
+    probe.stderr.setEncoding('utf8');
+    probe.stdout.on('data', (chunk) => { output += chunk; });
+    probe.stderr.on('data', (chunk) => { errorOutput += chunk; });
+    probe.on('error', reject);
+    probe.on('close', (code) => {
+      const duration = Number(output.trim());
+      if (code === 0 && Number.isFinite(duration) && duration > 0) resolve(duration);
+      else reject(new Error(errorOutput.trim() || 'Could not determine track duration'));
+    });
+  }).catch((error) => {
+    webDurationCache.delete(filePath);
+    throw error;
+  });
+  webDurationCache.set(filePath, pending);
+  return pending;
+}
+
+function stopWebAudioProcess(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const signalGroup = (signal) => {
+    try { process.kill(-child.pid, signal); } catch (_error) {}
+  };
+  signalGroup('SIGTERM');
+  const forceTimer = setTimeout(() => signalGroup('SIGKILL'), 1000);
+  forceTimer.unref();
+  child.once('close', () => clearTimeout(forceTimer));
+}
+
+// Keep store-review data and credentials in a separate local process while
+// exposing it through the existing HTTPS FredPlayer route. This middleware
+// intentionally runs before the personal-server authentication check; the
+// review process performs its own token validation using a different token.
+if (Number.isInteger(REVIEW_PROXY_PORT)
+    && REVIEW_PROXY_PORT > 0
+    && REVIEW_PROXY_PORT <= 65_535
+    && REVIEW_PROXY_PORT !== PORT) {
+  app.use('/review', (req, res) => {
+    const headers = { ...req.headers, host: `127.0.0.1:${REVIEW_PROXY_PORT}` };
+    const upstreamRequest = http.request({
+      hostname: '127.0.0.1',
+      port: REVIEW_PROXY_PORT,
+      method: req.method,
+      path: req.url || '/',
+      headers,
+    }, (upstreamResponse) => {
+      res.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
+      upstreamResponse.pipe(res);
+    });
+    upstreamRequest.on('error', () => {
+      if (!res.headersSent) {
+        res.status(502).json({ error: 'review server unavailable' });
+      } else {
+        res.destroy();
+      }
+    });
+    req.pipe(upstreamRequest);
+  });
+}
+
+const webLoginAttempts = new Map();
+
+function webClientAddress(req) {
+  const forwarded = (req.get('x-forwarded-for') || '').split(',').map((value) => value.trim());
+  return forwarded.filter(Boolean).at(-1) || req.socket.remoteAddress || 'unknown';
+}
+
+function sameOriginWebRequest(req) {
+  const origin = req.get('origin');
+  if (!origin) return true;
+  try {
+    const protocol = req.get('x-forwarded-proto') || req.protocol;
+    return new URL(origin).origin === `${protocol}://${req.get('host')}`;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function webSession(req) {
+  const value = webAuth.cookieValue(req.get('cookie'), WEB_COOKIE_NAME);
+  return webAuth.verifySession(value, WEB_SESSION_SECRET, { version: WEB_SESSION_VERSION });
+}
+
+function requireWebSession(req, res, next) {
+  const session = webSession(req);
+  if (!session || session.sub !== WEB_USERNAME) {
+    res.status(401).json({ error: 'login required' });
+    return;
+  }
+  req.webSession = session;
+  next();
+}
+
+function setWebSecurityHeaders(_req, res, next) {
+  res.set({
+    'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'self' http://192.168.0.178:8097; form-action 'self'",
+    'Permissions-Policy': 'camera=(), geolocation=(), microphone=()',
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
+  });
+  next();
+}
+
+if (WEB_ENABLED) {
+  if (!WEB_USERNAME || !WEB_PASSWORD_HASH || WEB_SESSION_SECRET.length < 32) {
+    console.error('WEB_ENABLED requires WEB_USERNAME, WEB_PASSWORD_HASH, and a 32+ character WEB_SESSION_SECRET');
+    process.exit(1);
+  }
+
+  app.use('/web', setWebSecurityHeaders);
+  app.get(['/web', '/web/'], (req, res) => {
+    if (!req.path.endsWith('/')) {
+      // Keep this redirect relative so it also preserves a reverse proxy prefix
+      // such as /fredplayer-media. Without the trailing slash, browsers resolve
+      // ./assets outside the Web UI and the application cannot start.
+      res.redirect(308, 'web/');
+      return;
+    }
+    res.set('Cache-Control', 'no-store').sendFile(path.join(WEB_DIR, 'index.html'));
+  });
+  app.use('/web/assets', express.static(path.join(WEB_DIR, 'assets'), {
+    etag: true,
+    fallthrough: false,
+    maxAge: '1h',
+  }));
+  app.get('/web/manifest.webmanifest', (_req, res) => {
+    res.type('application/manifest+json').sendFile(path.join(WEB_DIR, 'manifest.webmanifest'));
+  });
+  app.get('/web/service-worker.js', (_req, res) => {
+    res.set('Cache-Control', 'no-cache').type('application/javascript')
+      .sendFile(path.join(WEB_DIR, 'service-worker.js'));
+  });
+
+  app.get('/web/auth/session', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const session = webSession(req);
+    res.json({
+      authenticated: Boolean(session && session.sub === WEB_USERNAME),
+      username: WEB_USERNAME,
+    });
+  });
+
+  app.post('/web/auth/login', express.json({ limit: '4kb' }), async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    if (!sameOriginWebRequest(req)) {
+      res.status(403).json({ error: 'invalid request origin' });
+      return;
+    }
+    const address = webClientAddress(req);
+    const now = Date.now();
+    const previous = webLoginAttempts.get(address);
+    const attempt = previous && previous.resetAt > now
+      ? previous
+      : { count: 0, resetAt: now + 15 * 60 * 1000 };
+    if (attempt.count >= 5) {
+      res.set('Retry-After', String(Math.max(1, Math.ceil((attempt.resetAt - now) / 1000))));
+      res.status(429).json({ error: 'too many login attempts; try again later' });
+      return;
+    }
+    const username = typeof req.body?.username === 'string' ? req.body.username : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    const passwordMatches = await webAuth.verifyPassword(password, WEB_PASSWORD_HASH);
+    if (username !== WEB_USERNAME || !passwordMatches) {
+      attempt.count += 1;
+      webLoginAttempts.set(address, attempt);
+      res.status(401).json({ error: 'incorrect username or password' });
+      return;
+    }
+    webLoginAttempts.delete(address);
+    const remembered = req.body?.remember !== false;
+    const sessionSeconds = remembered
+      ? webAuth.REMEMBERED_DEVICE_SECONDS : webAuth.DEFAULT_SESSION_SECONDS;
+    const session = webAuth.createSession(WEB_USERNAME, WEB_SESSION_SECRET, {
+      version: WEB_SESSION_VERSION,
+      ttlSeconds: sessionSeconds,
+    });
+    const maxAge = remembered ? `; Max-Age=${sessionSeconds}` : '';
+    res.set('Set-Cookie', `${WEB_COOKIE_NAME}=${encodeURIComponent(session)}${maxAge}; Path=${WEB_COOKIE_PATH}; Secure; HttpOnly; SameSite=Lax`);
+    const deviceToken = remembered
+      ? webAuth.createSession(WEB_USERNAME, WEB_SESSION_SECRET, {
+        version: WEB_SESSION_VERSION,
+        ttlSeconds: webAuth.REMEMBERED_DEVICE_SECONDS,
+      })
+      : null;
+    res.json({ authenticated: true, deviceToken });
+  });
+
+  app.post('/web/auth/device', express.json({ limit: '8kb' }), (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    if (!sameOriginWebRequest(req)) {
+      res.status(403).json({ error: 'invalid request origin' });
+      return;
+    }
+    const token = typeof req.body?.token === 'string' ? req.body.token : '';
+    const device = webAuth.verifySession(token, WEB_SESSION_SECRET, { version: WEB_SESSION_VERSION });
+    if (!device || device.sub !== WEB_USERNAME) {
+      res.status(401).json({ error: 'saved TV sign-in is no longer valid' });
+      return;
+    }
+    const session = webAuth.createSession(WEB_USERNAME, WEB_SESSION_SECRET, {
+      version: WEB_SESSION_VERSION,
+      ttlSeconds: webAuth.REMEMBERED_DEVICE_SECONDS,
+    });
+    res.set('Set-Cookie', `${WEB_COOKIE_NAME}=${encodeURIComponent(session)}; Max-Age=${webAuth.REMEMBERED_DEVICE_SECONDS}; Path=${WEB_COOKIE_PATH}; Secure; HttpOnly; SameSite=Lax`);
+    res.json({ authenticated: true });
+  });
+
+  app.post('/web/auth/device/enroll', requireWebSession, (_req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const deviceToken = webAuth.createSession(WEB_USERNAME, WEB_SESSION_SECRET, {
+      version: WEB_SESSION_VERSION,
+      ttlSeconds: webAuth.REMEMBERED_DEVICE_SECONDS,
+    });
+    res.json({ deviceToken });
+  });
+
+  app.post('/web/auth/fluxa-grant', requireWebSession, (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    if (!sameOriginWebRequest(req)) {
+      res.status(403).json({ error: 'invalid request origin' });
+      return;
+    }
+    res.json({ grant: issueFluxaGrant(), expiresIn: 120 });
+  });
+
+  app.post('/web/auth/logout', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    if (!sameOriginWebRequest(req)) {
+      res.status(403).json({ error: 'invalid request origin' });
+      return;
+    }
+    res.set('Set-Cookie', `${WEB_COOKIE_NAME}=; Max-Age=0; Path=${WEB_COOKIE_PATH}; Secure; HttpOnly; SameSite=Lax`);
+    res.status(204).end();
+  });
+
+  app.get('/web/auth/fluxa-launch/:ticket', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const ticket = String(req.params.ticket || '');
+    const launch = fluxaLaunchTickets.get(ticket);
+    fluxaLaunchTickets.delete(ticket);
+    if (!launch || launch.expiresAt <= Date.now()) {
+      res.status(401).send('This Fluxa music launch has expired. Return to Fluxa and select the track again.');
+      return;
+    }
+    const session = webAuth.createSession(WEB_USERNAME, WEB_SESSION_SECRET, {
+      version: WEB_SESSION_VERSION,
+      ttlSeconds: webAuth.REMEMBERED_DEVICE_SECONDS,
+    });
+    res.set('Set-Cookie', `${WEB_COOKIE_NAME}=${encodeURIComponent(session)}; Max-Age=${webAuth.REMEMBERED_DEVICE_SECONDS}; Path=${WEB_COOKIE_PATH}; Secure; HttpOnly; SameSite=Lax`);
+    const query = new URLSearchParams({
+      fluxa: '1',
+      platform: 'tizen',
+      play: launch.trackPath,
+      return: launch.returnUrl,
+    });
+    res.redirect(303, `${WEB_COOKIE_PATH}/?${query}`);
+  });
+
+  app.get('/web/api/library', requireWebSession, async (_req, res) => {
+    res.json(await libraryPromise);
+  });
+
+  app.get('/web/api/playlists', requireWebSession, async (_req, res) => {
+    res.json(await sharedPlaylists.listSharedPlaylists(PLAYLISTS_DIR));
+  });
+
+  app.get('/web/api/playlists/:name', requireWebSession, async (req, res) => {
+    const playlist = await sharedPlaylists.readSharedPlaylist(PLAYLISTS_DIR, req.params.name);
+    if (!playlist) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json(playlist);
+  });
+
+  app.post('/web/api/stream-ticket', requireWebSession, express.json({ limit: '8kb' }), async (req, res) => {
+    const serverPath = req.body?.path;
+    if (typeof serverPath !== 'string' || !serverPath || serverPath.startsWith('/')) {
+      res.status(400).json({ error: 'path is required' });
+      return;
+    }
+    const filePath = resolveWithin(MUSIC_DIR, serverPath, true);
+    try {
+      const stats = filePath && await fsp.stat(filePath);
+      if (!stats?.isFile() || !AUDIO_EXTENSIONS.has(path.extname(filePath).toLowerCase())) {
+        res.status(404).json({ error: 'not found' });
+        return;
+      }
+      res.json(issueStreamTicket(serverPath, AUTH_TOKEN));
+    } catch (_error) {
+      res.status(404).json({ error: 'not found' });
+    }
+  });
+
+  app.get('/web/api/gain/*', requireWebSession, async (req, res) => {
+    const filePath = resolveWithin(PROFILES_DIR, `${req.params[0]}.json`, true);
+    try {
+      const profile = JSON.parse(await fsp.readFile(filePath, 'utf8'));
+      res.set('Cache-Control', 'private, no-store');
+      res.json({
+        gain: webLeveling.gainForProfile(profile),
+        rms: Number.isFinite(profile.rms) ? profile.rms : null,
+        peak: Number.isFinite(profile.peak) ? profile.peak : null,
+      });
+    } catch (_error) {
+      res.status(404).json({ error: 'not found' });
+    }
+  });
+
+  app.get('/web/api/audio-info/*', requireWebSession, async (req, res) => {
+    const filePath = resolveWithin(MUSIC_DIR, req.params[0], true);
+    try {
+      const stats = filePath && await fsp.stat(filePath);
+      if (!stats?.isFile() || !AUDIO_EXTENSIONS.has(path.extname(filePath).toLowerCase())) {
+        res.status(404).json({ error: 'not found' });
+        return;
+      }
+      const duration = await probeAudioDuration(filePath);
+      res.set('Cache-Control', 'private, max-age=21600').json({ duration });
+    } catch (_error) {
+      res.status(404).json({ error: 'duration not available' });
+    }
+  });
+
+  app.get('/web/api/audio/*', requireWebSession, async (req, res) => {
+    const serverPath = req.params[0];
+    const filePath = resolveWithin(MUSIC_DIR, serverPath, true);
+    const start = Math.max(0, Number(req.query.start) || 0);
+    const format = req.query.format === 'mp3' ? 'mp3' : 'flac';
+    const leveling = req.query.leveling !== '0';
+    try {
+      const stats = filePath && await fsp.stat(filePath);
+      if (!stats?.isFile() || !AUDIO_EXTENSIONS.has(path.extname(filePath).toLowerCase())) {
+        res.status(404).json({ error: 'not found' });
+        return;
+      }
+
+      let profile = null;
+      if (leveling) {
+        const profilePath = resolveWithin(PROFILES_DIR, `${serverPath}.json`, true);
+        try { profile = JSON.parse(await fsp.readFile(profilePath, 'utf8')); } catch (_error) {}
+      }
+      const args = [
+        WEB_AUDIO_STREAM_SCRIPT,
+        '--source', filePath,
+        '--start', start.toFixed(3),
+        '--format', format,
+        '--leveling', leveling ? '1' : '0',
+      ];
+      if (Number.isFinite(profile?.rms) && Number.isFinite(profile?.peak)) {
+        args.push('--rms', String(profile.rms), '--peak', String(profile.peak));
+      }
+
+      // Give each Web stream its own process group so disconnecting a browser
+      // can reliably stop the worker and both ffmpeg children together.
+      const child = spawn(process.execPath, args, {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let disconnected = false;
+      let errorOutput = '';
+      res.set({
+        'Accept-Ranges': 'none',
+        'Cache-Control': 'private, no-store',
+        'Content-Type': format === 'mp3' ? 'audio/mpeg' : 'audio/flac',
+        'X-Accel-Buffering': 'no',
+      });
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk) => { errorOutput = (errorOutput + chunk).slice(-4096); });
+      child.stdout.pipe(res);
+      child.on('error', (error) => {
+        if (!res.headersSent) res.status(500).json({ error: 'Could not start Web audio processor' });
+        else res.destroy(error);
+      });
+      child.on('close', (code, signal) => {
+        if (!disconnected && code !== 0 && signal !== 'SIGTERM') {
+          console.error(`Web audio processor failed for ${serverPath}: ${errorOutput.trim() || `exit ${code}`}`);
+          if (!res.headersSent) res.status(500).json({ error: 'Web audio processing failed' });
+          else if (!res.writableEnded) res.destroy();
+        }
+      });
+      res.on('close', () => {
+        disconnected = true;
+        stopWebAudioProcess(child);
+      });
+    } catch (_error) {
+      res.status(404).json({ error: 'not found' });
+    }
+  });
+
+  app.get('/web/api/visual/*', requireWebSession, (req, res) => {
+    const variant = precomputeCache.androidVariantKey(ANDROID_60_SETTINGS);
+    const variantDirectory = path.join(ANDROID_VISUAL_DIR, variant);
+    const filePath = resolveWithin(variantDirectory, `${req.params[0]}.fvz`, true);
+    if (!filePath) {
+      res.status(400).json({ error: 'invalid path' });
+      return;
+    }
+    const header = precomputeCache.readAndroidHeader(filePath);
+    if (!header
+        || header.fps !== ANDROID_60_SETTINGS.fps
+        || header.waveformPoints !== 96
+        || header.bars !== ANDROID_60_SETTINGS.bars) {
+      res.status(404).json({ error: 'visualization not available' });
+      return;
+    }
+    res.set('Cache-Control', 'private, max-age=21600');
+    res.type('application/octet-stream').sendFile(filePath, (error) => {
+      if (error && !res.headersSent) res.status(404).end();
+    });
+  });
+
+  app.get('/web/api/lyrics/*', requireWebSession, async (req, res) => {
+    const sidecarRelativePath = req.params[0].replace(/\.[^./\\]+$/, '') + '.lyrics.txt';
+    const filePath = resolveWithin(MUSIC_DIR, sidecarRelativePath, true);
+    if (!filePath) {
+      res.status(400).json({ error: 'invalid path' });
+      return;
+    }
+    try {
+      const raw = await fsp.readFile(filePath, 'utf8');
+      res.json(lyrics.parseLyricsSidecar(raw));
+    } catch (_error) {
+      res.status(404).json({ error: 'lyrics not available' });
+    }
+  });
+
+  app.get('/web/api/artwork/*', requireWebSession, async (req, res) => {
+    const library = await libraryPromise;
+    const track = library.find((entry) => entry.path === req.params[0]);
+    if (!track?.artist || !track?.album) {
+      res.status(404).end();
+      return;
+    }
+    const filePath = path.join(ARTWORK_DIR, `${artwork.albumCacheKey(track.artist, track.album)}.jpg`);
+    res.type('image/jpeg').sendFile(filePath, (error) => {
+      if (error && !res.headersSent) res.status(404).end();
+    });
+  });
+
+  app.post('/web/api/diagnostics', requireWebSession, express.json({ limit: '32kb' }), async (req, res) => {
+    const report = req.body;
+    if (!report || typeof report !== 'object' || Array.isArray(report)) {
+      res.status(400).json({ error: 'diagnostic report is required' });
+      return;
+    }
+    const entry = {
+      receivedAt: new Date().toISOString(),
+      userAgent: String(req.get('user-agent') || '').slice(0, 512),
+      report,
+    };
+    await fsp.mkdir(path.dirname(WEB_DIAGNOSTICS_PATH), { recursive: true });
+    await fsp.appendFile(WEB_DIAGNOSTICS_PATH, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+    res.status(204).end();
+  });
+}
 
 function checkToken(req) {
   const header = req.get('authorization') || '';
@@ -89,6 +604,34 @@ app.use((req, res, next) => {
     return;
   }
   next();
+});
+
+app.post('/api/fluxa-grant/:grant', (req, res) => {
+  const grant = String(req.params.grant || '');
+  const expiresAt = fluxaGrants.get(grant);
+  fluxaGrants.delete(grant);
+  if (!expiresAt || expiresAt <= Date.now()) {
+    res.status(401).json({ error: 'invalid or expired grant' });
+    return;
+  }
+  res.set('Cache-Control', 'no-store').json({ authenticated: true });
+});
+
+app.post('/api/fluxa-launch-ticket', express.json({ limit: '16kb' }), async (req, res) => {
+  const trackPath = typeof req.body?.trackPath === 'string' ? req.body.trackPath : '';
+  const returnUrl = typeof req.body?.returnUrl === 'string' ? req.body.returnUrl : '';
+  let destination;
+  try { destination = new URL(returnUrl); } catch (_error) {}
+  const library = await libraryPromise;
+  if (!trackPath || trackPath.length > 4096 || !library.some((track) => track.path === trackPath)
+      || !destination || !['http:', 'https:'].includes(destination.protocol)) {
+    res.status(400).json({ error: 'invalid Fluxa launch request' });
+    return;
+  }
+  res.set('Cache-Control', 'no-store').json({
+    ticket: issueFluxaLaunchTicket(trackPath, destination.href),
+    expiresIn: 120,
+  });
 });
 
 // Resolves a request-supplied relative path against a base directory,
@@ -153,7 +696,7 @@ async function buildLibraryIndex() {
   return tracks;
 }
 
-let libraryPromise = buildLibraryIndex();
+libraryPromise = buildLibraryIndex();
 
 app.get('/api/library', async (req, res) => {
   try {
@@ -398,8 +941,48 @@ async function runAutoPrecomputePass() {
       console.error(`Auto-precompute (${pass.label}) failed: ${error.message}`);
     }
   }
+  try {
+    didWork = await runArtworkPass() || didWork;
+  } catch (error) {
+    console.error(`Auto-precompute (artwork) failed: ${error.message}`);
+  }
   return didWork;
 }
+
+// Album art, unlike the visual/leveling passes above, is plain throttled
+// HTTP (MusicBrainz + Cover Art Archive) rather than CPU-heavy decode work,
+// so it runs directly in this process instead of a spawned child — nothing
+// here touches the event loop for long between awaits.
+async function runArtworkPass() {
+  const nowMs = Date.now();
+  if (runArtworkPass.nextRunAt && runArtworkPass.nextRunAt > nowMs) return false;
+  runArtworkPass.nextRunAt = nowMs + ARTWORK_PASS_INTERVAL_MS;
+  const library = await libraryPromise;
+  const seen = new Set();
+  const newAlbums = [];
+  const retries = [];
+  for (const track of library) {
+    if (!track.artist || !track.album) continue;
+    const key = artwork.albumCacheKey(track.artist, track.album);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const status = artwork.artworkAttemptStatus(ARTWORK_DIR, track.artist, track.album, nowMs);
+    if (!status.due) continue;
+    (status.isNew ? newAlbums : retries).push({ track, status });
+  }
+  // Newly added albums do not sit behind the historical retry backlog.
+  const pending = [...newAlbums, ...retries].slice(0, ARTWORK_PASS_LIMIT);
+  for (const { track, status } of pending) {
+    const variation = status.candidate === track.album ? '' : ` as "${status.candidate}"`;
+    console.log(`Fetching album art (${status.candidateIndex + 1}/${status.candidateCount}): ${track.artist} - ${track.album}${variation}`);
+    const result = await artwork.ensureAlbumArt(ARTWORK_DIR, track.artist, track.album);
+    if (!result) console.log(`  candidate did not produce art: ${status.candidate}`);
+  }
+  // Artwork has its own five-minute budget. Do not accelerate the global
+  // precompute loop to 15 seconds merely because an artwork attempt ran.
+  return false;
+}
+runArtworkPass.nextRunAt = 0;
 
 libraryPromise.then(() => triggerAutoPrecompute());
 
@@ -539,6 +1122,46 @@ app.get('/api/profile/*', async (req, res) => {
   try {
     const contents = await fsp.readFile(filePath, 'utf8');
     res.type('application/json').send(contents);
+  } catch (err) {
+    res.status(404).json({ error: 'not found' });
+  }
+});
+
+// Keyed by track path (like /api/profile/*), but the actual cached file is
+// shared across every track in the same album — this just looks up which
+// (artist, album) the requested track belongs to and serves whatever's
+// cached for that pair. Never fetches on-demand here; that only happens in
+// the background precompute pass, so this stays a fast, simple read.
+app.get('/api/artwork/*', async (req, res) => {
+  const library = await libraryPromise;
+  const track = library.find((t) => t.path === req.params[0]);
+  if (!track || !track.artist || !track.album) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  const key = artwork.albumCacheKey(track.artist, track.album);
+  const filePath = path.join(ARTWORK_DIR, `${key}.jpg`);
+  try {
+    const contents = await fsp.readFile(filePath);
+    res.type('image/jpeg').send(contents);
+  } catch (err) {
+    res.status(404).json({ error: 'not found' });
+  }
+});
+
+// The sidecar sits next to the audio file with the same base name, e.g.
+// "Artist/Album/01 Song.flac" -> "Artist/Album/01 Song.lyrics.txt".
+app.get('/api/lyrics/*', async (req, res) => {
+  const trackPath = req.params[0];
+  const sidecarRelPath = trackPath.replace(/\.[^./\\]+$/, '') + '.lyrics.txt';
+  const filePath = resolveWithin(MUSIC_DIR, sidecarRelPath, true);
+  if (!filePath) {
+    res.status(400).json({ error: 'invalid path' });
+    return;
+  }
+  try {
+    const raw = await fsp.readFile(filePath, 'utf8');
+    res.json(lyrics.parseLyricsSidecar(raw));
   } catch (err) {
     res.status(404).json({ error: 'not found' });
   }
@@ -776,7 +1399,7 @@ function appleHeaderMatchesSettings(header, settings) {
     && header.waveformMs === settings.waveformMs
     && header.fftSize === settings.fftSize
     && header.bars === settings.bars
-    && header.logarithmic === settings.logarithmic;
+    && Boolean(header.flags & 1) === settings.logarithmic;
 }
 
 app.get('/api/apple-visual-variant/:variant/*', async (req, res) => {

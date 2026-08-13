@@ -21,15 +21,18 @@ class ServerClient {
   ServerClient(std::string baseUrl = {}, std::string token = {});
   void configure(std::string baseUrl, std::string token);
   [[nodiscard]] std::vector<TrackEntry> library() const;
+  [[nodiscard]] int rescanLibrary() const;
   [[nodiscard]] std::vector<std::string> sharedPlaylists() const;
   [[nodiscard]] std::vector<std::string> playlistTracks(const std::string& name) const;
   void sharePlaylist(const std::string& name,
                      const std::vector<TrackEntry>& tracks) const;
   [[nodiscard]] std::optional<TrackProfile> profile(const TrackEntry& track) const;
+  [[nodiscard]] HttpResult artwork(const TrackEntry& track) const;
+  [[nodiscard]] std::optional<std::vector<LyricsPhrase>> lyrics(const TrackEntry& track) const;
   [[nodiscard]] HttpResult linuxVisual(const TrackEntry& track,
                                        const VisualizationSettings& settings) const;
-  [[nodiscard]] std::string askLiam(const std::string& deviceId,
-                                    const std::string& message) const;
+  [[nodiscard]] AskLiamResult askLiam(const std::string& deviceId,
+                                      const std::string& message) const;
   [[nodiscard]] std::string streamUrl(const std::string& serverPath) const;
   [[nodiscard]] std::optional<std::string> ticketedStreamUrl(
       const TrackEntry& track) const;

@@ -44,6 +44,30 @@ struct TrackProfile {
   double peak{0.0};
 };
 
+struct AskLiamResult {
+  std::string reply;
+  bool hasPlaylist{false};
+  std::string playlistName;
+  std::vector<std::string> trackPaths;
+};
+
+struct LyricsWord {
+  double timeSeconds{0.0};
+  std::string text;
+};
+
+struct LyricsPhrase {
+  double startSeconds{0.0};
+  double endSeconds{0.0};
+  std::string text;
+  std::vector<LyricsWord> words;
+};
+
+enum class RepeatMode { Off, All, One };
+
+std::string repeatModeToString(RepeatMode mode);
+RepeatMode repeatModeFromString(const std::string& value);
+
 struct TrackEntry {
   std::string path;
   std::string sourceFolder;
@@ -84,9 +108,14 @@ struct AppState {
   LevelingSettings leveling;
   VisualizationSettings visualization;
   WindowState window;
+  WindowState lyricsWindow{80, 80, 480, 680};
+  bool lyricsWindowOpen{false};
+  WindowState queueWindow{80, 80, 420, 640};
+  bool queueWindowOpen{false};
   std::string serverBaseUrl;
   std::string serverToken;
   bool shuffleEnabled{true};
+  RepeatMode repeatMode{RepeatMode::All};
   std::map<std::string, SpeakerLatency> speakerLatencies;
   std::string selectedMicrophone;
 };

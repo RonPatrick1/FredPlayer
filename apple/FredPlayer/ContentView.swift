@@ -3,18 +3,34 @@ import UniformTypeIdentifiers
 import OSLog
 
 struct ContentView: View {
+    private enum PresentedSheet: String, Identifiable {
+        case copiedLibrary
+        case serverSettings
+        case serverLibrary
+        case askLiam
+        case playlistManager
+        case sharedPlaylists
+
+        var id: String { rawValue }
+
+        var requiresServer: Bool {
+            switch self {
+            case .serverLibrary, .askLiam, .sharedPlaylists:
+                true
+            case .copiedLibrary, .serverSettings, .playlistManager:
+                false
+            }
+        }
+    }
+
     @EnvironmentObject private var player: PlayerController
     @State private var isImporterPresented = false
     @State private var isFolderImporterPresented = false
     @State private var isScanningFolder = false
     @State private var isMusicSourcePresented = false
-    @State private var isCopiedLibraryPresented = false
     @State private var isClearConfirmationPresented = false
-    @State private var isServerSettingsPresented = false
-    @State private var isServerLibraryPresented = false
-    @State private var isAskLiamPresented = false
-    @State private var isPlaylistManagerPresented = false
-    @State private var isSharedPlaylistsPresented = false
+    @State private var presentedSheet: PresentedSheet?
+    @State private var pendingServerSheet: PresentedSheet?
     private let logger = Logger(subsystem: "com.ronpatrick.FredPlayer", category: "Import")
 
     var body: some View {
@@ -27,30 +43,15 @@ struct ContentView: View {
                 PlayerPanel()
                     .environmentObject(player)
             }
-            .sheet(isPresented: $isCopiedLibraryPresented) {
-                CopiedMusicPicker()
+            .sheet(item: $presentedSheet, onDismiss: continuePendingServerDestination) { sheet in
+                sheetContent(for: sheet)
                     .environmentObject(player)
-            }
-            .sheet(isPresented: $isServerSettingsPresented) {
-                ServerSettingsView().environmentObject(player)
-            }
-            .sheet(isPresented: $isServerLibraryPresented) {
-                ServerLibraryPicker().environmentObject(player)
-            }
-            .sheet(isPresented: $isAskLiamPresented) {
-                AskLiamView().environmentObject(player)
-            }
-            .sheet(isPresented: $isPlaylistManagerPresented) {
-                PlaylistManagerView().environmentObject(player)
-            }
-            .sheet(isPresented: $isSharedPlaylistsPresented) {
-                SharedPlaylistsView().environmentObject(player)
             }
             .navigationTitle("FredPlayer")
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
-                        isPlaylistManagerPresented = true
+                        present(.playlistManager)
                     } label: {
                         Label(player.playlist.activePlaylistName, systemImage: "music.note.list")
                     }
@@ -58,20 +59,17 @@ struct ContentView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Button("Server Settings…", systemImage: "server.rack") {
-                            isServerSettingsPresented = true
+                            present(.serverSettings)
                         }
                         Button("Browse Server Library…", systemImage: "music.note.house") {
-                            isServerLibraryPresented = true
+                            present(.serverLibrary)
                         }
-                        .disabled(player.serverClient == nil)
                         Button("Shared Playlists…", systemImage: "person.2") {
-                            isSharedPlaylistsPresented = true
+                            present(.sharedPlaylists)
                         }
-                        .disabled(player.serverClient == nil)
                         Button("Ask Liam…", systemImage: "bubble.left.and.text.bubble.right") {
-                            isAskLiamPresented = true
+                            present(.askLiam)
                         }
-                        .disabled(player.serverClient == nil)
                         Divider()
                         Link("Privacy Policy", destination: URL(string: "https://patrick-lamphier.com/fredplayer-privacy")!)
                         Link("Support", destination: URL(string: "https://patrick-lamphier.com/fredplayer-support")!)
@@ -103,7 +101,7 @@ struct ContentView: View {
             ) {
                 Button("FredPlayer Library", systemImage: "internaldrive") {
                     player.playlist.scanCopiedMusic()
-                    isCopiedLibraryPresented = true
+                    present(.copiedLibrary)
                 }
                 Button("Choose from Files", systemImage: "folder") {
                     isImporterPresented = true
@@ -112,9 +110,8 @@ struct ContentView: View {
                     isFolderImporterPresented = true
                 }
                 Button("Fred Server", systemImage: "server.rack") {
-                    isServerLibraryPresented = true
+                    present(.serverLibrary)
                 }
-                .disabled(player.serverClient == nil)
                 Button("Cancel", role: .cancel) {}
             }
             .overlay {
@@ -174,6 +171,47 @@ struct ContentView: View {
                     logger.error("Folder picker failed: \(error.localizedDescription, privacy: .public)")
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func sheetContent(for sheet: PresentedSheet) -> some View {
+        switch sheet {
+        case .copiedLibrary:
+            CopiedMusicPicker()
+        case .serverSettings:
+            ServerSettingsView()
+        case .serverLibrary:
+            ServerLibraryPicker()
+        case .askLiam:
+            AskLiamView()
+        case .playlistManager:
+            PlaylistManagerView()
+        case .sharedPlaylists:
+            SharedPlaylistsView()
+        }
+    }
+
+    private func present(_ sheet: PresentedSheet) {
+        if sheet.requiresServer && player.serverClient == nil {
+            pendingServerSheet = sheet
+            presentedSheet = .serverSettings
+        } else {
+            pendingServerSheet = nil
+            presentedSheet = sheet
+        }
+    }
+
+    private func continuePendingServerDestination() {
+        guard let pendingServerSheet else { return }
+        self.pendingServerSheet = nil
+        guard player.serverClient != nil else { return }
+
+        // Let SwiftUI finish dismissing Server Settings before presenting
+        // the destination that originally sent the user there.
+        Task { @MainActor in
+            await Task.yield()
+            presentedSheet = pendingServerSheet
         }
     }
 

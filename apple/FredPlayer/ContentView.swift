@@ -10,6 +10,9 @@ struct ContentView: View {
         case askLiam
         case playlistManager
         case sharedPlaylists
+        case playerSettings
+        case lyrics
+        case whatsNext
 
         var id: String { rawValue }
 
@@ -17,7 +20,8 @@ struct ContentView: View {
             switch self {
             case .serverLibrary, .askLiam, .sharedPlaylists:
                 true
-            case .copiedLibrary, .serverSettings, .playlistManager:
+            case .copiedLibrary, .serverSettings, .playlistManager,
+                    .playerSettings, .lyrics, .whatsNext:
                 false
             }
         }
@@ -31,59 +35,25 @@ struct ContentView: View {
     @State private var isClearConfirmationPresented = false
     @State private var presentedSheet: PresentedSheet?
     @State private var pendingServerSheet: PresentedSheet?
+    @State private var queuedSheetAfterDismiss: PresentedSheet?
+    @State private var showMusicSourceAfterDismiss = false
     private let logger = Logger(subsystem: "com.ronpatrick.FredPlayer", category: "Import")
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 16) {
-                playlistContent
-                addMusicButton
-            }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 10) {
+                mainHeader
                 PlayerPanel()
                     .environmentObject(player)
             }
-            .sheet(item: $presentedSheet, onDismiss: continuePendingServerDestination) { sheet in
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+            .background(Color(uiColor: .systemBackground))
+            .sheet(item: $presentedSheet, onDismiss: handleSheetDismissal) { sheet in
                 sheetContent(for: sheet)
                     .environmentObject(player)
             }
-            .navigationTitle("FredPlayer")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        present(.playlistManager)
-                    } label: {
-                        Label(player.playlist.activePlaylistName, systemImage: "music.note.list")
-                    }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Button("Server Settings…", systemImage: "server.rack") {
-                            present(.serverSettings)
-                        }
-                        Button("Browse Server Library…", systemImage: "music.note.house") {
-                            present(.serverLibrary)
-                        }
-                        Button("Shared Playlists…", systemImage: "person.2") {
-                            present(.sharedPlaylists)
-                        }
-                        Button("Ask Liam…", systemImage: "bubble.left.and.text.bubble.right") {
-                            present(.askLiam)
-                        }
-                        Divider()
-                        Link("Privacy Policy", destination: URL(string: "https://patrick-lamphier.com/fredplayer-privacy")!)
-                        Link("Support", destination: URL(string: "https://patrick-lamphier.com/fredplayer-support")!)
-                        if !player.playlist.tracks.isEmpty {
-                            Divider()
-                            Button("Clear Playlist", role: .destructive) {
-                                isClearConfirmationPresented = true
-                            }
-                        }
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
-                    }
-                }
-            }
+            .toolbar(.hidden, for: .navigationBar)
             .confirmationDialog(
                 "Remove every track from the playlist?",
                 isPresented: $isClearConfirmationPresented,
@@ -174,6 +144,41 @@ struct ContentView: View {
         }
     }
 
+    private var mainHeader: some View {
+        HStack(spacing: 8) {
+            Text("FredPlayer")
+                .font(.system(size: 28, weight: .semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+            Spacer(minLength: 6)
+            headerButton("quote.bubble", label: "Lyrics") {
+                present(.lyrics)
+            }
+            headerButton("list.bullet", label: "What's Next") {
+                present(.whatsNext)
+            }
+            headerButton("gearshape", label: "Settings") {
+                present(.playerSettings)
+            }
+        }
+    }
+
+    private func headerButton(
+        _ systemName: String,
+        label: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 18, weight: .semibold))
+                .frame(width: 42, height: 42)
+                .background(Color.secondary.opacity(0.14))
+                .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+
     @ViewBuilder
     private func sheetContent(for sheet: PresentedSheet) -> some View {
         switch sheet {
@@ -189,6 +194,19 @@ struct ContentView: View {
             PlaylistManagerView()
         case .sharedPlaylists:
             SharedPlaylistsView()
+        case .playerSettings:
+            PlayerSettingsView(
+                onManagePlaylists: { transitionFromSettings(to: .playlistManager) },
+                onAddMusic: transitionFromSettingsToMusicSource,
+                onServerSettings: { transitionFromSettings(to: .serverSettings) },
+                onBrowseServer: { transitionFromSettings(to: .serverLibrary) },
+                onSharedPlaylists: { transitionFromSettings(to: .sharedPlaylists) },
+                onAskLiam: { transitionFromSettings(to: .askLiam) }
+            )
+        case .lyrics:
+            LyricsView()
+        case .whatsNext:
+            WhatsNextView()
         }
     }
 
@@ -213,6 +231,36 @@ struct ContentView: View {
             await Task.yield()
             presentedSheet = pendingServerSheet
         }
+    }
+
+    private func transitionFromSettings(to sheet: PresentedSheet) {
+        queuedSheetAfterDismiss = sheet
+        presentedSheet = nil
+    }
+
+    private func transitionFromSettingsToMusicSource() {
+        showMusicSourceAfterDismiss = true
+        presentedSheet = nil
+    }
+
+    private func handleSheetDismissal() {
+        if let queuedSheetAfterDismiss {
+            self.queuedSheetAfterDismiss = nil
+            Task { @MainActor in
+                await Task.yield()
+                present(queuedSheetAfterDismiss)
+            }
+            return
+        }
+        if showMusicSourceAfterDismiss {
+            showMusicSourceAfterDismiss = false
+            Task { @MainActor in
+                await Task.yield()
+                isMusicSourcePresented = true
+            }
+            return
+        }
+        continuePendingServerDestination()
     }
 
     private func importFolder(_ folder: URL) {
@@ -256,49 +304,6 @@ struct ContentView: View {
         return results
     }
 
-    @ViewBuilder
-    private var playlistContent: some View {
-        if player.playlist.tracks.isEmpty {
-            ContentUnavailableView(
-                "No Music Yet",
-                systemImage: "music.note.list",
-                description: Text("Import MP3 or FLAC files to begin.")
-            )
-        } else {
-            List {
-                ForEach(player.playlist.tracks) { track in
-                    Button {
-                        player.play(trackID: track.id)
-                    } label: {
-                        HStack {
-                            Image(systemName: player.currentTrackID == track.id ? "speaker.wave.2.fill" : "music.note")
-                                .foregroundStyle(player.currentTrackID == track.id ? Color.accentColor : Color.secondary)
-                            VStack(alignment: .leading) {
-                                Text(track.displayTitle)
-                                    .lineLimit(1)
-                                if let subtitle = track.displaySubtitle {
-                                    Text(subtitle)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
-                            }
-                        }
-                    }
-                    .buttonStyle(.plain)
-                }
-                .onDelete(perform: player.removeTracks)
-            }
-        }
-    }
-
-    private var addMusicButton: some View {
-        Button("Add Music", systemImage: "plus") {
-            isMusicSourcePresented = true
-        }
-        .buttonStyle(.borderedProminent)
-        .padding(.bottom)
-    }
 }
 
 private struct CopiedMusicPicker: View {

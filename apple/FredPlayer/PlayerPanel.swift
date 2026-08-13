@@ -2,90 +2,31 @@ import SwiftUI
 
 struct PlayerPanel: View {
     @EnvironmentObject private var player: PlayerController
-    @State private var settingsPresented = false
     @State private var removeConfirmationPresented = false
-    @State private var lyricsPresented = false
-    @State private var whatsNextPresented = false
+    @State private var seekValue: Double = 0
+    @State private var isSeeking = false
 
     var body: some View {
-        VStack(spacing: 10) {
-            if let track = player.currentTrack {
-                HStack(spacing: 12) {
-                    artworkView
-                    VStack(spacing: 2) {
-                        Text(track.displayTitle)
-                            .font(.headline)
-                            .lineLimit(1)
-                        if let subtitle = track.displaySubtitle {
-                            Text(subtitle)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
+        GeometryReader { geometry in
+            let isWide = geometry.size.width > geometry.size.height
+            VStack(spacing: isWide ? 8 : 12) {
+                if isWide {
+                    HStack(spacing: 14) {
+                        artworkAndMetadata
+                            .frame(width: geometry.size.width * 0.48)
+                        VisualizerView(waveform: player.waveform, spectrum: player.spectrum)
                     }
+                    .frame(maxHeight: .infinity)
+                } else {
+                    artworkAndMetadata
+                        .aspectRatio(1, contentMode: .fit)
+                    timeRow
+                    VisualizerView(waveform: player.waveform, spectrum: player.spectrum)
+                        .frame(minHeight: 120, maxHeight: .infinity)
                 }
-
-                VisualizerView(waveform: player.waveform, spectrum: player.spectrum)
-                    .frame(height: 110)
-
-                ProgressView(value: player.currentTime, total: max(1, player.duration))
-                HStack {
-                    Text(format(player.currentTime))
-                    Spacer()
-                    Text(format(player.duration))
-                }
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
+                transportControls
             }
-
-            HStack(spacing: 22) {
-                Button(action: player.toggleShuffle) {
-                    Image(systemName: "shuffle")
-                        .foregroundStyle(player.shuffleEnabled ? Color.accentColor : Color.secondary)
-                }
-                Button(action: player.previous) { Image(systemName: "backward.fill") }
-                Button(action: player.togglePlayback) {
-                    Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                        .font(.system(size: 38))
-                }
-                Button(action: player.next) { Image(systemName: "forward.fill") }
-                Button(action: player.stop) { Image(systemName: "stop.fill") }
-                Button(action: player.cycleRepeatMode) {
-                    Image(systemName: player.repeatMode == .one ? "repeat.1" : "repeat")
-                        .foregroundStyle(player.repeatMode == .off ? Color.secondary : Color.accentColor)
-                }
-                Button {
-                    removeConfirmationPresented = true
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .disabled(player.currentTrack == nil)
-                Button {
-                    lyricsPresented = true
-                } label: {
-                    Image(systemName: "quote.bubble")
-                }
-                Button {
-                    whatsNextPresented = true
-                } label: {
-                    Image(systemName: "list.bullet")
-                }
-                Button {
-                    settingsPresented = true
-                } label: {
-                    Image(systemName: "gearshape")
-                }
-            }
-            .font(.title3)
-            .buttonStyle(.plain)
-            .disabled(player.playlist.tracks.isEmpty)
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 10)
-        .background(.bar)
-        .sheet(isPresented: $settingsPresented) {
-            PlayerSettingsView()
-                .environmentObject(player)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .confirmationDialog(
             "Remove the current track from this playlist?",
@@ -95,13 +36,140 @@ struct PlayerPanel: View {
             Button("Remove", role: .destructive) { player.removeCurrentTrack() }
             Button("Cancel", role: .cancel) {}
         }
-        .sheet(isPresented: $lyricsPresented) {
-            LyricsView()
-                .environmentObject(player)
+    }
+
+    private var artworkAndMetadata: some View {
+        ZStack {
+            artworkView
+            Color.black.opacity(0.58)
+            VStack(spacing: 7) {
+                Text(playbackState)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.78))
+                Text(player.currentTrack?.displayTitle ?? "No song selected")
+                    .font(.title2.bold())
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(3)
+                    .minimumScaleFactor(0.75)
+                if let track = player.currentTrack {
+                    Text([track.artist, track.album]
+                        .compactMap { $0?.isEmpty == false ? $0 : nil }
+                        .joined(separator: "\n"))
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.82))
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
+                }
+                Text("\(player.playlist.activePlaylistName) · \(player.playlist.tracks.count) \(player.playlist.tracks.count == 1 ? "song" : "songs")")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.72))
+                    .lineLimit(1)
+                seekSlider
+            }
+            .padding(20)
         }
-        .sheet(isPresented: $whatsNextPresented) {
-            WhatsNextView()
-                .environmentObject(player)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private var playbackState: String {
+        if player.isLoadingRemoteTrack { return "Buffering…" }
+        if player.isPlaying { return "Playing" }
+        return player.currentTrack == nil ? "Stopped" : "Paused"
+    }
+
+    private var seekSlider: some View {
+        Slider(
+            value: Binding(
+                get: { isSeeking ? seekValue : player.currentTime },
+                set: { seekValue = $0 }
+            ),
+            in: 0...max(1, player.duration),
+            onEditingChanged: { editing in
+                if editing {
+                    seekValue = player.currentTime
+                    isSeeking = true
+                } else {
+                    player.seek(to: seekValue)
+                    isSeeking = false
+                }
+            }
+        )
+        .tint(.accentColor)
+        .disabled(player.currentTrack == nil)
+        .accessibilityLabel("Track position")
+    }
+
+    private var timeRow: some View {
+        HStack {
+            Text(format(isSeeking ? seekValue : player.currentTime))
+            Spacer()
+            Text(format(player.duration))
+        }
+        .font(.caption.monospacedDigit())
+        .foregroundStyle(.secondary)
+    }
+
+    private var transportControls: some View {
+        HStack(spacing: 6) {
+            transportButton(
+                "shuffle",
+                label: "Shuffle",
+                active: player.shuffleEnabled,
+                action: player.toggleShuffle
+            )
+            transportButton("backward.fill", label: "Previous", action: player.previous)
+            transportButton(
+                player.isPlaying ? "pause.fill" : "play.fill",
+                label: player.isPlaying ? "Pause" : "Play",
+                prominent: true,
+                action: player.togglePlayback
+            )
+            transportButton("forward.fill", label: "Next", action: player.next)
+            transportButton("stop.fill", label: "Stop", action: player.stop)
+            transportButton(
+                player.repeatMode == .one ? "repeat.1" : "repeat",
+                label: "Repeat",
+                active: player.repeatMode != .off,
+                action: player.cycleRepeatMode
+            )
+            transportButton("trash", label: "Remove from playlist") {
+                removeConfirmationPresented = true
+            }
+            .disabled(player.currentTrack == nil)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private func transportButton(
+        _ systemName: String,
+        label: String,
+        active: Bool = false,
+        prominent: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        let foreground = prominent ? Color.white : (active ? Color.accentColor : Color.primary)
+        let background = prominent ? Color.accentColor : Color.secondary.opacity(0.14)
+        let content = Image(systemName: systemName)
+            .font(.system(size: prominent ? 21 : 17, weight: .semibold))
+            .foregroundStyle(foreground)
+            .frame(width: prominent ? 46 : 42, height: prominent ? 48 : 42)
+            .background(background)
+            .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+
+        if prominent {
+            Button(action: action) {
+                content
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(label)
+        } else {
+            Button(action: action) {
+                content
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(label)
         }
     }
 
@@ -114,19 +182,18 @@ struct PlayerPanel: View {
     private var artworkView: some View {
         RoundedRectangle(cornerRadius: 8)
             .fill(.quaternary)
-            .frame(width: 48, height: 48)
             .overlay {
                 if let artwork = player.currentArtwork {
                     Image(uiImage: artwork)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
-                        .frame(width: 48, height: 48)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
                 } else {
                     Image(systemName: "music.note")
+                        .font(.system(size: 64, weight: .light))
                         .foregroundStyle(.secondary)
                 }
             }
+            .clipped()
     }
 }
 
@@ -169,14 +236,61 @@ private struct VisualizerView: View {
     }
 }
 
-private struct PlayerSettingsView: View {
+struct PlayerSettingsView: View {
     @EnvironmentObject private var player: PlayerController
     @Environment(\.dismiss) private var dismiss
     @AppStorage("appearance") private var appearance = AppAppearance.system.rawValue
+    let onManagePlaylists: () -> Void
+    let onAddMusic: () -> Void
+    let onServerSettings: () -> Void
+    let onBrowseServer: () -> Void
+    let onSharedPlaylists: () -> Void
+    let onAskLiam: () -> Void
 
     var body: some View {
         NavigationStack {
             Form {
+                Section("Appearance") {
+                    Picker("Color Scheme", selection: $appearance) {
+                        ForEach(AppAppearance.allCases) { option in
+                            Text(option.title).tag(option.rawValue)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    Text("System follows the iPhone or iPad appearance setting.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Playlist & Library") {
+                    Button(action: onManagePlaylists) {
+                        Label("Choose or Manage Playlists", systemImage: "music.note.list")
+                    }
+                    Button(action: onAddMusic) {
+                        Label("Add Music", systemImage: "plus")
+                    }
+                    Button("Clear Playlist", systemImage: "trash", role: .destructive) {
+                        player.stop()
+                        player.playlist.clearPlaylist()
+                    }
+                    .disabled(player.playlist.tracks.isEmpty)
+                }
+
+                Section("Fred Server") {
+                    Button(action: onServerSettings) {
+                        Label("Server Settings", systemImage: "server.rack")
+                    }
+                    Button(action: onBrowseServer) {
+                        Label("Browse Server Library", systemImage: "music.note.house")
+                    }
+                    Button(action: onSharedPlaylists) {
+                        Label("Shared Playlists", systemImage: "person.2")
+                    }
+                    Button(action: onAskLiam) {
+                        Label("Ask Liam", systemImage: "bubble.left.and.text.bubble.right")
+                    }
+                }
+
                 Section("Audio") {
                     control("Output Level", value: $player.outputLevel, range: 0...1, format: "%.0f%%", scale: 100)
                     Text("Real-time PCM gain riding reduces loud passages using the threshold, strength, attack, release, and ceiling settings.")
@@ -188,15 +302,6 @@ private struct PlayerSettingsView: View {
                     doubleControl("Release Time", value: $player.releaseTime, range: 0.05...3, format: "%.2f s")
                     control("Output Ceiling", value: $player.outputCeiling, range: -12...0, format: "%.1f dB")
                     doubleControl("Startup Scan", value: $player.startupScanSeconds, range: 0...30, format: "%.0f s")
-                }
-
-                Section("Appearance") {
-                    Picker("Color Scheme", selection: $appearance) {
-                        ForEach(AppAppearance.allCases) { option in
-                            Text(option.title).tag(option.rawValue)
-                        }
-                    }
-                    .pickerStyle(.segmented)
                 }
 
                 Section("Visualization") {
@@ -243,8 +348,13 @@ private struct PlayerSettingsView: View {
                         }
                     }
                 }
+
+                Section("About") {
+                    Link("Privacy Policy", destination: URL(string: "https://patrick-lamphier.com/fredplayer-privacy")!)
+                    Link("Support", destination: URL(string: "https://patrick-lamphier.com/fredplayer-support")!)
+                }
             }
-            .navigationTitle("Player Settings")
+            .navigationTitle("Settings")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }

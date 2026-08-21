@@ -1005,6 +1005,11 @@ class FredPlayerWindow final : public Gtk::ApplicationWindow {
         // song entirely, showing "No song selected" with a stale error
         // status left over from the last real playback attempt.
         stop();currentIndex_=-1;shuffleBag_.clear();playHistory_.clear();historyIndex_=-1;
+        const auto wanted=toLowerAscii(name);
+        for(auto it=state_.namedPlaylists.begin();it!=state_.namedPlaylists.end();){
+          if(toLowerAscii(it->first)==wanted)it=state_.namedPlaylists.erase(it);
+          else ++it;
+        }
         state_.namedPlaylists[name]=tracks;state_.activePlaylist=name;state_.playlist=tracks;refreshPlaylist();updateNowPlaying();refreshQueueWindow();saveState();});}).detach();
   }
 

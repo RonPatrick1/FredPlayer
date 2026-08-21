@@ -1,8 +1,8 @@
-const CACHE_NAME = 'fredplayer-web-shell-v39';
+const CACHE_NAME = 'fredplayer-web-shell-v62';
 const SHELL = [
   './',
-  './assets/app.css?v=33',
-  './assets/app.js?v=37',
+  './assets/app.css?v=37',
+  './assets/app.js?v=60',
   './assets/fredplayer-icon-192.png',
   './assets/fredplayer-icon-512.png',
   './assets/no-album-art.png',

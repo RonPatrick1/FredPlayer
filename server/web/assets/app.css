@@ -111,9 +111,22 @@ body.tizen-tv .tv-login-hint { display: block; margin: 0 0 18px; color: var(--mu
 .transport #play.playing .pause-icon { display: block; }
 .transport #play.play-required { border-color: var(--liam-bright); animation: play-ready-pulse 1.25s ease-in-out infinite; }
 @keyframes play-ready-pulse { 50% { box-shadow: 0 0 0 8px rgba(91,225,194,.18); } }
-.quick-controls { display: flex; align-items: center; gap: 12px; margin-top: 14px; padding: 14px; }
+.quick-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 14px; padding: 14px; }
 .volume { display: flex; align-items: center; gap: 12px; min-width: 260px; }
-.leveling { display: flex; align-items: center; gap: 8px; }
+.leveling, .bass-enhancement, .bass-strength { display: flex; align-items: center; gap: 8px; }
+.bass-strength input { width: 150px; accent-color: var(--liam-bright); }
+.bass-strength output { min-width: 44px; color: var(--liam-bright); font-variant-numeric: tabular-nums; }
+.tv-options-popup { position: fixed; inset: 0; z-index: 80; display: flex; align-items: flex-end; background: rgba(0, 0, 0, .34); }
+.tv-options-popup[hidden] { display: none; }
+.tv-options-panel { width: 100%; padding: 22px 38px 30px; border-top: 1px solid var(--line); background: rgba(7, 16, 21, .96); box-shadow: 0 -18px 50px rgba(0, 0, 0, .38); }
+.tv-options-panel > p { margin: 0 0 14px; color: var(--muted); font-size: .85rem; font-weight: 800; letter-spacing: .08em; text-align: center; text-transform: uppercase; }
+.tv-options-actions { display: flex; justify-content: center; gap: 20px; }
+.tv-options-actions button { display: grid; width: 150px; min-height: 104px; padding: 14px 10px 11px; place-items: center; }
+.tv-options-actions svg { width: 35px; height: 35px; fill: currentColor; }
+.tv-options-actions span { font-size: .9rem; font-weight: 750; }
+.tv-options-actions button.active { color: var(--liam-bright); background: #15302e; border-color: var(--liam-bright); }
+body.fredplayer-theme .tv-options-panel { background: rgba(17, 14, 31, .97); }
+body.fredplayer-theme .tv-options-actions button.active { background: #302658; }
 .visualization-panel { margin-top: 14px; padding: 18px; }
 .visualization-panel .section-heading { margin-bottom: 12px; }
 .visualization-panel canvas { display: block; width: 100%; height: clamp(260px, 38vh, 520px); border: 1px solid var(--line); border-radius: 12px; background: #020908; }
@@ -122,11 +135,19 @@ body.tizen-tv .tv-login-hint { display: block; margin: 0 0 18px; color: var(--mu
 .browser-panel, .queue-panel, .lyrics-panel { min-height: 500px; padding: 18px; }
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .section-heading h2 { margin: 0; }
+.section-heading-actions { display: flex; align-items: center; gap: 12px; }
+.library-page-status { color: var(--muted); font-weight: 750; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .search-field { position: relative; margin: 14px 0 10px; }
 .search { width: 100%; min-height: 52px; margin: 0; padding: 0 58px 0 15px; }
 .search-keyboard-toggle { display: none; position: absolute; top: 4px; right: 4px; width: 44px; min-height: 44px; padding: 0; place-items: center; background: transparent; }
 .search-keyboard-toggle svg { width: 21px; height: 21px; fill: currentColor; }
 body.tizen-tv .search-keyboard-toggle { display: grid; }
+body.tizen-tv input[type="range"].tv-range-adjusting {
+  border-radius: 8px;
+  outline: 4px solid var(--liam-bright) !important;
+  outline-offset: 5px;
+  box-shadow: 0 0 0 7px rgba(91, 225, 194, .18);
+}
 .source-row { display: flex; gap: 10px; margin-bottom: 12px; }
 .source-row select { min-height: 48px; max-width: 320px; padding: 0 12px; }
 .playlist-buttons { display: flex; overflow-x: auto; gap: 8px; margin: 0 0 12px; padding: 2px 1px 8px; scrollbar-color: var(--liam) transparent; }
@@ -135,6 +156,11 @@ body.tizen-tv .search-keyboard-toggle { display: grid; }
 body.fredplayer-theme .playlist-buttons button.active { background: #302658; }
 .track-list, .queue-list { overflow: auto; max-height: 58vh; border-top: 1px solid var(--line); }
 .track-row, .queue-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; min-height: 66px; padding: 9px 4px; border-bottom: 1px solid #18322f; }
+body.tizen-tv .track-row[data-tv-activatable="true"] { padding: 9px 12px; border: 1px solid transparent; border-bottom-color: #18322f; border-radius: 8px; }
+body.tizen-tv .track-row[data-tv-activatable="true"]:focus,
+body.tizen-tv .track-row[data-tv-activatable="true"]:focus-within { color: var(--text); background: #123d38; border-color: var(--liam-bright); }
+body.tizen-tv.fredplayer-theme .track-row[data-tv-activatable="true"]:focus,
+body.tizen-tv.fredplayer-theme .track-row[data-tv-activatable="true"]:focus-within { background: #302658; }
 .track-main { min-width: 0; }
 .track-title { overflow: hidden; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
 .track-meta { overflow: hidden; color: var(--muted); font-size: .88rem; text-overflow: ellipsis; white-space: nowrap; }

@@ -7,10 +7,10 @@
   <title>FredPlayer Web</title>
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./assets/fredplayer-icon-192.png">
-  <link rel="stylesheet" href="./assets/app.css?v=33">
+  <link rel="stylesheet" href="./assets/app.css?v=37">
 </head>
 <body>
-  <main id="login-view" class="login-shell">
+  <main id="login-view" class="login-shell" hidden>
     <form id="login-form" class="login-card">
       <img class="login-logo" src="./assets/fredplayer-icon-192.png" alt="">
       <p class="eyebrow">Silveron Studios</p>
@@ -48,7 +48,6 @@
         <button id="queue-toggle" class="icon-button" type="button" aria-label="What's Next" aria-pressed="false" title="What's Next">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h15v2H3V5zm0 5h15v2H3v-2zm0 5h9v2H3v-2zm13-1 5 3-5 3v-6z"/></svg>
         </button>
-        <button id="tesla-mode" class="secondary" type="button">Tesla mode</button>
         <button id="logout" class="secondary" type="button">Sign out</button>
       </div>
     </header>
@@ -92,6 +91,32 @@
       <button id="visualization-toggle" class="secondary" type="button" aria-pressed="false">Visualization off</button>
       <label class="volume">Volume <input id="volume" type="range" min="0" max="1" value="1" step="0.01"></label>
       <label class="leveling" title="The server applies FredPlayer's native adaptive leveler and compressor before streaming"><input id="leveling" type="checkbox" checked> Server adaptive leveling</label>
+      <label class="bass-enhancement" title="Adds low-frequency weight with output protection"><input id="bass-enhancement" type="checkbox"> Bass enhancement</label>
+      <label class="bass-strength">Strength <input id="bass-gain" type="range" min="0" max="9" value="4" step="0.5"><output id="bass-gain-value">+4 dB</output></label>
+    </section>
+
+    <section id="tv-options-popup" class="tv-options-popup" hidden role="dialog" aria-modal="true" aria-label="Playback options">
+      <div class="tv-options-panel">
+        <p>Playback options</p>
+        <div class="tv-options-actions">
+          <button id="tv-option-repeat" type="button" aria-label="Repeat off">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h10V2l4 4-4 4V7H7c-1.7 0-3 1.3-3 3v1H2v-1c0-2.8 2.2-5 5-5zm10 12H7v3l-4-4 4-4v3h10c1.7 0 3-1.3 3-3v-1h2v1c0 2.8-2.2 5-5 5z"/></svg>
+            <span>Repeat off</span>
+          </button>
+          <button id="tv-option-shuffle" type="button" aria-label="Shuffle on">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 3h5v5h-2V6.4l-4.3 4.3-1.4-1.4L17.6 5H16V3zM4.3 5.7l1.4-1.4L19 17.6V16h2v5h-5v-2h1.6L4.3 5.7zm0 12.6 4.9-4.9 1.4 1.4-4.9 4.9-1.4-1.4z"/></svg>
+            <span>Shuffle</span>
+          </button>
+          <button id="tv-option-lyrics" type="button" aria-label="Lyrics">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h11v2H6v12h12v-7h2v9H4V4zm4 4h7v2H8V8zm0 4h5v2H8v-2zm10-9h4v2h-2v9.1a3 3 0 1 1-2-2.83V3z"/></svg>
+            <span>Lyrics</span>
+          </button>
+          <button id="tv-option-queue" type="button" aria-label="What's next">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h15v2H3V5zm0 5h15v2H3v-2zm0 5h9v2H3v-2zm13-1 5 3-5 3v-6z"/></svg>
+            <span>What's next</span>
+          </button>
+        </div>
+      </div>
     </section>
 
     <section id="visualization-panel" class="panel visualization-panel" hidden>
@@ -104,7 +129,13 @@
 
     <section id="content-grid" class="content-grid">
       <section class="panel browser-panel">
-        <div class="section-heading"><div><p class="eyebrow">Music</p><h2>Library</h2></div><button id="refresh-library" class="secondary" type="button">Refresh</button></div>
+        <div class="section-heading">
+          <div><p class="eyebrow">Music</p><h2>Library</h2></div>
+          <div class="section-heading-actions">
+            <span id="library-page-status" class="library-page-status" aria-live="polite" hidden></span>
+            <button id="refresh-library" class="secondary" type="button">Refresh</button>
+          </div>
+        </div>
         <div class="search-field">
           <input id="search" class="search" type="search" placeholder="Search title, artist, or album" autocomplete="off">
           <button id="search-keyboard-toggle" class="search-keyboard-toggle" type="button"
@@ -133,9 +164,9 @@
 
     <details class="panel diagnostics-panel">
       <summary>Browser compatibility diagnostics</summary>
-      <p id="tesla-control-status" class="muted" hidden>Tesla control logging is active. Steering-wheel Media Session actions and any keyboard or wheel events exposed to the browser will appear below.</p>
+      <p id="tesla-control-status" class="muted" hidden>Tesla control logging is active. Browser events, Media Session actions, and server-inferred volume detents are uploaded automatically and will also appear below.</p>
       <div class="diagnostic-actions">
-        <button id="save-diagnostics" class="secondary" type="button">Send report to server</button>
+        <button id="save-diagnostics" class="secondary" type="button">Send full report now</button>
         <button id="clear-diagnostics" class="secondary" type="button">Clear log</button>
       </div>
       <p class="muted">For the Tesla test: start music, leave the browser for at least one minute, then return and send this report.</p>
@@ -144,6 +175,6 @@
   </main>
 
   <audio id="audio" preload="auto"></audio>
-  <script type="module" src="./assets/app.js?v=37"></script>
+  <script type="module" src="./assets/app.js?v=60"></script>
 </body>
 </html>

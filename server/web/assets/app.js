@@ -11,6 +11,27 @@ const LOGIN_USERNAME_KEY = 'fredplayer.web.login-username.v1';
 const launchParameters = new URLSearchParams(window.location.search);
 document.body.classList.add(launchParameters.get('fluxa') === '1' ? 'fluxa-theme' : 'fredplayer-theme');
 
+function detectTeslaBrowser() {
+  const userAgent = navigator.userAgent || '';
+  const browserIdentity = `${userAgent} ${navigator.appVersion || ''} ${navigator.vendor || ''}`;
+  const explicitMarker = /(?:\bTesla(?:\/|\s|$)|QtCarBrowser)/i.test(browserIdentity);
+  const chromium = /(?:Chrome|Chromium)\/\d+/i.test(userAgent)
+    && !/(?:Edg|OPR)\/\d+/i.test(userAgent);
+  const linuxX64 = /X11;\s*Linux x86_64/i.test(userAgent)
+    || /Linux x86_64/i.test(navigator.platform || '');
+  const maxTouchPoints = Number(navigator.maxTouchPoints) || 0;
+  return {
+    detected: explicitMarker || (chromium && linuxX64 && maxTouchPoints > 0),
+    reason: explicitMarker ? 'browser-marker'
+      : (chromium && linuxX64 && maxTouchPoints > 0 ? 'linux-chromium-touch' : ''),
+    chromiumLinux: chromium && linuxX64,
+    maxTouchPoints,
+  };
+}
+
+let teslaBrowser = detectTeslaBrowser();
+document.body.classList.toggle('tesla', teslaBrowser.detected);
+
 function isFluxaTizen() {
   if (/Tizen/i.test(navigator.userAgent) || 'tizen' in window) return true;
   const parameters = new URLSearchParams(window.location.search);
@@ -63,10 +84,12 @@ function installTizenLoginKeyboard() {
     setOnScreenKeyboard(keyboardToggle.getAttribute('aria-pressed') !== 'true');
   });
   const searchKeyboardToggle = $('#search-keyboard-toggle');
+  const search = $('#search');
+  search.tabIndex = -1;
   searchKeyboardToggle.addEventListener('click', () => {
-    const search = $('#search');
     const enabled = searchKeyboardToggle.getAttribute('aria-pressed') !== 'true';
     search.readOnly = !enabled;
+    search.tabIndex = enabled ? 0 : -1;
     search.setAttribute('inputmode', enabled ? 'search' : 'none');
     searchKeyboardToggle.classList.toggle('active', enabled);
     searchKeyboardToggle.setAttribute('aria-pressed', String(enabled));
@@ -74,6 +97,19 @@ function installTizenLoginKeyboard() {
     searchKeyboardToggle.setAttribute('title', enabled ? 'Use physical keyboard' : 'Use on-screen keyboard');
     if (enabled) window.setTimeout(() => search.focus(), 0);
     else searchKeyboardToggle.focus();
+  });
+
+  // A focused text input is enough for Samsung to summon its IME even when
+  // inputmode="none". In physical-keyboard mode keep focus on the small
+  // keyboard button and edit the read-only search field ourselves.
+  search.addEventListener('pointerdown', (event) => {
+    if (searchKeyboardToggle.getAttribute('aria-pressed') === 'true') return;
+    event.preventDefault();
+    searchKeyboardToggle.focus();
+  });
+  search.addEventListener('focus', () => {
+    if (searchKeyboardToggle.getAttribute('aria-pressed') === 'true') return;
+    window.setTimeout(() => searchKeyboardToggle.focus(), 0);
   });
 
   function legacyKeyboardCharacter(event) {
@@ -100,6 +136,43 @@ function installTizenLoginKeyboard() {
     }
     field.dispatchEvent(new Event('input', { bubbles: true }));
   }
+
+  let lastPhysicalSearchKey = '';
+  let lastPhysicalSearchKeyAt = 0;
+  document.addEventListener('keydown', (event) => {
+    if (playerView.hidden || searchKeyboardToggle.getAttribute('aria-pressed') === 'true'
+        || event.ctrlKey || event.altKey || event.metaKey) return;
+    const key = event.key && event.key.length === 1
+      ? event.key
+      : (event.key === 'Backspace' || event.key === 'Delete'
+        ? event.key : legacyKeyboardCharacter(event));
+    if (!(key.length === 1 || key === 'Backspace' || key === 'Delete')) return;
+
+    // Some Samsung/Tizen USB stacks emit the same physical transition twice.
+    // Ignore only the near-simultaneous duplicate; normal key repeat remains.
+    const now = performance.now();
+    const signature = `${event.keyCode || event.which || 0}:${key}:${event.shiftKey ? 1 : 0}`;
+    if (signature === lastPhysicalSearchKey && now - lastPhysicalSearchKeyAt < 70) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
+    lastPhysicalSearchKey = signature;
+    lastPhysicalSearchKeyAt = now;
+
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const before = search.value;
+    const start = Number.isInteger(search.selectionStart) ? search.selectionStart : before.length;
+    const end = Number.isInteger(search.selectionEnd) ? search.selectionEnd : start;
+    if (key.length === 1) replaceSelection(search, key, start, end);
+    else if (key === 'Backspace' && (start !== end || start > 0)) {
+      replaceSelection(search, '', start !== end ? start : start - 1, end);
+    } else if (key === 'Delete' && (start !== end || end < before.length)) {
+      replaceSelection(search, '', start, start !== end ? end : end + 1);
+    }
+    searchKeyboardToggle.focus({ preventScroll: true });
+  }, true);
 
   fields.forEach((field) => {
     field.addEventListener('keydown', (event) => {
@@ -131,6 +204,10 @@ function installTizenLoginKeyboard() {
         return;
       }
 
+      // Once the on-screen keyboard is explicitly enabled, its IME owns the
+      // search field. Never synthesize a second copy of an edit it is making.
+      if (field === search) return;
+
       // Samsung normally edits the field after keydown. If it does, leave the
       // native result alone. Some Tizen builds deliver the physical-keyboard
       // event but skip that edit; only then apply the missing edit ourselves.
@@ -161,7 +238,103 @@ function installTizenLoginKeyboard() {
 
 function installTizenRemoteNavigation() {
   if (!isFluxaTizen()) return;
-  const selector = 'a[href]:not([hidden]), button:not([disabled]):not([hidden]), input:not([disabled]):not([hidden]), select:not([disabled]):not([hidden]), summary';
+  const selector = 'a[href]:not([hidden]), button:not([disabled]):not([hidden]), input:not([disabled]):not([hidden]):not([readonly]), select:not([disabled]):not([hidden]), summary, [data-tv-activatable="true"]';
+  const mediaKeyHandlers = new Map();
+  let lastMediaAction = '';
+  let lastMediaActionAt = 0;
+
+  function duplicateMediaAction(action) {
+    const now = Date.now();
+    const pageAction = action === 'next-page' || action === 'previous-page';
+    const duplicate = !pageAction && action === lastMediaAction && now - lastMediaActionAt < 350;
+    lastMediaAction = action;
+    lastMediaActionAt = now;
+    return duplicate;
+  }
+
+  function playOrResume() {
+    if (audio.src) {
+      audio.play().catch((error) => logDiagnostic('tizen-remote-play-failed', { message: error.message }));
+    } else {
+      $('#play').click();
+    }
+  }
+
+  function handleMediaKey(event) {
+    const action = mediaKeyHandlers.get(event.keyCode);
+    if (!action || playerView.hidden) return false;
+    if (duplicateMediaAction(action)) return true;
+    logDiagnostic('tizen-remote-media-key', { action, keyCode: event.keyCode });
+    reportTizenShellMediaAction(action, 'direct-received');
+    if (action === 'options') {
+      toggleTvOptionsPopup();
+    } else if (action === 'next-page' || action === 'previous-page') {
+      changeTrackPage(action === 'next-page' ? 1 : -1);
+    } else if (action === 'toggle') {
+      if (audio.paused) playOrResume();
+      else audio.pause();
+    } else if (action === 'play') playOrResume();
+    else if (action === 'pause') audio.pause();
+    else if (action === 'stop') stopPlayback();
+    else if (action === 'rewind') seekPlaybackRelative(-10);
+    else if (action === 'fast-forward') seekPlaybackRelative(30);
+    else if (action === 'previous') playPrevious();
+    else if (action === 'next') playNext();
+    window.setTimeout(() => reportTizenShellMediaAction(action, 'direct-applied'), 250);
+    return true;
+  }
+
+  function handleShellMediaAction(action) {
+    if (!action || playerView.hidden) return false;
+    if (duplicateMediaAction(action)) return true;
+    logDiagnostic('tizen-shell-media-key', { action });
+    reportTizenShellMediaAction(action, 'received');
+    if (action === 'chapters' || action === 'options') {
+      toggleTvOptionsPopup();
+    } else if (action === 'next-page' || action === 'previous-page') {
+      changeTrackPage(action === 'next-page' ? 1 : -1);
+    } else if (action === 'toggle') {
+      if (audio.paused) playOrResume();
+      else audio.pause();
+    } else if (action === 'play') playOrResume();
+    else if (action === 'pause') audio.pause();
+    else if (action === 'stop') stopPlayback();
+    else if (action === 'rewind') seekPlaybackRelative(-10);
+    else if (action === 'fast-forward') seekPlaybackRelative(30);
+    else if (action === 'previous') playPrevious();
+    else if (action === 'next') playNext();
+    else return false;
+    window.setTimeout(() => reportTizenShellMediaAction(action, 'applied'), 250);
+    return true;
+  }
+
+  window.addEventListener('message', (event) => {
+    if (window.parent === window || event.source !== window.parent || !event.data
+        || event.data.type !== 'fluxa-tv-media-key') return;
+    handleShellMediaAction(event.data.action);
+  });
+
+  const mediaKeys = [
+    ['MediaPlayPause', 'toggle', 10252], ['MediaPlay', 'play', 415],
+    ['MediaPause', 'pause', 19], ['MediaStop', 'stop', 413],
+    ['MediaRewind', 'rewind', 412], ['MediaFastForward', 'fast-forward', 417],
+    ['MediaTrackPrevious', 'previous', 10232], ['MediaTrackNext', 'next', 10233],
+    ['ChannelUp', 'next-page', 427], ['ChannelDown', 'previous-page', 428],
+    ['Guide', 'options', 458],
+  ];
+  mediaKeys.forEach(([name, action, fallbackCode]) => {
+    let code = fallbackCode;
+    if (window.tizen && window.tizen.tvinputdevice) {
+      try {
+        const key = window.tizen.tvinputdevice.getKey(name);
+        if (key && Number.isFinite(key.code)) code = key.code;
+        window.tizen.tvinputdevice.registerKey(name);
+      } catch (error) {
+        logDiagnostic('tizen-remote-key-registration-failed', { name, message: error.message });
+      }
+    }
+    mediaKeyHandlers.set(code, action);
+  });
 
   function visible(element) {
     if (!element || element.offsetParent === null) return false;
@@ -175,36 +348,81 @@ function installTizenRemoteNavigation() {
   }
 
   function focusables() {
+    const popup = $('#tv-options-popup');
+    if (popup && !popup.hidden) return [...popup.querySelectorAll('button:not([disabled])')].filter(visible);
     return [...document.querySelectorAll(selector)].filter(visible);
   }
 
   function focusRemote(element) {
     if (!element) return;
+    const adjusting = document.querySelector('input[type="range"].tv-range-adjusting');
+    if (adjusting && adjusting !== element) finishRangeAdjustment(adjusting);
     element.focus();
     try { element.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' }); }
     catch (_error) { element.scrollIntoView(false); }
   }
 
+  function finishRangeAdjustment(element) {
+    if (!element?.classList.contains('tv-range-adjusting')) return;
+    element.classList.remove('tv-range-adjusting');
+    element.removeAttribute('aria-keyshortcuts');
+    if (element.dataset.tvRangeDirty === 'true') {
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    delete element.dataset.tvRangeDirty;
+  }
+
+  function setRangeAdjustment(element, enabled) {
+    if (!enabled) {
+      finishRangeAdjustment(element);
+      return;
+    }
+    document.querySelectorAll('input[type="range"].tv-range-adjusting').forEach((range) => {
+      if (range !== element) finishRangeAdjustment(range);
+    });
+    element.classList.add('tv-range-adjusting');
+    element.dataset.tvRangeDirty = 'false';
+    element.setAttribute('aria-keyshortcuts', 'ArrowLeft ArrowRight Enter');
+  }
+
   function adjustRange(element, direction) {
-    const step = Number(element.step) || 1;
+    const step = element.id === 'seek'
+      ? 10
+      : (element.id === 'volume' ? 0.05 : (Number(element.step) || 1));
     const minimum = Number(element.min);
     const maximum = Number(element.max);
     element.value = String(Math.max(minimum, Math.min(maximum, Number(element.value) + step * direction)));
+    element.dataset.tvRangeDirty = 'true';
     element.dispatchEvent(new Event('input', { bubbles: true }));
-    element.dispatchEvent(new Event('change', { bubbles: true }));
   }
+
+  document.querySelectorAll('input[type="range"]').forEach((range) => {
+    range.addEventListener('blur', () => finishRangeAdjustment(range));
+  });
 
   function move(direction) {
     const nodes = focusables();
     if (!nodes.length) return;
     const current = document.activeElement;
+    if (direction === 'ArrowDown' && (current === $('#search') || current === $('#search-keyboard-toggle'))) {
+      const firstResult = document.querySelector('#track-list .track-row[data-tv-activatable="true"]');
+      if (firstResult) {
+        focusRemote(firstResult);
+        return;
+      }
+    }
     if (!nodes.includes(current)) {
       focusRemote(nodes[0]);
       return;
     }
-    if (current.matches('input[type="range"]') && (direction === 'ArrowLeft' || direction === 'ArrowRight')) {
+    if (current.matches('input[type="range"].tv-range-adjusting')
+        && (direction === 'ArrowLeft' || direction === 'ArrowRight')) {
       adjustRange(current, direction === 'ArrowRight' ? 1 : -1);
       return;
+    }
+    if (current.matches('input[type="range"].tv-range-adjusting')
+        && (direction === 'ArrowUp' || direction === 'ArrowDown')) {
+      finishRangeAdjustment(current);
     }
     const source = center(current);
     let best = null;
@@ -229,6 +447,11 @@ function installTizenRemoteNavigation() {
 
   document.addEventListener('keydown', (event) => {
     if (event.defaultPrevented) return;
+    if (handleMediaKey(event)) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter', 'Escape'].includes(event.key)
         && event.keyCode !== 10009) return;
     const current = document.activeElement;
@@ -236,7 +459,10 @@ function installTizenRemoteNavigation() {
       && !current.readOnly;
     if (editingText && !['ArrowUp', 'ArrowDown', 'Escape'].includes(event.key) && event.keyCode !== 10009) return;
     if (event.key === 'Enter') {
-      if (current?.matches('button, a, summary')) {
+      if (current?.matches('input[type="range"]')) {
+        event.preventDefault();
+        setRangeAdjustment(current, !current.classList.contains('tv-range-adjusting'));
+      } else if (current?.matches('button, a, summary, [data-tv-activatable="true"]')) {
         event.preventDefault();
         current.click();
       } else if (current?.matches('input[type="checkbox"]')) {
@@ -249,6 +475,16 @@ function installTizenRemoteNavigation() {
       return;
     }
     if (event.key === 'Escape' || event.keyCode === 10009) {
+      if (!$('#tv-options-popup').hidden) {
+        event.preventDefault();
+        closeTvOptionsPopup();
+        return;
+      }
+      if (current?.matches('input[type="range"].tv-range-adjusting')) {
+        event.preventDefault();
+        finishRangeAdjustment(current);
+        return;
+      }
       if (editingText && $('#tv-keyboard-toggle')?.getAttribute('aria-pressed') === 'true') {
         event.preventDefault();
         $('#tv-keyboard-toggle').click();
@@ -269,6 +505,44 @@ function installTizenRemoteNavigation() {
     event.preventDefault();
     move(event.key);
   });
+}
+
+let tvOptionsPreviousFocus = null;
+
+function refreshTvOptionsPopup() {
+  const repeat = $('#tv-option-repeat');
+  const repeatLabel = state.repeatMode === 'one' ? 'Repeat one'
+    : (state.repeatMode === 'all' ? 'Repeat all' : 'Repeat off');
+  repeat.setAttribute('aria-label', repeatLabel);
+  repeat.querySelector('span').textContent = repeatLabel;
+  repeat.classList.toggle('active', state.repeatMode !== 'none');
+  const shuffle = $('#tv-option-shuffle');
+  shuffle.setAttribute('aria-label', state.shuffle ? 'Shuffle on' : 'Shuffle off');
+  shuffle.querySelector('span').textContent = state.shuffle ? 'Shuffle on' : 'Shuffle off';
+  shuffle.classList.toggle('active', state.shuffle);
+  $('#tv-option-lyrics').classList.toggle('active', state.sidePanel === 'lyrics');
+  $('#tv-option-queue').classList.toggle('active', state.sidePanel === 'queue');
+}
+
+function toggleTvOptionsPopup() {
+  if (!isFluxaTizen() || playerView.hidden) return false;
+  const popup = $('#tv-options-popup');
+  if (!popup.hidden) {
+    closeTvOptionsPopup();
+    return true;
+  }
+  tvOptionsPreviousFocus = document.activeElement;
+  refreshTvOptionsPopup();
+  popup.hidden = false;
+  window.setTimeout(() => $('#tv-option-repeat').focus(), 0);
+  return true;
+}
+
+function closeTvOptionsPopup(restoreFocus = true) {
+  const popup = $('#tv-options-popup');
+  if (!popup || popup.hidden) return;
+  popup.hidden = true;
+  if (restoreFocus && tvOptionsPreviousFocus?.isConnected) tvOptionsPreviousFocus.focus();
 }
 
 function configureFluxaReturn() {
@@ -313,7 +587,7 @@ async function completeFluxaAuthorization() {
   const parameters = new URLSearchParams(window.location.search);
   const destination = fluxaReturnDestination();
   if (!destination || parameters.get('authorize') !== '1') return false;
-  const response = await fetch('./auth/fluxa-grant', {
+  const response = await authenticatedFetch('./auth/fluxa-grant', {
     method: 'POST',
     credentials: 'same-origin',
   });
@@ -331,14 +605,18 @@ const state = {
   playlists: [],
   displayedTracks: [],
   queue: [],
+  queueOriginal: [],
   currentIndex: -1,
   sourceName: 'All music',
   queueSourceName: '',
+  queueSourceKind: '',
   sidePanel: '',
   shuffle: true,
   repeatMode: 'none',
   volume: 1,
   leveling: true,
+  bassEnhancement: isFluxaTizen(),
+  bassGainDb: 4,
   visualization: false,
   visualData: null,
   visualTrackPath: '',
@@ -358,7 +636,14 @@ const state = {
   playGeneration: 0,
   diagnostics: [],
   mediaSessionActions: [],
+  teslaDiagnosticQueue: [],
+  teslaDiagnosticTimer: 0,
+  teslaDiagnosticSending: false,
+  teslaEventSource: null,
+  teslaTelemetryConnected: false,
   visibleLimit: 100,
+  trackPage: 0,
+  trackPageSize: 8,
 };
 
 function encodePath(value) {
@@ -366,7 +651,7 @@ function encodePath(value) {
 }
 
 function api(path, options = {}) {
-  return fetch(`./api/${path}`, {
+  return authenticatedFetch(`./api/${path}`, {
     credentials: 'same-origin',
     ...options,
     headers: { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
@@ -384,22 +669,130 @@ function api(path, options = {}) {
   });
 }
 
+function authenticatedFetch(resource, options = {}) {
+  let token = '';
+  try { token = localStorage.getItem(DEVICE_TOKEN_KEY) || ''; } catch (_error) {}
+  return fetch(resource, {
+    ...options,
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(options.headers || {}),
+    },
+  });
+}
+
 function logDiagnostic(event, details = {}) {
-  state.diagnostics.push({ at: new Date().toISOString(), event, ...details });
+  const entry = { at: new Date().toISOString(), event, ...details };
+  state.diagnostics.push(entry);
   if (state.diagnostics.length > 250) state.diagnostics.shift();
   $('#diagnostics').textContent = state.diagnostics
     .map((entry) => `${entry.at}  ${entry.event}${Object.keys(entry).length > 2 ? `  ${JSON.stringify(Object.fromEntries(Object.entries(entry).filter(([key]) => !['at', 'event'].includes(key))))}` : ''}`)
     .join('\n');
+  return entry;
+}
+
+function reportTizenShellMediaAction(action, phase) {
+  authenticatedFetch('./api/diagnostics', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      automatic: true,
+      kind: 'tizen-shell-media-key',
+      action,
+      phase,
+      paused: audio.paused,
+      currentTime: Number.isFinite(audio.currentTime) ? audio.currentTime : null,
+      hasSource: Boolean(audio.currentSrc || audio.src),
+    }),
+  }).catch(() => {});
 }
 
 function teslaModeEnabled() {
-  return document.body.classList.contains('tesla');
+  return teslaBrowser.detected;
+}
+
+function teslaDiagnosticReport(events) {
+  return {
+    automatic: true,
+    kind: 'tesla-controls',
+    events,
+    visibility: document.visibilityState,
+    page: window.location.pathname,
+    capabilities: {
+      teslaDetection: { ...teslaBrowser },
+      mediaSession: 'mediaSession' in navigator,
+      registeredMediaActions: [...state.mediaSessionActions],
+    },
+  };
+}
+
+function scheduleTeslaDiagnosticUpload(delay = 750) {
+  if (state.teslaDiagnosticTimer || state.teslaDiagnosticSending
+      || !state.teslaDiagnosticQueue.length) return;
+  state.teslaDiagnosticTimer = window.setTimeout(() => {
+    state.teslaDiagnosticTimer = 0;
+    uploadTeslaDiagnostics();
+  }, delay);
+}
+
+function queueTeslaDiagnostic(entry) {
+  if (!entry) return;
+  state.teslaDiagnosticQueue.push(entry);
+  if (state.teslaDiagnosticQueue.length > 200) {
+    state.teslaDiagnosticQueue.splice(0, state.teslaDiagnosticQueue.length - 200);
+  }
+  scheduleTeslaDiagnosticUpload();
+}
+
+async function uploadTeslaDiagnostics(keepalive = false) {
+  if (state.teslaDiagnosticSending || !state.teslaDiagnosticQueue.length) return;
+  if (state.teslaDiagnosticTimer) {
+    window.clearTimeout(state.teslaDiagnosticTimer);
+    state.teslaDiagnosticTimer = 0;
+  }
+  const events = state.teslaDiagnosticQueue.splice(0, 25);
+  state.teslaDiagnosticSending = true;
+  try {
+    const response = await authenticatedFetch('./api/diagnostics', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(teslaDiagnosticReport(events)),
+      keepalive,
+    });
+    if (!response.ok) throw new Error(`Diagnostic upload failed (${response.status})`);
+  } catch (_error) {
+    state.teslaDiagnosticQueue.unshift(...events);
+  } finally {
+    state.teslaDiagnosticSending = false;
+    if (state.teslaDiagnosticQueue.length) scheduleTeslaDiagnosticUpload(5000);
+  }
+}
+
+function logTeslaDiagnosticSession(reason) {
+  if (!teslaModeEnabled()) return;
+  queueTeslaDiagnostic(logDiagnostic('tesla-control-logging-active', {
+    reason,
+    detection: { ...teslaBrowser },
+    mediaSession: 'mediaSession' in navigator,
+    registeredMediaActions: [...state.mediaSessionActions],
+    rawEvents: [
+      'keydown', 'keyup', 'wheel', 'pointerdown', 'pointerup',
+      'pointermove', 'pointercancel', 'click',
+    ],
+    audioVolume: audio.volume,
+    audioMuted: audio.muted,
+    audioReadyState: audio.readyState,
+    audioNetworkState: audio.networkState,
+    automaticUpload: true,
+  }));
 }
 
 function logTeslaControl(source, action, details = {}) {
   if (!teslaModeEnabled()) return;
   const track = state.queue[state.currentIndex];
-  logDiagnostic('tesla-control', {
+  queueTeslaDiagnostic(logDiagnostic('tesla-control', {
     source,
     action,
     ...details,
@@ -407,13 +800,148 @@ function logTeslaControl(source, action, details = {}) {
     paused: audio.paused,
     position: Number(playbackPosition().toFixed(3)),
     track: track?.path || '',
+  }));
+}
+
+function logTeslaAudioState(action, details = {}) {
+  logTeslaControl('audio-element', action, {
+    volume: audio.volume,
+    muted: audio.muted,
+    readyState: audio.readyState,
+    networkState: audio.networkState,
+    ended: audio.ended,
+    format: processedAudioFormat(),
+    ...details,
   });
 }
 
-function updateTeslaModeUi(enabled) {
+function diagnosticEventTarget(target) {
+  if (!(target instanceof Element)) return {};
+  return {
+    targetTag: target.tagName.toLowerCase(),
+    targetId: target.id || '',
+    targetRole: target.getAttribute('role') || '',
+    targetType: target.getAttribute('type') || '',
+    targetLabel: target.getAttribute('aria-label') || target.getAttribute('title') || '',
+  };
+}
+
+function pointerDiagnosticDetails(event) {
+  return {
+    pointerType: event.pointerType,
+    pointerId: event.pointerId,
+    isPrimary: event.isPrimary,
+    button: event.button,
+    buttons: event.buttons,
+    clientX: Math.round(event.clientX),
+    clientY: Math.round(event.clientY),
+    pressure: event.pressure,
+    ...diagnosticEventTarget(event.target),
+  };
+}
+
+function disconnectTeslaTelemetry() {
+  state.teslaEventSource?.close();
+  state.teslaEventSource = null;
+  state.teslaTelemetryConnected = false;
+}
+
+async function claimTeslaVolumeGesture(event) {
+  const count = Math.max(1, Math.min(20, Math.round(Number(event.count) || 1)));
+  if (count !== 1) {
+    logTeslaControl('fleet-telemetry-mapping', 'ordinary-volume-adjustment', {
+      direction: event.direction,
+      count,
+      observedAt: event.observedAt,
+    });
+    return;
+  }
+  if (audio.paused || state.currentIndex < 0) {
+    logTeslaControl('fleet-telemetry-mapping', 'ignored-player-inactive', {
+      direction: event.direction,
+      count,
+      observedAt: event.observedAt,
+    });
+    return;
+  }
+  try {
+    const response = await api(`tesla-events/${encodeURIComponent(event.id)}/claim`, {
+      method: 'POST',
+      body: '{}',
+    });
+    const result = await response.json();
+    if (!result.claimed) {
+      logTeslaControl('fleet-telemetry-mapping', 'gesture-already-claimed', { eventId: event.id });
+      return;
+    }
+    logTeslaControl('fleet-telemetry-mapping', result.action, {
+      eventId: event.id,
+      direction: event.direction,
+      count,
+      observedAt: event.observedAt,
+    });
+    if (result.action === 'nexttrack') playNext();
+    else if (result.action === 'previoustrack') playTeslaPreviousTrack();
+  } catch (error) {
+    logTeslaControl('fleet-telemetry-mapping', 'claim-failed', {
+      eventId: event.id,
+      message: error.message,
+    });
+  }
+}
+
+function connectTeslaTelemetry() {
+  if (!teslaModeEnabled() || state.teslaEventSource || playerView.hidden) return;
+  if (!('EventSource' in window)) {
+    logTeslaControl('fleet-telemetry', 'event-source-unavailable');
+    return;
+  }
+  const source = new EventSource('./api/tesla-events', { withCredentials: true });
+  state.teslaEventSource = source;
+  source.onopen = () => {
+    if (!state.teslaTelemetryConnected) {
+      state.teslaTelemetryConnected = true;
+      logTeslaControl('fleet-telemetry', 'connected');
+    }
+  };
+  source.onerror = () => {
+    if (state.teslaTelemetryConnected) {
+      state.teslaTelemetryConnected = false;
+      logTeslaControl('fleet-telemetry', 'disconnected');
+    }
+  };
+  const receive = (message) => {
+    let event;
+    try { event = JSON.parse(message.data); } catch (_error) { return; }
+    const { type, source: telemetrySource, ...details } = event;
+    logTeslaControl('fleet-telemetry', type || message.type, { telemetrySource, ...details });
+    if (type === 'volume-gesture-candidate') claimTeslaVolumeGesture(event);
+  };
+  for (const type of [
+    'telemetry-status', 'media-playback-status',
+    'volume-detent-candidate', 'volume-gesture-candidate',
+    'volume-compensation-observed',
+  ]) source.addEventListener(type, receive);
+}
+
+function applyTeslaBrowserMode() {
+  const enabled = teslaModeEnabled();
   document.body.classList.toggle('tesla', enabled);
-  $('#tesla-mode').classList.toggle('active', enabled);
   $('#tesla-control-status').hidden = !enabled;
+  if (enabled) connectTeslaTelemetry();
+  else disconnectTeslaTelemetry();
+}
+
+function detectTeslaFromTouch(event) {
+  if (teslaModeEnabled() || !teslaBrowser.chromiumLinux || event.pointerType !== 'touch') return;
+  teslaBrowser = {
+    ...teslaBrowser,
+    detected: true,
+    reason: 'linux-chromium-touch-event',
+  };
+  applyTeslaBrowserMode();
+  logDiagnostic('tesla-browser-detected', { ...teslaBrowser });
+  logTeslaDiagnosticSession('touch-detected');
 }
 
 function showLogin(message = '') {
@@ -421,20 +949,25 @@ function showLogin(message = '') {
   loginView.hidden = false;
   $('#login-error').textContent = message;
   audio.pause();
+  disconnectTeslaTelemetry();
   try { $('#username').value = localStorage.getItem(LOGIN_USERNAME_KEY) || $('#username').value; } catch (_error) {}
   const target = $('#username').value ? $('#password') : $('#username');
   window.setTimeout(() => target.focus(), 0);
+  if (isFluxaTizen() && window.parent !== window) {
+    window.parent.postMessage({ type: 'fluxa-tv-ready', screen: 'fredplayer-login' }, '*');
+  }
 }
 
 function showPlayer() {
   loginView.hidden = true;
   playerView.hidden = false;
+  connectTeslaTelemetry();
 }
 
 async function rememberAuthenticatedDevice() {
   try {
     if (localStorage.getItem(DEVICE_TOKEN_KEY)) return;
-    const response = await fetch('./auth/device/enroll', {
+    const response = await authenticatedFetch('./auth/device/enroll', {
       method: 'POST',
       credentials: 'same-origin',
     });
@@ -478,7 +1011,8 @@ function updatePlayingPlaylist() {
   const name = state.currentIndex >= 0 && state.queue.length
     ? (state.queueSourceName || 'Current queue')
     : 'None';
-  const sourceKind = name === 'All music' ? 'Library' : (name === 'Current queue' ? 'Queue' : 'Playlist');
+  const sourceKind = state.queueSourceKind
+    || (name === 'All music' ? 'Library' : (name === 'Current queue' ? 'Queue' : 'Playlist'));
   $('#playing-playlist').textContent = `${sourceKind} · ${name}`;
 }
 
@@ -509,8 +1043,9 @@ function persistPreferences() {
     repeatMode: state.repeatMode,
     volume: state.volume,
     leveling: state.leveling,
+    bassEnhancement: state.bassEnhancement,
+    bassGainDb: state.bassGainDb,
     visualization: state.visualization,
-    tesla: document.body.classList.contains('tesla'),
     sidePanel: state.sidePanel,
   };
   try { localStorage.setItem(WEB_PREFERENCES_KEY, JSON.stringify(snapshot)); } catch (_error) {}
@@ -521,8 +1056,10 @@ function saveQueueState() {
   try {
     localStorage.setItem('fredplayer.web.queue', JSON.stringify({
       queue: state.queue.map((track) => track.path),
+      queueOriginal: state.queueOriginal.map((track) => track.path),
       currentPath: current?.path || '',
       queueSourceName: state.queueSourceName,
+      queueSourceKind: state.queueSourceKind,
     }));
   } catch (_error) {}
 }
@@ -534,8 +1071,9 @@ function savePreferences() {
       repeatMode: state.repeatMode,
       volume: state.volume,
       leveling: state.leveling,
+      bassEnhancement: state.bassEnhancement,
+      bassGainDb: state.bassGainDb,
       visualization: state.visualization,
-      tesla: document.body.classList.contains('tesla'),
       sourceName: state.sourceName,
       sidePanel: state.sidePanel,
     }));
@@ -570,19 +1108,39 @@ function trackRow(track) {
   play.type = 'button';
   play.textContent = 'Play';
   play.addEventListener('click', () => playFromSource(track));
+  if (isFluxaTizen()) {
+    row.tabIndex = 0;
+    row.dataset.tvActivatable = 'true';
+    row.setAttribute('role', 'button');
+    row.setAttribute('aria-label', `Play ${track.title || fileName(track.path)}`);
+    play.tabIndex = -1;
+    row.addEventListener('click', (event) => {
+      if (event.target.closest('button')) return;
+      playFromSource(track);
+    });
+  }
   row.append(details, play);
   return row;
 }
 
-function renderTracks() {
+function filteredSourceTracks() {
   const query = $('#search').value.trim().toLocaleLowerCase();
-  const filtered = query
+  return query
     ? state.displayedTracks.filter((track) => `${track.title}\n${track.artist}\n${track.album}`.toLocaleLowerCase().includes(query))
     : state.displayedTracks;
-  const shown = filtered.slice(0, state.visibleLimit);
+}
+
+function renderTracks() {
+  const filtered = filteredSourceTracks();
+  const tvPages = isFluxaTizen();
+  const pageCount = Math.max(1, Math.ceil(filtered.length / state.trackPageSize));
+  state.trackPage = Math.max(0, Math.min(pageCount - 1, state.trackPage));
+  const shown = tvPages
+    ? filtered.slice(state.trackPage * state.trackPageSize, (state.trackPage + 1) * state.trackPageSize)
+    : filtered.slice(0, state.visibleLimit);
   const fragment = document.createDocumentFragment();
   shown.forEach((track) => fragment.append(trackRow(track)));
-  if (shown.length < filtered.length) {
+  if (!tvPages && shown.length < filtered.length) {
     const more = document.createElement('button');
     more.type = 'button';
     more.className = 'secondary wide';
@@ -593,6 +1151,29 @@ function renderTracks() {
   const list = $('#track-list');
   replaceChildren(list, fragment);
   if (!shown.length) list.textContent = 'No matching tracks.';
+  const pageStatus = $('#library-page-status');
+  pageStatus.hidden = !tvPages;
+  if (tvPages) pageStatus.textContent = `Page ${state.trackPage + 1} of ${pageCount}`;
+}
+
+function changeTrackPage(direction) {
+  if (!isFluxaTizen()) return false;
+  const filtered = filteredSourceTracks();
+  const pageCount = Math.max(1, Math.ceil(filtered.length / state.trackPageSize));
+  const nextPage = Math.max(0, Math.min(pageCount - 1, state.trackPage + direction));
+  if (nextPage === state.trackPage) return true;
+  state.trackPage = nextPage;
+  renderTracks();
+  const list = $('#track-list');
+  list.scrollTop = 0;
+  window.setTimeout(() => {
+    const first = list.querySelector('.track-row[data-tv-activatable="true"], button:not([disabled])');
+    if (!first) return;
+    first.focus();
+    try { first.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' }); }
+    catch (_error) { first.scrollIntoView(false); }
+  }, 0);
+  return true;
 }
 
 function renderQueue() {
@@ -954,14 +1535,41 @@ async function audioInfoFor(track) {
   return pending;
 }
 
+function processedAudioFormat() {
+  // Tesla-browser detection forces MP3 as a conservative compatibility and
+  // bandwidth choice. The original FLAC silence issue was a server bug: its
+  // STREAMINFO header had a corrupted/zeroed total-sample-count because the
+  // non-seekable encoder pipe could not patch it. The server now repairs that
+  // header; FLAC remains available to other capable browsers.
+  if (teslaModeEnabled()) return 'mp3';
+  return audio.canPlayType('audio/flac') ? 'flac' : 'mp3';
+}
+
 function processedAudioUrl(track, position) {
-  const format = audio.canPlayType('audio/flac') ? 'flac' : 'mp3';
+  const format = processedAudioFormat();
   const query = new URLSearchParams({
     start: Math.max(0, Number(position) || 0).toFixed(3),
     leveling: state.leveling ? '1' : '0',
+    bass_gain: state.bassEnhancement ? state.bassGainDb.toFixed(1) : '0',
     format,
   });
   return new URL(`./api/audio/${encodePath(track.path)}?${query}`, window.location.href).href;
+}
+
+async function authorizedProcessedAudioUrl(track, position) {
+  const url = new URL(processedAudioUrl(track, position));
+  if (!isFluxaTizen()) return url.href;
+  const response = await api('stream-ticket', {
+    method: 'POST',
+    body: JSON.stringify({ path: track.path }),
+  });
+  const ticket = await response.json();
+  if (!Number.isSafeInteger(ticket.expires) || !ticket.signature) {
+    throw new Error('FredPlayer did not provide a valid TV audio ticket.');
+  }
+  url.searchParams.set('expires', String(ticket.expires));
+  url.searchParams.set('signature', ticket.signature);
+  return url.href;
 }
 
 function preauthorizeNext() {
@@ -1000,16 +1608,29 @@ async function playTrack(index, position = 0, shouldPlay = true) {
   if (state.visualization) loadVisualization(track);
   if (!$('#lyrics-panel').hidden) loadLyrics(track);
   logDiagnostic('track-prepare', { path: track.path, requestedPosition: position });
+  const sourcePosition = Math.max(0, Number(position) || 0);
   try {
-    const sourcePosition = Math.max(0, Number(position) || 0);
     state.streamBaseOffset = sourcePosition;
     state.resumePosition = sourcePosition;
-    state.seekingPosition = null;
+    // Keep displaying the target position (via state.seekingPosition, which
+    // the timeupdate handler respects) until the new stream actually comes
+    // up — cleared below once that's confirmed, not here. A fresh <audio>
+    // resource reports currentTime 0 until it loads, so clearing this early
+    // let real (but momentarily stale/zero) position updates flash the knob
+    // back to the start before the new stream caught up.
+    state.seekingPosition = sourcePosition;
     $('#seek').value = sourcePosition;
     $('#elapsed').textContent = formatTime(sourcePosition);
     saveQueueState();
     applyVolume();
-    audio.src = processedAudioUrl(track, sourcePosition);
+    // Tesla requires playback to begin in the original tap/click task so the
+    // vehicle grants its browser audio focus. Only Fluxa on Tizen needs the
+    // asynchronous stream-ticket exchange.
+    const sourceUrl = isFluxaTizen()
+      ? await authorizedProcessedAudioUrl(track, sourcePosition)
+      : processedAudioUrl(track, sourcePosition);
+    if (generation !== state.playGeneration || state.queue[state.currentIndex]?.path !== track.path) return;
+    audio.src = sourceUrl;
     audio.load();
     const playAttempt = shouldPlay ? audio.play().then(
       () => ({ error: null }),
@@ -1020,13 +1641,16 @@ async function playTrack(index, position = 0, shouldPlay = true) {
     state.trackDuration = Number.isFinite(info.duration) ? info.duration : 0;
     $('#seek').max = state.trackDuration || 1;
     $('#duration').textContent = formatTime(state.trackDuration);
+    // The new stream is up — safe to let real position updates drive the
+    // seek bar again now.
+    if (state.seekingPosition === sourcePosition) state.seekingPosition = null;
     if (playResult.error) throw playResult.error;
     else $('#playback-status').textContent = 'Paused';
     logDiagnostic('play-accepted', {
       serverDsp: state.leveling,
       sourcePosition,
       duration: state.trackDuration,
-      format: audio.canPlayType('audio/flac') ? 'flac' : 'mp3',
+      format: processedAudioFormat(),
     });
     preauthorizeNext();
   } catch (error) {
@@ -1036,21 +1660,28 @@ async function playTrack(index, position = 0, shouldPlay = true) {
       : error.message;
     $('#play').classList.toggle('play-required', blocked);
     logDiagnostic('play-rejected', { name: error.name, message: error.message });
+    // Don't leave the seek bar frozen at the target position forever if
+    // this attempt failed — let real position updates resume driving it.
+    if (state.seekingPosition === sourcePosition) state.seekingPosition = null;
   }
 }
 
 function playFromSource(track) {
   const remaining = state.displayedTracks.filter((entry) => entry.path !== track.path);
+  state.queueOriginal = [...state.displayedTracks];
   state.queue = [track, ...(state.shuffle ? shuffled(remaining) : remaining)];
   state.queueSourceName = state.sourceName;
+  state.queueSourceKind = state.sourceName === 'All music' ? 'Library' : 'Playlist';
   return playTrack(0);
 }
 
 function playFromLibrary(track) {
   applySourceTracks('All music', state.library, false);
   const remaining = state.library.filter((entry) => entry.path !== track.path);
+  state.queueOriginal = [...state.library];
   state.queue = [track, ...(state.shuffle ? shuffled(remaining) : remaining)];
   state.queueSourceName = 'All music';
+  state.queueSourceKind = 'Library';
   return playTrack(0);
 }
 
@@ -1067,6 +1698,12 @@ window.FluxaFredPlayer = {
     playFromLibrary(track);
     return true;
   },
+  playQueue(paths, sourceName, sourceKind, shuffle, startPath) {
+    if (!Array.isArray(paths) || !paths.length) return false;
+    showPlayer();
+    playFluxaQueue({ paths, sourceName, sourceKind, shuffle, startPath });
+    return true;
+  },
   stop() {
     stopPlayback();
   },
@@ -1077,11 +1714,50 @@ window.addEventListener('message', (event) => {
   const destination = fluxaReturnDestination();
   if (!destination || event.origin !== destination.origin) return;
   if (event.data.type === 'fluxa-fredplayer-play') window.FluxaFredPlayer.playPath(event.data.path);
+  else if (event.data.type === 'fluxa-fredplayer-queue') {
+    window.FluxaFredPlayer.playQueue(event.data.paths, event.data.sourceName,
+      event.data.sourceKind, event.data.shuffle, event.data.startPath);
+  }
   else if (event.data.type === 'fluxa-fredplayer-stop') window.FluxaFredPlayer.stop();
 });
 
+async function playFluxaQueue(request) {
+  const tracks = (Array.isArray(request.paths) ? request.paths : [])
+    .map((path) => state.libraryByPath.get(path)).filter(Boolean);
+  if (!tracks.length) throw new Error('This Fluxa collection has no playable FredPlayer tracks.');
+  const startPath = request.startPath || '';
+  const selected = startPath ? tracks.find((track) => track.path === startPath) : null;
+  const remaining = selected ? tracks.filter((track) => track.path !== startPath) : tracks;
+  state.queueOriginal = [...tracks];
+  state.queue = selected
+    ? [selected, ...(request.shuffle === true ? shuffled(remaining) : remaining)]
+    : (request.shuffle === true ? shuffled(tracks) : [...tracks]);
+  state.shuffle = request.shuffle === true;
+  $('#shuffle').classList.toggle('active', state.shuffle);
+  $('#shuffle').setAttribute('aria-pressed', String(state.shuffle));
+  $('#shuffle').setAttribute('aria-label', state.shuffle ? 'Shuffle: on' : 'Shuffle: off');
+  applySourceTracks(request.sourceName || 'Fluxa queue', tracks, false);
+  state.queueSourceName = request.sourceName || 'Fluxa queue';
+  state.queueSourceKind = request.sourceKind || 'Queue';
+  state.currentIndex = -1;
+  updatePlayingPlaylist();
+  renderQueue();
+  saveQueueState();
+  await playTrack(0);
+}
+
 async function playRequestedTrack() {
   const url = new URL(window.location.href);
+  const queueTicket = url.searchParams.get('queue');
+  if (queueTicket) {
+    url.searchParams.delete('queue');
+    window.history.replaceState({}, '', url.href);
+    const response = await api(`fluxa-queue/${encodeURIComponent(queueTicket)}`);
+    const request = await response.json();
+    if (!response.ok) throw new Error(request.error || 'Could not load the Fluxa queue.');
+    await playFluxaQueue(request);
+    return true;
+  }
   const requested = url.searchParams.get('play');
   if (!requested) return false;
   const track = state.libraryByPath.get(requested);
@@ -1115,6 +1791,18 @@ function playPrevious() {
   else playTrack(0);
 }
 
+function playTeslaPreviousTrack() {
+  if (!state.queue.length) return;
+  if (state.currentIndex > 0) playTrack(state.currentIndex - 1);
+  else if (state.repeatMode === 'all') playTrack(state.queue.length - 1);
+}
+
+function seekPlaybackRelative(offset) {
+  if (state.currentIndex < 0) return;
+  const position = Math.max(0, Math.min(state.trackDuration || Infinity, playbackPosition() + offset));
+  playTrack(state.currentIndex, position, !audio.paused);
+}
+
 function updateRepeatControl() {
   const repeat = $('#repeat');
   const label = state.repeatMode === 'one'
@@ -1131,6 +1819,24 @@ function cycleRepeatMode() {
     ? 'one' : (state.repeatMode === 'one' ? 'all' : 'none');
   updateRepeatControl();
   savePreferences();
+  reportPlaybackMode('repeat-changed');
+}
+
+function reportPlaybackMode(reason) {
+  authenticatedFetch('./api/diagnostics', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      automatic: true,
+      kind: 'fredplayer-playback-mode',
+      reason,
+      shuffle: state.shuffle,
+      repeatMode: state.repeatMode,
+      queueLength: state.queue.length,
+      currentIndex: state.currentIndex,
+    }),
+  }).catch(() => {});
 }
 
 function handleTrackEnded() {
@@ -1170,6 +1876,7 @@ function applySourceTracks(name, tracks, persist = true) {
   state.sourceName = name;
   state.displayedTracks = tracks;
   state.visibleLimit = 100;
+  state.trackPage = 0;
   $('#library-source').classList.toggle('active', name === 'All music');
   $('#playlist-source').value = name === 'All music' ? '' : name;
   document.querySelectorAll('#playlist-buttons button').forEach((button) => {
@@ -1208,8 +1915,10 @@ function stopForSourceChange() {
 
 async function startSource(name, tracks) {
   applySourceTracks(name, tracks);
+  state.queueOriginal = [...tracks];
   state.queue = state.shuffle ? shuffled(tracks) : [...tracks];
   state.queueSourceName = name;
+  state.queueSourceKind = name === 'All music' ? 'Library' : 'Playlist';
   state.currentIndex = -1;
   updatePlayingPlaylist();
   renderQueue();
@@ -1266,6 +1975,10 @@ async function loadLibrary() {
   state.repeatMode = ['none', 'one', 'all'].includes(saved.repeatMode) ? saved.repeatMode : 'none';
   state.volume = Number.isFinite(saved.volume) ? saved.volume : 1;
   state.leveling = saved.leveling !== false;
+  state.bassEnhancement = typeof saved.bassEnhancement === 'boolean'
+    ? saved.bassEnhancement
+    : isFluxaTizen();
+  state.bassGainDb = Math.max(0, Math.min(9, Number(saved.bassGainDb) || 4));
   state.visualization = saved.visualization === true;
   $('#shuffle').classList.toggle('active', state.shuffle);
   $('#shuffle').setAttribute('aria-pressed', String(state.shuffle));
@@ -1273,7 +1986,11 @@ async function loadLibrary() {
   updateRepeatControl();
   $('#volume').value = state.volume;
   $('#leveling').checked = state.leveling;
-  updateTeslaModeUi(Boolean(saved.tesla));
+  $('#bass-enhancement').checked = state.bassEnhancement;
+  $('#bass-gain').value = state.bassGainDb;
+  $('#bass-gain').disabled = !state.bassEnhancement;
+  $('#bass-gain-value').textContent = `${state.bassGainDb >= 0 ? '+' : ''}${state.bassGainDb} dB`;
+  applyTeslaBrowserMode();
 
   const savedSourceName = typeof saved.sourceName === 'string' && saved.sourceName
     ? saved.sourceName
@@ -1299,7 +2016,11 @@ async function loadLibrary() {
     state.queue = Array.isArray(saved.queue)
       ? saved.queue.map((path) => state.libraryByPath.get(path)).filter(Boolean)
       : [];
+    state.queueOriginal = Array.isArray(saved.queueOriginal)
+      ? saved.queueOriginal.map((path) => state.libraryByPath.get(path)).filter(Boolean)
+      : [...state.queue];
     state.queueSourceName = typeof saved.queueSourceName === 'string' ? saved.queueSourceName : '';
+    state.queueSourceKind = typeof saved.queueSourceKind === 'string' ? saved.queueSourceKind : '';
     state.currentIndex = state.queue.findIndex((track) => track.path === saved.currentPath);
     state.resumePosition = Math.max(0, Number(saved.position) || 0);
   }
@@ -1331,7 +2052,7 @@ async function initialize() {
       return;
     }
   }
-  let session = await fetch('./auth/session', { credentials: 'same-origin', cache: 'no-store' });
+  let session = await authenticatedFetch('./auth/session', { credentials: 'same-origin', cache: 'no-store' });
   let value = await session.json();
   if (value.username && !$('#username').value) $('#username').value = value.username;
   if (!value.authenticated) {
@@ -1356,9 +2077,12 @@ async function initialize() {
   }
   await rememberAuthenticatedDevice();
   if (await completeFluxaAuthorization()) return;
-  showPlayer();
   await loadLibrary();
+  showPlayer();
   await playRequestedTrack();
+  if (isFluxaTizen() && window.parent !== window) {
+    window.parent.postMessage({ type: 'fluxa-tv-ready', screen: 'fredplayer' }, '*');
+  }
   logDiagnostic('initialized', {
     visibility: document.visibilityState,
     mediaSession: 'mediaSession' in navigator,
@@ -1375,7 +2099,7 @@ async function showStartupFailure(error) {
   $('#track-list').textContent = `FredPlayer startup error: ${message}`;
   logDiagnostic('startup-failed', { message, stack: error && error.stack ? error.stack : '' });
   try {
-    await fetch('./api/diagnostics', {
+    await authenticatedFetch('./api/diagnostics', {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
@@ -1415,9 +2139,12 @@ $('#login-form').addEventListener('submit', async (event) => {
     } catch (_error) {}
     $('#password').value = '';
     if (await completeFluxaAuthorization()) return;
-    showPlayer();
     await loadLibrary();
+    showPlayer();
     await playRequestedTrack();
+    if (isFluxaTizen() && window.parent !== window) {
+      window.parent.postMessage({ type: 'fluxa-tv-ready', screen: 'fredplayer' }, '*');
+    }
     logDiagnostic('login-success');
   } catch (error) {
     if (authenticated) await showStartupFailure(error);
@@ -1448,24 +2175,64 @@ $('#library-source').addEventListener('click', async () => {
   logDiagnostic('library-started', { tracks: state.library.length });
 });
 $('#playlist-source').addEventListener('change', (event) => selectPlaylist(event.target.value));
-$('#search').addEventListener('input', () => { state.visibleLimit = 100; renderTracks(); });
+$('#search').addEventListener('input', () => {
+  state.visibleLimit = 100;
+  state.trackPage = 0;
+  renderTracks();
+});
 $('#shuffle').addEventListener('click', () => {
   state.shuffle = !state.shuffle;
+  if (state.queueOriginal.length && state.queue.length) {
+    const prefix = state.currentIndex >= 0 ? state.queue.slice(0, state.currentIndex + 1) : [];
+    const consumed = new Map();
+    prefix.forEach((track) => consumed.set(track.path, (consumed.get(track.path) || 0) + 1));
+    const remaining = state.queueOriginal.filter((track) => {
+      const count = consumed.get(track.path) || 0;
+      if (!count) return true;
+      consumed.set(track.path, count - 1);
+      return false;
+    });
+    state.queue = [...prefix, ...(state.shuffle ? shuffled(remaining) : remaining)];
+    renderQueue();
+    saveQueueState();
+  }
   $('#shuffle').classList.toggle('active', state.shuffle);
   $('#shuffle').setAttribute('aria-pressed', String(state.shuffle));
   $('#shuffle').setAttribute('aria-label', state.shuffle ? 'Shuffle: on' : 'Shuffle: off');
   savePreferences();
+  reportPlaybackMode('shuffle-changed');
 });
 $('#repeat').addEventListener('click', cycleRepeatMode);
 $('#queue-toggle').addEventListener('click', () => showSidePanel('queue'));
 $('#lyrics-toggle').addEventListener('click', () => showSidePanel('lyrics'));
+$('#tv-option-repeat').addEventListener('click', () => {
+  cycleRepeatMode();
+  refreshTvOptionsPopup();
+});
+$('#tv-option-shuffle').addEventListener('click', () => {
+  $('#shuffle').click();
+  refreshTvOptionsPopup();
+});
+$('#tv-option-lyrics').addEventListener('click', () => {
+  $('#lyrics-toggle').click();
+  closeTvOptionsPopup();
+});
+$('#tv-option-queue').addEventListener('click', () => {
+  $('#queue-toggle').click();
+  closeTvOptionsPopup();
+});
+$('#tv-options-popup').addEventListener('click', (event) => {
+  if (event.target === event.currentTarget) closeTvOptionsPopup();
+});
 $('#clear-queue').addEventListener('click', () => {
   audio.pause();
   audio.removeAttribute('src');
   audio.load();
   state.queue = [];
+  state.queueOriginal = [];
   state.currentIndex = -1;
   state.queueSourceName = '';
+  state.queueSourceKind = '';
   state.streamBaseOffset = 0;
   state.resumePosition = 0;
   state.trackDuration = 0;
@@ -1514,6 +2281,28 @@ $('#leveling').addEventListener('change', async (event) => {
     await playTrack(state.currentIndex, position, wasPlaying);
   }
 });
+$('#bass-enhancement').addEventListener('change', async (event) => {
+  const position = playbackPosition();
+  const wasPlaying = !audio.paused;
+  state.bassEnhancement = event.target.checked;
+  $('#bass-gain').disabled = !state.bassEnhancement;
+  savePreferences();
+  if (state.currentIndex >= 0 && audio.src) {
+    await playTrack(state.currentIndex, position, wasPlaying);
+  }
+});
+$('#bass-gain').addEventListener('input', (event) => {
+  state.bassGainDb = Math.max(0, Math.min(9, Number(event.target.value) || 0));
+  $('#bass-gain-value').textContent = `+${state.bassGainDb} dB`;
+  savePreferences();
+});
+$('#bass-gain').addEventListener('change', async () => {
+  const position = playbackPosition();
+  const wasPlaying = !audio.paused;
+  if (state.currentIndex >= 0 && audio.src) {
+    await playTrack(state.currentIndex, position, wasPlaying);
+  }
+});
 $('#visualization-toggle').addEventListener('click', () => setVisualizationEnabled(!state.visualization));
 $('#seek').addEventListener('input', (event) => {
   state.seekingPosition = Number(event.target.value);
@@ -1524,21 +2313,13 @@ $('#seek').addEventListener('input', (event) => {
 $('#seek').addEventListener('change', async (event) => {
   const position = Number(event.target.value);
   const wasPlaying = !audio.paused;
-  state.seekingPosition = null;
+  // Deliberately NOT clearing state.seekingPosition here — seeking reloads
+  // the stream from scratch (a fresh <audio> resource starting at local
+  // time 0), and clearing this too early let the knob visibly snap back
+  // to the beginning for a moment before jumping to the clicked position.
+  // playTrack() keeps this override in place until the new stream is
+  // actually ready.
   if (state.currentIndex >= 0) await playTrack(state.currentIndex, position, wasPlaying);
-});
-$('#tesla-mode').addEventListener('click', () => {
-  const enabled = !teslaModeEnabled();
-  updateTeslaModeUi(enabled);
-  logDiagnostic('tesla-mode', { enabled });
-  if (enabled) {
-    logDiagnostic('tesla-control-logging-enabled', {
-      mediaSession: 'mediaSession' in navigator,
-      registeredMediaActions: state.mediaSessionActions,
-      rawEvents: ['keydown', 'keyup', 'wheel'],
-    });
-  }
-  savePreferences();
 });
 $('#save-diagnostics').addEventListener('click', async () => {
   const report = {
@@ -1577,15 +2358,17 @@ audio.addEventListener('timeupdate', () => {
   updateLyricsHighlight();
   if (audio.paused) drawVisualization();
 });
-audio.addEventListener('play', () => { $('#play').classList.remove('play-required'); updateTransport(); startVisualizationLoop(); syncLyricsTimer(); $('#playback-status').textContent = 'Playing'; logDiagnostic('audio-play'); });
-audio.addEventListener('pause', () => { stopVisualizationLoop(); stopLyricsTimer(); drawVisualization(); updateTransport(); if (!audio.ended && audio.src) $('#playback-status').textContent = 'Paused'; logDiagnostic('audio-pause', { position: playbackPosition() }); savePosition(); });
-audio.addEventListener('playing', () => { $('#playback-status').textContent = 'Playing'; logDiagnostic('audio-playing', { visibility: document.visibilityState }); });
-audio.addEventListener('waiting', () => { $('#playback-status').textContent = 'Buffering…'; logDiagnostic('audio-waiting', { position: playbackPosition() }); });
-audio.addEventListener('stalled', () => logDiagnostic('audio-stalled', { position: playbackPosition() }));
+audio.addEventListener('play', () => { $('#play').classList.remove('play-required'); updateTransport(); startVisualizationLoop(); syncLyricsTimer(); $('#playback-status').textContent = 'Playing'; logDiagnostic('audio-play'); logTeslaAudioState('play'); });
+audio.addEventListener('pause', () => { stopVisualizationLoop(); stopLyricsTimer(); drawVisualization(); updateTransport(); if (!audio.ended && audio.src) $('#playback-status').textContent = 'Paused'; logDiagnostic('audio-pause', { position: playbackPosition() }); logTeslaAudioState('pause'); savePosition(); });
+audio.addEventListener('playing', () => { $('#playback-status').textContent = 'Playing'; logDiagnostic('audio-playing', { visibility: document.visibilityState }); logTeslaAudioState('playing'); });
+audio.addEventListener('waiting', () => { $('#playback-status').textContent = 'Buffering…'; logDiagnostic('audio-waiting', { position: playbackPosition() }); logTeslaAudioState('waiting'); });
+audio.addEventListener('stalled', () => { logDiagnostic('audio-stalled', { position: playbackPosition() }); logTeslaAudioState('stalled'); });
+audio.addEventListener('volumechange', () => logTeslaAudioState('volumechange'));
 audio.addEventListener('error', () => {
   const message = audio.error?.message || `Media error ${audio.error?.code || 'unknown'}`;
   $('#playback-status').textContent = message;
   logDiagnostic('audio-error', { code: audio.error?.code, message });
+  logTeslaAudioState('error', { code: audio.error?.code, message });
 });
 audio.addEventListener('ended', () => { logDiagnostic('audio-ended', { visibility: document.visibilityState, repeatMode: state.repeatMode }); handleTrackEnded(); });
 document.addEventListener('visibilitychange', () => logDiagnostic('visibility-change', {
@@ -1602,6 +2385,7 @@ document.addEventListener('keydown', (event) => logTeslaControl('dom-keyboard', 
   ctrlKey: event.ctrlKey,
   metaKey: event.metaKey,
   shiftKey: event.shiftKey,
+  ...diagnosticEventTarget(event.target),
 }), true);
 document.addEventListener('keyup', (event) => logTeslaControl('dom-keyboard', 'keyup', {
   key: event.key,
@@ -1612,6 +2396,7 @@ document.addEventListener('keyup', (event) => logTeslaControl('dom-keyboard', 'k
   ctrlKey: event.ctrlKey,
   metaKey: event.metaKey,
   shiftKey: event.shiftKey,
+  ...diagnosticEventTarget(event.target),
 }), true);
 window.addEventListener('wheel', (event) => logTeslaControl('dom-wheel', 'wheel', {
   deltaX: event.deltaX,
@@ -1622,10 +2407,37 @@ window.addEventListener('wheel', (event) => logTeslaControl('dom-wheel', 'wheel'
   ctrlKey: event.ctrlKey,
   metaKey: event.metaKey,
   shiftKey: event.shiftKey,
+  ...diagnosticEventTarget(event.target),
 }), { capture: true, passive: true });
+['pointerdown', 'pointerup', 'pointercancel'].forEach((eventName) => {
+  document.addEventListener(eventName, (event) => {
+    if (eventName === 'pointerdown') detectTeslaFromTouch(event);
+    logTeslaControl('dom-pointer', eventName, pointerDiagnosticDetails(event));
+  }, { capture: true, passive: true });
+});
+let lastTeslaPointerMoveAt = 0;
+document.addEventListener('pointermove', (event) => {
+  if (!teslaModeEnabled()) return;
+  const now = performance.now();
+  if (now - lastTeslaPointerMoveAt < 100) return;
+  lastTeslaPointerMoveAt = now;
+  logTeslaControl('dom-pointer', 'pointermove', pointerDiagnosticDetails(event));
+}, { capture: true, passive: true });
+document.addEventListener('click', (event) => logTeslaControl('dom-click', 'click', {
+  button: event.button,
+  buttons: event.buttons,
+  clientX: Math.round(event.clientX),
+  clientY: Math.round(event.clientY),
+  detail: event.detail,
+  ...diagnosticEventTarget(event.target),
+}), true);
 window.addEventListener('online', () => { $('#connection-status').textContent = `${state.library.length.toLocaleString()} tracks available`; logDiagnostic('network-online'); });
 window.addEventListener('offline', () => { $('#connection-status').textContent = 'Network offline'; logDiagnostic('network-offline'); });
-window.addEventListener('beforeunload', savePosition);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') uploadTeslaDiagnostics(true);
+});
+window.addEventListener('pagehide', () => uploadTeslaDiagnostics(true));
+window.addEventListener('beforeunload', () => { savePosition(); uploadTeslaDiagnostics(true); });
 setInterval(() => { if (!audio.paused) savePosition(); }, 5000);
 
 if ('mediaSession' in navigator) {
@@ -1650,18 +2462,13 @@ if ('mediaSession' in navigator) {
       state.mediaSessionActions.push(action);
     } catch (_error) {}
   };
-  const seekRelative = (offset) => {
-    if (state.currentIndex < 0) return;
-    const position = Math.max(0, Math.min(state.trackDuration || Infinity, playbackPosition() + offset));
-    playTrack(state.currentIndex, position, !audio.paused);
-  };
   registerMediaAction('play', () => audio.play());
   registerMediaAction('pause', () => audio.pause());
   registerMediaAction('stop', stopPlayback);
   registerMediaAction('previoustrack', playPrevious);
   registerMediaAction('nexttrack', playNext);
-  registerMediaAction('seekbackward', (details) => seekRelative(-(details.seekOffset || 10)));
-  registerMediaAction('seekforward', (details) => seekRelative(details.seekOffset || 10));
+  registerMediaAction('seekbackward', (details) => seekPlaybackRelative(-(details.seekOffset || 10)));
+  registerMediaAction('seekforward', (details) => seekPlaybackRelative(details.seekOffset || 10));
   registerMediaAction('seekto', (details) => {
     if (Number.isFinite(details.seekTime) && state.currentIndex >= 0) {
       playTrack(state.currentIndex, details.seekTime, !audio.paused);
@@ -1673,4 +2480,6 @@ installTizenLoginKeyboard();
 installTizenRemoteNavigation();
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('./service-worker.js').catch(() => {});
 
-initialize().catch(showStartupFailure);
+initialize()
+  .then(() => logTeslaDiagnosticSession('page-initialized'))
+  .catch(showStartupFailure);

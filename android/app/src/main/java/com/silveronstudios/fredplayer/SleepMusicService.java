@@ -43,6 +43,7 @@ import java.util.concurrent.Executors;
 public class SleepMusicService extends MediaBrowserServiceCompat implements AudioManager.OnAudioFocusChangeListener {
     private static final String BROWSE_ROOT_ID = "root";
     private static final String PLAYLIST_ID_PREFIX = "playlist:";
+    private static final String PLAY_PLAYLIST_ID_PREFIX = "play-playlist:";
     private static final String TRACK_ID_PREFIX = "track:";
     public static final String ACTION_SET_PLAYLIST = "com.silveronstudios.fredplayer.SET_PLAYLIST";
     public static final String ACTION_PLAY_URI = "com.silveronstudios.fredplayer.PLAY_URI";
@@ -153,6 +154,8 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
     private volatile Bitmap currentArtworkBitmap;
     private Bitmap placeholderArtworkBitmap;
     private String artworkRequestKey = "";
+    private String lastPublishedMetadataKey = "";
+    private Bitmap lastPublishedArtworkBitmap;
     private String activePlaylistName = PlaylistStore.DEFAULT_PLAYLIST_NAME;
     private boolean shuffleEnabled = true;
     private int repeatMode = REPEAT_ALL;
@@ -526,28 +529,44 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
                         .setTitle(entry.getKey())
                         .setSubtitle(count + (count == 1 ? " song" : " songs"))
                         .build();
-                items.add(new MediaBrowserCompat.MediaItem(description, MediaBrowserCompat.MediaItem.FLAG_BROWSABLE));
+                int flags = MediaBrowserCompat.MediaItem.FLAG_BROWSABLE;
+                if (count > 0) {
+                    flags |= MediaBrowserCompat.MediaItem.FLAG_PLAYABLE;
+                }
+                items.add(new MediaBrowserCompat.MediaItem(description, flags));
             }
             result.sendResult(items);
             return;
         }
 
         if (!parentId.startsWith(PLAYLIST_ID_PREFIX)) {
-            result.sendResult(null);
+            result.sendResult(Collections.emptyList());
             return;
         }
         String playlistName = parentId.substring(PLAYLIST_ID_PREFIX.length());
         ArrayList<String> tracks = PlaylistStore.loadPlaylists(this).get(playlistName);
         if (tracks == null) {
-            result.sendResult(null);
+            result.sendResult(Collections.emptyList());
             return;
         }
         ArrayList<String> snapshot = new ArrayList<>(tracks);
         result.detach();
         browseExecutor.execute(() -> {
             ArrayList<MediaBrowserCompat.MediaItem> items = new ArrayList<>();
+            if (!snapshot.isEmpty()) {
+                MediaDescriptionCompat playDescription = new MediaDescriptionCompat.Builder()
+                        .setMediaId(PLAY_PLAYLIST_ID_PREFIX + playlistName)
+                        .setTitle(shuffleEnabled ? "Shuffle playlist" : "Play playlist")
+                        .setSubtitle(snapshot.size() + (snapshot.size() == 1 ? " song" : " songs"))
+                        .build();
+                items.add(new MediaBrowserCompat.MediaItem(
+                        playDescription, MediaBrowserCompat.MediaItem.FLAG_PLAYABLE));
+            }
             for (int i = 0; i < snapshot.size(); i++) {
-                TrackMetadata metadata = resolveMetadata(snapshot.get(i));
+                // Browsing must never open every remote audio file just to
+                // populate the list. Cached metadata is normally present for
+                // server tracks; a filename is an immediate safe fallback.
+                TrackMetadata metadata = resolveBrowseMetadata(snapshot.get(i));
                 MediaDescriptionCompat.Builder descriptionBuilder = new MediaDescriptionCompat.Builder()
                         .setMediaId(TRACK_ID_PREFIX + playlistName + "#" + i)
                         .setTitle(metadata.title.isEmpty() ? "FredPlayer" : metadata.title)
@@ -569,6 +588,27 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
             }
             result.sendResult(items);
         });
+    }
+
+    private TrackMetadata resolveBrowseMetadata(String uri) {
+        String[] cached = PlaylistStore.loadTrackMetadata(this, uri);
+        if (cached != null) {
+            return new TrackMetadata(cached[0], cached[1], cached[2]);
+        }
+        return new TrackMetadata(PlaylistStore.displayName(this, uri), "", "");
+    }
+
+    private static String parsePlaylistName(String mediaId) {
+        if (mediaId == null) {
+            return null;
+        }
+        if (mediaId.startsWith(PLAY_PLAYLIST_ID_PREFIX)) {
+            return mediaId.substring(PLAY_PLAYLIST_ID_PREFIX.length());
+        }
+        if (mediaId.startsWith(PLAYLIST_ID_PREFIX)) {
+            return mediaId.substring(PLAYLIST_ID_PREFIX.length());
+        }
+        return null;
     }
 
     private static String parseTrackPlaylistName(String mediaId) {
@@ -1383,6 +1423,30 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
             @Override
             public void onPlayFromMediaId(String mediaId, Bundle extras) {
                 mainHandler.post(() -> {
+                    String directPlaylistName = parsePlaylistName(mediaId);
+                    if (directPlaylistName != null) {
+                        switchActivePlaylist(directPlaylistName);
+                        if (playlist.isEmpty()) {
+                            playbackRequested = false;
+                            message = "Playlist is empty";
+                            publishState();
+                            return;
+                        }
+                        if (!requestAudioFocus()) {
+                            playbackRequested = false;
+                            message = "Audio focus unavailable";
+                            publishState();
+                            return;
+                        }
+                        currentIndex = -1;
+                        historyIndex = -1;
+                        playHistory.clear();
+                        shuffleBag.clear();
+                        playbackRequested = true;
+                        audioActuallyPlaying = false;
+                        playRandomTrack();
+                        return;
+                    }
                     String playlistName = parseTrackPlaylistName(mediaId);
                     int index = parseTrackIndex(mediaId);
                     if (playlistName == null || index < 0) {
@@ -1532,29 +1596,44 @@ public class SleepMusicService extends MediaBrowserServiceCompat implements Audi
                         playbackRequested ? 1.0f : 0.0f)
                 .build());
 
-        MediaMetadataCompat.Builder metadata = new MediaMetadataCompat.Builder()
-                .putString(MediaMetadataCompat.METADATA_KEY_MEDIA_ID, TRACK_ID_PREFIX + activePlaylistName + "#" + currentIndex)
-                .putString(MediaMetadataCompat.METADATA_KEY_TITLE,
-                        currentTrackName == null || currentTrackName.isEmpty() ? "FredPlayer" : currentTrackName);
-        if (currentTrackArtist != null && !currentTrackArtist.isEmpty()) {
-            metadata.putString(MediaMetadataCompat.METADATA_KEY_ARTIST, currentTrackArtist);
-        }
-        if (currentTrackAlbum != null && !currentTrackAlbum.isEmpty()) {
-            metadata.putString(MediaMetadataCompat.METADATA_KEY_ALBUM, currentTrackAlbum);
-        }
-        if (player != null && player.getDurationMs() > 0L) {
-            metadata.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, player.getDurationMs());
-        }
+        String mediaId = TRACK_ID_PREFIX + activePlaylistName + "#" + currentIndex;
+        String title = currentTrackName == null || currentTrackName.isEmpty() ? "FredPlayer" : currentTrackName;
+        String artist = currentTrackArtist == null ? "" : currentTrackArtist;
+        String album = currentTrackAlbum == null ? "" : currentTrackAlbum;
+        long duration = player == null ? 0L : Math.max(0L, player.getDurationMs());
         // Read straight from the lock screen / notification / Android
         // Auto's now-playing template — none of those need any
         // FredPlayer-specific code, they all already render whatever
         // bitmap sits in this metadata key. Falls back to the branded
         // placeholder so those surfaces never show a blank art slot.
         Bitmap art = currentArtworkBitmap != null ? currentArtworkBitmap : placeholderArtwork();
-        if (art != null) {
-            metadata.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, art);
+        String metadataKey = mediaId + '\u0000' + currentTrackUri + '\u0000' + title + '\u0000'
+                + artist + '\u0000' + album + '\u0000' + duration;
+
+        // Playback position is refreshed every 500 ms, but Android Auto
+        // treats setMetadata() as a full now-playing refresh. Republishing
+        // the identical bitmap on every tick makes full-screen artwork
+        // visibly blink, so only send metadata when it actually changes.
+        if (!metadataKey.equals(lastPublishedMetadataKey) || art != lastPublishedArtworkBitmap) {
+            MediaMetadataCompat.Builder metadata = new MediaMetadataCompat.Builder()
+                    .putString(MediaMetadataCompat.METADATA_KEY_MEDIA_ID, mediaId)
+                    .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title);
+            if (!artist.isEmpty()) {
+                metadata.putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist);
+            }
+            if (!album.isEmpty()) {
+                metadata.putString(MediaMetadataCompat.METADATA_KEY_ALBUM, album);
+            }
+            if (duration > 0L) {
+                metadata.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, duration);
+            }
+            if (art != null) {
+                metadata.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, art);
+            }
+            mediaSession.setMetadata(metadata.build());
+            lastPublishedMetadataKey = metadataKey;
+            lastPublishedArtworkBitmap = art;
         }
-        mediaSession.setMetadata(metadata.build());
     }
 
     private void createNotificationChannel() {

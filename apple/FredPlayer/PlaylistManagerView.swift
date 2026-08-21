@@ -262,7 +262,7 @@ struct SharedPlaylistsView: View {
                 }
                 player.stop()
                 let localName = player.playlist.installSharedPlaylist(name: shared.name, serverTracks: tracks)
-                message = "Saved ‘\(localName)’ on this device. Local changes and deletion won’t affect the server copy."
+                message = "‘\(localName)’ on this device now matches the server copy. Local edits stay on this device until you share."
             } catch {
                 message = "Couldn’t download playlist: \(error.localizedDescription)"
             }

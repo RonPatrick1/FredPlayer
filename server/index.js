@@ -6,15 +6,17 @@ const fsp = fs.promises;
 const http = require('http');
 const path = require('path');
 const { spawn } = require('child_process');
+const { Transform } = require('stream');
 const express = require('express');
 const mm = require('music-metadata');
 const precomputeCache = require('./precompute-cache.js');
 const sharedPlaylists = require('./shared-playlists.js');
 const artwork = require('./artwork.js');
 const lyrics = require('./lyrics.js');
-const { issueStreamTicket, validStreamTicket } = require('./stream-tickets.js');
+const { encodeServerPath, issueStreamTicket, validStreamTicket } = require('./stream-tickets.js');
 const webAuth = require('./web-auth.js');
 const webLeveling = require('./web-leveling.js');
+const { TeslaTelemetryRedisBridge } = require('./tesla-telemetry.js');
 
 const MUSIC_DIR = path.resolve(process.env.MUSIC_DIR || '');
 const PORT = parseInt(process.env.PORT || '8790', 10);
@@ -53,6 +55,16 @@ const WEB_COOKIE_PATH = process.env.WEB_COOKIE_PATH || '/fredplayer-media/web';
 const WEB_DIR = path.join(__dirname, 'web');
 const WEB_DIAGNOSTICS_PATH = path.join(DATA_DIR, 'web-diagnostics.jsonl');
 const WEB_AUDIO_STREAM_SCRIPT = path.join(__dirname, 'web-audio-stream.js');
+// Fixed output rate for the Web streaming pipeline (web-audio-stream.js
+// forces -ar 48000 on both the decode and encode side, no resampling in
+// between) — kept in sync with that script's hardcoded rate.
+const WEB_AUDIO_SAMPLE_RATE = 48000;
+const TESLA_TELEMETRY_REDIS_URL = process.env.TESLA_TELEMETRY_REDIS_URL || '';
+const TESLA_TELEMETRY_REDIS_PATTERN = process.env.TESLA_TELEMETRY_REDIS_PATTERN
+  || 'tesla_telemetry_V_*';
+const TESLA_CONTROL_URL = process.env.TESLA_CONTROL_URL || '';
+const TESLA_CONTROL_TOKEN = process.env.TESLA_CONTROL_TOKEN || '';
+const TESLA_CONTROL_ENV_PATH = process.env.TESLA_CONTROL_ENV_PATH || '';
 
 const AUDIO_EXTENSIONS = new Set([
   '.mp3', '.flac', '.m4a', '.wav', '.ogg', '.aac', '.wma', '.opus', '.alac',
@@ -96,6 +108,7 @@ let libraryPromise;
 const webDurationCache = new Map();
 const fluxaGrants = new Map();
 const fluxaLaunchTickets = new Map();
+const fluxaQueueTickets = new Map();
 
 function issueFluxaGrant() {
   const grant = crypto.randomBytes(32).toString('base64url');
@@ -107,13 +120,21 @@ function issueFluxaGrant() {
   return grant;
 }
 
-function issueFluxaLaunchTicket(trackPath, returnUrl) {
+function issueFluxaLaunchTicket(launch) {
   const ticket = crypto.randomBytes(32).toString('base64url');
   fluxaLaunchTickets.set(ticket, {
-    trackPath,
-    returnUrl,
+    ...launch,
     expiresAt: Date.now() + 2 * 60 * 1000,
   });
+  return ticket;
+}
+
+function issueFluxaQueueTicket(launch) {
+  const ticket = crypto.randomBytes(32).toString('base64url');
+  fluxaQueueTickets.set(ticket, { ...launch, expiresAt: Date.now() + 2 * 60 * 1000 });
+  for (const [candidate, value] of fluxaQueueTickets) {
+    if (value.expiresAt <= Date.now()) fluxaQueueTickets.delete(candidate);
+  }
   return ticket;
 }
 
@@ -143,6 +164,60 @@ function probeAudioDuration(filePath) {
   });
   webDurationCache.set(filePath, pending);
   return pending;
+}
+
+// FLAC's STREAMINFO metadata block carries the stream's total sample count
+// (and an MD5 checksum), which a normal encoder writes by seeking back to
+// the start of its output once it's done. web-audio-stream.js always
+// writes to a pipe (so playback can start immediately instead of waiting
+// for a full-track encode) — pipes aren't seekable, so ffmpeg silently
+// leaves total_samples at zero instead. A stream reporting zero total
+// samples reads as "unknown/live duration" to a stricter decoder, which
+// can plausibly affect how it hands the decoded audio off for output
+// routing. We already know the real answer before the encode even starts
+// (source duration minus the requested start position, at this pipeline's
+// fixed sample rate), so patch it into the first ~42 bytes of the
+// response in memory as they pass through — no temp file, and no added
+// latency for the rest of the stream since everything after that first
+// chunk just flows through unmodified.
+//
+// STREAMINFO byte layout (FLAC spec): 4-byte "fLaC" magic, 4-byte metadata
+// block header, then a 34-byte STREAMINFO body whose last 36 bits (byte 21
+// low nibble through byte 25) hold total_samples — see
+// https://xiph.org/flac/format.html#metadata_block_streaminfo
+function patchFlacStreaminfoTotalSamples(totalSamples) {
+  let patched = false;
+  let pending = Buffer.alloc(0);
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      if (patched) {
+        callback(null, chunk);
+        return;
+      }
+      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+      if (pending.length < 42) {
+        callback();
+        return;
+      }
+      patched = true;
+      if (pending.toString('ascii', 0, 4) === 'fLaC') {
+        const total = BigInt(Math.max(0, Math.round(totalSamples)));
+        pending[21] = (pending[21] & 0xf0) | Number((total >> 32n) & 0xfn);
+        pending[22] = Number((total >> 24n) & 0xffn);
+        pending[23] = Number((total >> 16n) & 0xffn);
+        pending[24] = Number((total >> 8n) & 0xffn);
+        pending[25] = Number(total & 0xffn);
+      }
+      const output = pending;
+      pending = Buffer.alloc(0);
+      callback(null, output);
+    },
+    flush(callback) {
+      // Stream ended before 42 bytes ever arrived (e.g. a near-empty
+      // source) — pass along whatever was buffered, unpatched.
+      callback(null, pending.length ? pending : undefined);
+    },
+  });
 }
 
 function stopWebAudioProcess(child) {
@@ -188,6 +263,76 @@ if (Number.isInteger(REVIEW_PROXY_PORT)
 }
 
 const webLoginAttempts = new Map();
+const webTeslaEventClients = new Set();
+const webTeslaGestures = new Map();
+let webTeslaEventId = 0;
+let teslaTelemetry = null;
+let teslaControlTokenPromise = null;
+
+async function appendWebDiagnostic(entry) {
+  await fsp.mkdir(path.dirname(WEB_DIAGNOSTICS_PATH), { recursive: true });
+  await fsp.appendFile(WEB_DIAGNOSTICS_PATH, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+}
+
+async function resolvedTeslaControlToken() {
+  if (TESLA_CONTROL_TOKEN) return TESLA_CONTROL_TOKEN;
+  if (!TESLA_CONTROL_ENV_PATH) return '';
+  if (!teslaControlTokenPromise) {
+    teslaControlTokenPromise = fsp.readFile(TESLA_CONTROL_ENV_PATH, 'utf8').then((raw) => {
+      const line = raw.split(/\r?\n/).find((candidate) => candidate.startsWith('WATCH_API_TOKEN='));
+      if (!line) return '';
+      const value = line.slice('WATCH_API_TOKEN='.length).trim();
+      if (value.length >= 2 && value[0] === value.at(-1) && ['"', "'"].includes(value[0])) {
+        return value.slice(1, -1);
+      }
+      return value;
+    });
+  }
+  return teslaControlTokenPromise;
+}
+
+async function restoreTeslaVolume(direction) {
+  if (!TESLA_CONTROL_URL) throw new Error('Tesla volume control URL is not configured');
+  const token = await resolvedTeslaControlToken();
+  if (!token) throw new Error('Tesla volume control token is not configured');
+  const command = direction === 'up' ? 'media_volume_down'
+    : direction === 'down' ? 'media_volume_up' : '';
+  if (!command) throw new Error('Tesla volume gesture direction is invalid');
+  const response = await fetch(TESLA_CONTROL_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ command }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!response.ok) throw new Error(`Tesla volume correction failed (${response.status})`);
+}
+
+function broadcastTeslaTelemetryEvent(event) {
+  webTeslaEventId += 1;
+  if (event.type === 'volume-gesture-candidate'
+    && event.count === 1
+    && ['up', 'down'].includes(event.direction)) {
+    webTeslaGestures.set(webTeslaEventId, {
+      direction: event.direction,
+      previousVolume: event.previousVolume,
+      claimed: false,
+      expiresAt: Date.now() + 15_000,
+    });
+  }
+  for (const [id, gesture] of webTeslaGestures) {
+    if (gesture.expiresAt <= Date.now()) webTeslaGestures.delete(id);
+  }
+  const payload = JSON.stringify({ id: webTeslaEventId, ...event });
+  const message = `id: ${webTeslaEventId}\nevent: ${event.type}\ndata: ${payload}\n\n`;
+  for (const response of webTeslaEventClients) response.write(message);
+  appendWebDiagnostic({
+    receivedAt: new Date().toISOString(),
+    report: { automatic: true, kind: 'tesla-fleet-telemetry', event },
+  }).catch((error) => console.error(`Could not store Tesla telemetry diagnostic: ${error.message}`));
+}
 
 function webClientAddress(req) {
   const forwarded = (req.get('x-forwarded-for') || '').split(',').map((value) => value.trim());
@@ -206,8 +351,12 @@ function sameOriginWebRequest(req) {
 }
 
 function webSession(req) {
-  const value = webAuth.cookieValue(req.get('cookie'), WEB_COOKIE_NAME);
-  return webAuth.verifySession(value, WEB_SESSION_SECRET, { version: WEB_SESSION_VERSION });
+  const cookie = webAuth.cookieValue(req.get('cookie'), WEB_COOKIE_NAME);
+  const cookieSession = webAuth.verifySession(cookie, WEB_SESSION_SECRET, { version: WEB_SESSION_VERSION });
+  if (cookieSession) return cookieSession;
+  const authorization = req.get('authorization') || '';
+  if (!authorization.startsWith('Bearer ')) return null;
+  return webAuth.verifySession(authorization.slice(7), WEB_SESSION_SECRET, { version: WEB_SESSION_VERSION });
 }
 
 function requireWebSession(req, res, next) {
@@ -220,9 +369,32 @@ function requireWebSession(req, res, next) {
   next();
 }
 
+function requireWebAudioAccess(req, res, next) {
+  const session = webSession(req);
+  if (session && session.sub === WEB_USERNAME) {
+    req.webSession = session;
+    next();
+    return;
+  }
+  const serverPath = req.params[0];
+  const ticketRequest = {
+    method: req.method,
+    path: `/stream/${encodeServerPath(serverPath)}`,
+    query: req.query,
+  };
+  if (validStreamTicket(ticketRequest, AUTH_TOKEN)) {
+    next();
+    return;
+  }
+  res.status(401).json({ error: 'audio authorization required' });
+}
+
 function setWebSecurityHeaders(_req, res, next) {
+  const frameAncestors = _req.query?.platform === 'tizen'
+    ? "'self' http://192.168.0.178:8097 file:"
+    : "'self' http://192.168.0.178:8097";
   res.set({
-    'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'self' http://192.168.0.178:8097; form-action 'self'",
+    'Content-Security-Policy': `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors ${frameAncestors}; form-action 'self'`,
     'Permissions-Policy': 'camera=(), geolocation=(), microphone=()',
     'Referrer-Policy': 'no-referrer',
     'X-Content-Type-Options': 'nosniff',
@@ -304,7 +476,7 @@ if (WEB_ENABLED) {
       ttlSeconds: sessionSeconds,
     });
     const maxAge = remembered ? `; Max-Age=${sessionSeconds}` : '';
-    res.set('Set-Cookie', `${WEB_COOKIE_NAME}=${encodeURIComponent(session)}${maxAge}; Path=${WEB_COOKIE_PATH}; Secure; HttpOnly; SameSite=Lax`);
+    res.set('Set-Cookie', `${WEB_COOKIE_NAME}=${encodeURIComponent(session)}${maxAge}; Path=${WEB_COOKIE_PATH}; Secure; HttpOnly; SameSite=None`);
     const deviceToken = remembered
       ? webAuth.createSession(WEB_USERNAME, WEB_SESSION_SECRET, {
         version: WEB_SESSION_VERSION,
@@ -330,7 +502,7 @@ if (WEB_ENABLED) {
       version: WEB_SESSION_VERSION,
       ttlSeconds: webAuth.REMEMBERED_DEVICE_SECONDS,
     });
-    res.set('Set-Cookie', `${WEB_COOKIE_NAME}=${encodeURIComponent(session)}; Max-Age=${webAuth.REMEMBERED_DEVICE_SECONDS}; Path=${WEB_COOKIE_PATH}; Secure; HttpOnly; SameSite=Lax`);
+    res.set('Set-Cookie', `${WEB_COOKIE_NAME}=${encodeURIComponent(session)}; Max-Age=${webAuth.REMEMBERED_DEVICE_SECONDS}; Path=${WEB_COOKIE_PATH}; Secure; HttpOnly; SameSite=None`);
     res.json({ authenticated: true });
   });
 
@@ -358,7 +530,7 @@ if (WEB_ENABLED) {
       res.status(403).json({ error: 'invalid request origin' });
       return;
     }
-    res.set('Set-Cookie', `${WEB_COOKIE_NAME}=; Max-Age=0; Path=${WEB_COOKIE_PATH}; Secure; HttpOnly; SameSite=Lax`);
+    res.set('Set-Cookie', `${WEB_COOKIE_NAME}=; Max-Age=0; Path=${WEB_COOKIE_PATH}; Secure; HttpOnly; SameSite=None`);
     res.status(204).end();
   });
 
@@ -375,14 +547,36 @@ if (WEB_ENABLED) {
       version: WEB_SESSION_VERSION,
       ttlSeconds: webAuth.REMEMBERED_DEVICE_SECONDS,
     });
-    res.set('Set-Cookie', `${WEB_COOKIE_NAME}=${encodeURIComponent(session)}; Max-Age=${webAuth.REMEMBERED_DEVICE_SECONDS}; Path=${WEB_COOKIE_PATH}; Secure; HttpOnly; SameSite=Lax`);
+    res.set('Set-Cookie', `${WEB_COOKIE_NAME}=${encodeURIComponent(session)}; Max-Age=${webAuth.REMEMBERED_DEVICE_SECONDS}; Path=${WEB_COOKIE_PATH}; Secure; HttpOnly; SameSite=None`);
     const query = new URLSearchParams({
       fluxa: '1',
       platform: 'tizen',
-      play: launch.trackPath,
       return: launch.returnUrl,
     });
+    if (Array.isArray(launch.trackPaths) && launch.trackPaths.length) {
+      query.set('queue', issueFluxaQueueTicket(launch));
+    } else {
+      query.set('play', launch.trackPath);
+    }
     res.redirect(303, `${WEB_COOKIE_PATH}/?${query}`);
+  });
+
+  app.get('/web/api/fluxa-queue/:ticket', requireWebSession, (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const ticket = String(req.params.ticket || '');
+    const launch = fluxaQueueTickets.get(ticket);
+    fluxaQueueTickets.delete(ticket);
+    if (!launch || launch.expiresAt <= Date.now()) {
+      res.status(401).json({ error: 'This Fluxa playback queue has expired.' });
+      return;
+    }
+    res.json({
+      paths: launch.trackPaths,
+      sourceName: launch.sourceName,
+      sourceKind: launch.sourceKind,
+      shuffle: launch.shuffle === true,
+      startPath: launch.startPath || '',
+    });
   });
 
   app.get('/web/api/library', requireWebSession, async (_req, res) => {
@@ -451,12 +645,13 @@ if (WEB_ENABLED) {
     }
   });
 
-  app.get('/web/api/audio/*', requireWebSession, async (req, res) => {
+  app.get('/web/api/audio/*', requireWebAudioAccess, async (req, res) => {
     const serverPath = req.params[0];
     const filePath = resolveWithin(MUSIC_DIR, serverPath, true);
     const start = Math.max(0, Number(req.query.start) || 0);
     const format = req.query.format === 'mp3' ? 'mp3' : 'flac';
     const leveling = req.query.leveling !== '0';
+    const bassGain = Math.max(0, Math.min(9, Number(req.query.bass_gain) || 0));
     try {
       const stats = filePath && await fsp.stat(filePath);
       if (!stats?.isFile() || !AUDIO_EXTENSIONS.has(path.extname(filePath).toLowerCase())) {
@@ -469,12 +664,30 @@ if (WEB_ENABLED) {
         const profilePath = resolveWithin(PROFILES_DIR, `${serverPath}.json`, true);
         try { profile = JSON.parse(await fsp.readFile(profilePath, 'utf8')); } catch (_error) {}
       }
+
+      // See patchFlacStreaminfoTotalSamples() — only meaningful for FLAC.
+      // probeAudioDuration() is cached and usually already warm (the client
+      // fetches audio-info in parallel with starting playback), so this
+      // rarely adds a real ffprobe round-trip on the hot path; if it fails
+      // for any reason we just skip the patch instead of failing the
+      // stream.
+      let totalSamples = null;
+      if (format === 'flac') {
+        try {
+          const duration = await probeAudioDuration(filePath);
+          totalSamples = Math.max(0, Math.round((duration - start) * WEB_AUDIO_SAMPLE_RATE));
+        } catch (_error) {
+          totalSamples = null;
+        }
+      }
+
       const args = [
         WEB_AUDIO_STREAM_SCRIPT,
         '--source', filePath,
         '--start', start.toFixed(3),
         '--format', format,
         '--leveling', leveling ? '1' : '0',
+        '--bass-gain', bassGain.toFixed(2),
       ];
       if (Number.isFinite(profile?.rms) && Number.isFinite(profile?.peak)) {
         args.push('--rms', String(profile.rms), '--peak', String(profile.peak));
@@ -496,7 +709,11 @@ if (WEB_ENABLED) {
       });
       child.stderr.setEncoding('utf8');
       child.stderr.on('data', (chunk) => { errorOutput = (errorOutput + chunk).slice(-4096); });
-      child.stdout.pipe(res);
+      if (Number.isFinite(totalSamples)) {
+        child.stdout.pipe(patchFlacStreaminfoTotalSamples(totalSamples)).pipe(res);
+      } else {
+        child.stdout.pipe(res);
+      }
       child.on('error', (error) => {
         if (!res.headersSent) res.status(500).json({ error: 'Could not start Web audio processor' });
         else res.destroy(error);
@@ -567,6 +784,66 @@ if (WEB_ENABLED) {
     });
   });
 
+  app.get('/web/api/tesla-events', requireWebSession, (req, res) => {
+    res.status(200).set({
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-store, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.flushHeaders();
+    res.write(`event: telemetry-status\ndata: ${JSON.stringify({
+      configured: Boolean(TESLA_TELEMETRY_REDIS_URL),
+    })}\n\n`);
+    webTeslaEventClients.add(res);
+    const keepalive = setInterval(() => res.write(': keepalive\n\n'), 20_000);
+    keepalive.unref?.();
+    req.on('close', () => {
+      clearInterval(keepalive);
+      webTeslaEventClients.delete(res);
+    });
+  });
+
+  app.post('/web/api/tesla-events/:id/claim', requireWebSession, express.json({ limit: '1kb' }), (req, res) => {
+    if (!sameOriginWebRequest(req)) {
+      res.status(403).json({ error: 'cross-origin Tesla control request denied' });
+      return;
+    }
+    const id = Number(req.params.id);
+    const gesture = Number.isSafeInteger(id) ? webTeslaGestures.get(id) : null;
+    if (!gesture || gesture.expiresAt <= Date.now() || gesture.claimed) {
+      res.json({ claimed: false });
+      return;
+    }
+    gesture.claimed = true;
+    const action = gesture.direction === 'up' ? 'nexttrack' : 'previoustrack';
+    teslaTelemetry?.suppressNextVolume(gesture.previousVolume, { ttlMs: 10_000 });
+    restoreTeslaVolume(gesture.direction)
+      .then(() => appendWebDiagnostic({
+        receivedAt: new Date().toISOString(),
+        report: {
+          automatic: true,
+          kind: 'tesla-volume-compensation',
+          eventId: id,
+          direction: gesture.direction,
+          restoredVolume: gesture.previousVolume,
+          status: 'sent',
+        },
+      }))
+      .catch((error) => appendWebDiagnostic({
+        receivedAt: new Date().toISOString(),
+        report: {
+          automatic: true,
+          kind: 'tesla-volume-compensation',
+          eventId: id,
+          direction: gesture.direction,
+          status: 'failed',
+          error: error.message,
+        },
+      }).catch(() => {}));
+    res.json({ claimed: true, action });
+  });
+
   app.post('/web/api/diagnostics', requireWebSession, express.json({ limit: '32kb' }), async (req, res) => {
     const report = req.body;
     if (!report || typeof report !== 'object' || Array.isArray(report)) {
@@ -578,8 +855,7 @@ if (WEB_ENABLED) {
       userAgent: String(req.get('user-agent') || '').slice(0, 512),
       report,
     };
-    await fsp.mkdir(path.dirname(WEB_DIAGNOSTICS_PATH), { recursive: true });
-    await fsp.appendFile(WEB_DIAGNOSTICS_PATH, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+    await appendWebDiagnostic(entry);
     res.status(204).end();
   });
 }
@@ -617,19 +893,35 @@ app.post('/api/fluxa-grant/:grant', (req, res) => {
   res.set('Cache-Control', 'no-store').json({ authenticated: true });
 });
 
-app.post('/api/fluxa-launch-ticket', express.json({ limit: '16kb' }), async (req, res) => {
+app.post('/api/fluxa-launch-ticket', express.json({ limit: '2mb' }), async (req, res) => {
   const trackPath = typeof req.body?.trackPath === 'string' ? req.body.trackPath : '';
+  const trackPaths = Array.isArray(req.body?.trackPaths)
+    ? req.body.trackPaths.filter((value) => typeof value === 'string')
+    : [];
   const returnUrl = typeof req.body?.returnUrl === 'string' ? req.body.returnUrl : '';
   let destination;
   try { destination = new URL(returnUrl); } catch (_error) {}
   const library = await libraryPromise;
-  if (!trackPath || trackPath.length > 4096 || !library.some((track) => track.path === trackPath)
+  const libraryPaths = new Set(library.map((track) => track.path));
+  const validSingle = trackPath && trackPath.length <= 4096 && libraryPaths.has(trackPath);
+  const validQueue = trackPaths.length > 0 && trackPaths.length <= 2000
+    && trackPaths.every((path) => path.length <= 4096 && libraryPaths.has(path));
+  if ((!validSingle && !validQueue)
       || !destination || !['http:', 'https:'].includes(destination.protocol)) {
     res.status(400).json({ error: 'invalid Fluxa launch request' });
     return;
   }
   res.set('Cache-Control', 'no-store').json({
-    ticket: issueFluxaLaunchTicket(trackPath, destination.href),
+    ticket: issueFluxaLaunchTicket({
+      trackPath,
+      trackPaths: validQueue ? trackPaths : [],
+      sourceName: typeof req.body?.sourceName === 'string' ? req.body.sourceName.slice(0, 500) : '',
+      sourceKind: typeof req.body?.sourceKind === 'string' ? req.body.sourceKind.slice(0, 50) : 'Queue',
+      shuffle: req.body?.shuffle === true,
+      startPath: typeof req.body?.startPath === 'string' && libraryPaths.has(req.body.startPath)
+        ? req.body.startPath : '',
+      returnUrl: destination.href,
+    }),
     expiresIn: 120,
   });
 });
@@ -1483,3 +1775,16 @@ app.listen(PORT, '127.0.0.1', () => {
   console.log(`FredPlayer media server listening on 127.0.0.1:${PORT}`);
   console.log(`Serving library from ${MUSIC_DIR}`);
 });
+
+if (WEB_ENABLED && TESLA_TELEMETRY_REDIS_URL) {
+  teslaTelemetry = new TeslaTelemetryRedisBridge({
+    redisUrl: TESLA_TELEMETRY_REDIS_URL,
+    channelPattern: TESLA_TELEMETRY_REDIS_PATTERN,
+  });
+  teslaTelemetry.on('event', broadcastTeslaTelemetryEvent);
+  teslaTelemetry.on('status', (status) => {
+    if (status.connected) console.log('Tesla Fleet Telemetry Redis bridge connected');
+    else if (status.error) console.error(`Tesla Fleet Telemetry Redis bridge: ${status.error}`);
+  });
+  teslaTelemetry.start();
+}

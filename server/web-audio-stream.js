@@ -13,6 +13,7 @@ const source = option('source');
 const start = Math.max(0, Number(option('start', '0')) || 0);
 const format = option('format', 'flac') === 'mp3' ? 'mp3' : 'flac';
 const enabled = option('leveling', '1') !== '0';
+const bassGain = Math.max(0, Math.min(9, Number(option('bass-gain', '0')) || 0));
 const rms = Number(option('rms', 'nan'));
 const peak = Number(option('peak', 'nan'));
 const profile = Number.isFinite(rms) && Number.isFinite(peak) ? { rms, peak } : null;
@@ -37,6 +38,13 @@ const encoderArgs = [
   '-f', 'f32le', '-ar', '48000', '-ac', '2', '-i', 'pipe:0',
   '-map_metadata', '-1',
 ];
+if (bassGain > 0) {
+  // The Node DSP feeds this encoder, so enhancement happens after FredPlayer's
+  // adaptive leveling/compression. The limiter remains the final DSP stage.
+  encoderArgs.push(
+    '-af', `bass=g=${bassGain.toFixed(2)}:f=95:w=0.70:t=q:precision=f32,alimiter=limit=0.95:attack=5:release=100:level=false`,
+  );
+}
 if (format === 'mp3') {
   encoderArgs.push('-c:a', 'libmp3lame', '-b:a', '320k', '-write_xing', '0', '-f', 'mp3');
 } else {

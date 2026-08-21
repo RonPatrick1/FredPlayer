@@ -227,6 +227,13 @@ public class MainActivity extends Activity {
             }
             String message = intent.getStringExtra(SleepMusicService.EXTRA_MESSAGE);
             int count = intent.getIntExtra(SleepMusicService.EXTRA_PLAYLIST_COUNT, playlist.size());
+            // The player service is the source of truth for Remove-current-track.
+            // Reload from disk when the counts diverge so Share / Settings cannot
+            // publish or persist the stale in-memory copy over those removals.
+            if (count != playlist.size()) {
+                syncPlaylistFromStore();
+                count = playlist.size();
+            }
             int cacheCount = intent.getIntExtra(SleepMusicService.EXTRA_CACHE_COUNT, -1);
             int cachePruneAbove = intent.getIntExtra(SleepMusicService.EXTRA_CACHE_PRUNE_ABOVE, 5000);
             int cacheKeep = intent.getIntExtra(SleepMusicService.EXTRA_CACHE_KEEP, 4000);
@@ -973,6 +980,7 @@ public class MainActivity extends Activity {
     }
 
     private void confirmShareCurrentPlaylist(JSONArray summaries, String baseUrl, String token) {
+        syncPlaylistFromStore();
         persistActivePlaylist();
         if (playlist.isEmpty()) {
             Toast.makeText(this, "Add songs to \"" + activePlaylistName + "\" before sharing",
@@ -1091,14 +1099,14 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "That shared playlist has no playable songs", Toast.LENGTH_LONG).show();
             return;
         }
-        String localName = uniquePlaylistName(sharedName);
+        syncPlaylistFromStore();
         persistActivePlaylist();
-        playlists.put(localName, new ArrayList<>(urls));
+        String localName = replaceLocalPlaylist(sharedName, urls);
         PlaylistStore.savePlaylists(this, playlists);
         switchPlaylist(localName);
         new AlertDialog.Builder(this)
                 .setTitle("Playlist downloaded")
-                .setMessage("Saved \"" + localName + "\" on this device. You can change or delete it without changing the shared server copy.")
+                .setMessage("\"" + localName + "\" on this device now matches the server copy. Local edits stay on this device until you share.")
                 .setPositiveButton("OK", null)
                 .show();
     }
@@ -1478,6 +1486,7 @@ public class MainActivity extends Activity {
     }
 
     private void showSettingsScreen() {
+        syncPlaylistFromStore();
         lyricsTickHandler.removeCallbacks(lyricsTick);
         showingSettings = true;
         showingLyrics = false;
@@ -1495,6 +1504,7 @@ public class MainActivity extends Activity {
     }
 
     private void showPlaylistEditorScreen() {
+        syncPlaylistFromStore();
         lyricsTickHandler.removeCallbacks(lyricsTick);
         showingSettings = false;
         showingLyrics = false;
@@ -3050,9 +3060,11 @@ public class MainActivity extends Activity {
         if (!playlists.containsKey(name)) {
             return;
         }
-        persistActivePlaylist();
-        activePlaylistName = name;
-        PlaylistStore.saveActivePlaylistName(this, activePlaylistName);
+        if (!name.equals(activePlaylistName)) {
+            persistActivePlaylist();
+            activePlaylistName = name;
+            PlaylistStore.saveActivePlaylistName(this, activePlaylistName);
+        }
         playlist.clear();
         playlist.addAll(playlists.get(activePlaylistName));
         updatePlaylistText();
@@ -3063,6 +3075,36 @@ public class MainActivity extends Activity {
         playlists.put(activePlaylistName, new ArrayList<>(playlist));
         PlaylistStore.savePlaylists(this, playlists);
         PlaylistStore.saveActivePlaylistName(this, activePlaylistName);
+    }
+
+    private void syncPlaylistFromStore() {
+        playlists.clear();
+        playlists.putAll(PlaylistStore.loadPlaylists(this));
+        activePlaylistName = PlaylistStore.loadActivePlaylistName(this, playlists);
+        playlist.clear();
+        ArrayList<String> active = playlists.get(activePlaylistName);
+        if (active != null) {
+            playlist.addAll(active);
+        }
+        updatePlaylistText();
+    }
+
+    private String replaceLocalPlaylist(String sharedName, ArrayList<String> urls) {
+        String canonical = sharedName == null ? "" : sharedName.trim();
+        ArrayList<String> aliases = new ArrayList<>();
+        for (String existing : playlists.keySet()) {
+            if (existing.equalsIgnoreCase(canonical) && !existing.equals(canonical)) {
+                aliases.add(existing);
+            }
+        }
+        for (String alias : aliases) {
+            playlists.remove(alias);
+            if (alias.equals(activePlaylistName)) {
+                activePlaylistName = canonical;
+            }
+        }
+        playlists.put(canonical, new ArrayList<>(urls));
+        return canonical;
     }
 
     private EditText playlistNameInput(String initialValue) {
@@ -3706,8 +3748,14 @@ public class MainActivity extends Activity {
                 .setTitle("Remove track")
                 .setMessage("Remove the current track from \"" + activePlaylistName + "\"?")
                 .setNegativeButton("Cancel", null)
-                .setPositiveButton("Remove", (dialog, which) ->
-                        sendServiceCommand(SleepMusicService.ACTION_REMOVE_CURRENT))
+                .setPositiveButton("Remove", (dialog, which) -> {
+                    String uri = currentTrackUri;
+                    if (uri != null && !uri.isEmpty() && playlist.remove(uri)) {
+                        persistActivePlaylist();
+                        updatePlaylistText();
+                    }
+                    sendServiceCommand(SleepMusicService.ACTION_REMOVE_CURRENT);
+                })
                 .show();
     }
 

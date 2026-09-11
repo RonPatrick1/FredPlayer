@@ -37,6 +37,7 @@ const ARTWORK_DIR = path.join(DATA_DIR, 'artwork');
 // so a big backlog just gets worked through incrementally across ticks
 // rather than one pass blocking everything else for minutes.
 const ARTWORK_PASS_LIMIT = 5;
+const ARTWORK_EMBEDDED_PASS_LIMIT = 1000;
 const ARTWORK_PASS_INTERVAL_MS = 5 * 60 * 1000;
 const PLAYLISTS_DIR = path.join(DATA_DIR, 'playlists');
 const LIAM_ASK_URL = process.env.LIAM_ASK_URL || 'http://127.0.0.1:8787/fredplayer-ask';
@@ -69,6 +70,21 @@ const TESLA_CONTROL_ENV_PATH = process.env.TESLA_CONTROL_ENV_PATH || '';
 const AUDIO_EXTENSIONS = new Set([
   '.mp3', '.flac', '.m4a', '.wav', '.ogg', '.aac', '.wma', '.opus', '.alac',
 ]);
+
+function artworkArtistForTrack(track) {
+  return track?.albumArtist || track?.artist || '';
+}
+
+function cachedArtworkFileForTrack(track) {
+  if (!track?.album) return null;
+  const artists = [...new Set([artworkArtistForTrack(track), track.artist].filter(Boolean))];
+  for (const artist of artists) {
+    const filePath = path.join(ARTWORK_DIR,
+      `${artwork.albumCacheKey(artist, track.album)}.jpg`);
+    if (fs.existsSync(filePath)) return filePath;
+  }
+  return null;
+}
 
 // Both current Android devices use these settings. The 30-FPS legacy cache
 // remains available as a fallback; this second settings-keyed variant makes
@@ -778,7 +794,11 @@ if (WEB_ENABLED) {
       res.status(404).end();
       return;
     }
-    const filePath = path.join(ARTWORK_DIR, `${artwork.albumCacheKey(track.artist, track.album)}.jpg`);
+    const filePath = cachedArtworkFileForTrack(track);
+    if (!filePath) {
+      res.status(404).end();
+      return;
+    }
     res.type('image/jpeg').sendFile(filePath, (error) => {
       if (error && !res.headersSent) res.status(404).end();
     });
@@ -963,6 +983,7 @@ async function buildLibraryIndex() {
     const posixPath = relPath.split(path.sep).join('/');
     let title = path.basename(relPath, path.extname(relPath));
     let artist = '';
+    let albumArtist = '';
     let album = '';
     let genre = '';
     try {
@@ -974,6 +995,8 @@ async function buildLibraryIndex() {
         title = metadata.common.title;
       }
       artist = metadata.common.artist || (metadata.common.artists || []).join(', ') || '';
+      albumArtist = metadata.common.albumartist
+        || (metadata.common.compilation ? 'Various Artists' : '');
       album = metadata.common.album || '';
       if (metadata.common.genre && metadata.common.genre.length) {
         genre = metadata.common.genre.join(', ');
@@ -981,7 +1004,7 @@ async function buildLibraryIndex() {
     } catch (err) {
       // Unreadable tags — fall back to the filename-derived title above.
     }
-    tracks.push({ path: posixPath, title, artist, album, genre });
+    tracks.push({ path: posixPath, title, artist, albumArtist, album, genre });
   }
   tracks.sort((a, b) => a.path.localeCompare(b.path));
   console.log(`Library index built: ${tracks.length} tracks`);
@@ -1241,33 +1264,82 @@ async function runAutoPrecomputePass() {
   return didWork;
 }
 
-// Album art, unlike the visual/leveling passes above, is plain throttled
-// HTTP (MusicBrainz + Cover Art Archive) rather than CPU-heavy decode work,
-// so it runs directly in this process instead of a spawned child — nothing
-// here touches the event loop for long between awaits.
+// Album art, unlike the visual/leveling passes above, is lightweight tag
+// parsing plus throttled HTTP (MusicBrainz + Cover Art Archive), so it runs
+// directly in this process instead of a spawned child.
 async function runArtworkPass() {
   const nowMs = Date.now();
   if (runArtworkPass.nextRunAt && runArtworkPass.nextRunAt > nowMs) return false;
   runArtworkPass.nextRunAt = nowMs + ARTWORK_PASS_INTERVAL_MS;
   const library = await libraryPromise;
-  const seen = new Set();
-  const newAlbums = [];
-  const retries = [];
+  await fsp.mkdir(ARTWORK_DIR, { recursive: true });
+  const albums = new Map();
   for (const track of library) {
     if (!track.artist || !track.album) continue;
-    const key = artwork.albumCacheKey(track.artist, track.album);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const status = artwork.artworkAttemptStatus(ARTWORK_DIR, track.artist, track.album, nowMs);
-    if (!status.due) continue;
-    (status.isNew ? newAlbums : retries).push({ track, status });
+    const artist = track.albumArtist || track.artist;
+    const key = artwork.albumCacheKey(artist, track.album);
+    let entry = albums.get(key);
+    if (!entry) {
+      entry = { key, artist, album: track.album, tracks: [], legacyArtists: new Set() };
+      albums.set(key, entry);
+    }
+    entry.tracks.push(track);
+    entry.legacyArtists.add(track.artist);
+  }
+
+  for (const entry of albums.values()) {
+    entry.wasNew = artwork.artworkAttemptStatus(
+      ARTWORK_DIR, entry.artist, entry.album, nowMs).isNew;
+  }
+
+  // Reuse artwork cached under the old track-artist key when album-artist
+  // grouping changes a compilation's canonical key.
+  for (const entry of albums.values()) {
+    const canonicalPath = path.join(ARTWORK_DIR, `${entry.key}.jpg`);
+    if (fs.existsSync(canonicalPath)) continue;
+    for (const legacyArtist of entry.legacyArtists) {
+      const legacyPath = path.join(ARTWORK_DIR,
+        `${artwork.albumCacheKey(legacyArtist, entry.album)}.jpg`);
+      if (legacyPath === canonicalPath || !fs.existsSync(legacyPath)) continue;
+      const temporary = `${canonicalPath}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+      try {
+        await fsp.copyFile(legacyPath, temporary);
+        await fsp.rename(temporary, canonicalPath);
+      } finally {
+        await fsp.unlink(temporary).catch(() => {});
+      }
+      break;
+    }
+  }
+
+  // Embedded images do not consume a web-service quota, so recover them in
+  // substantially larger batches than remote MusicBrainz lookups.
+  const embeddedPending = [...albums.values()]
+    .filter((entry) => artwork.artworkAttemptStatus(
+      ARTWORK_DIR, entry.artist, entry.album, nowMs).needsEmbeddedCheck)
+    .slice(0, ARTWORK_EMBEDDED_PASS_LIMIT);
+  for (const entry of embeddedPending) {
+    const sourcePaths = entry.tracks
+      .map((track) => resolveWithin(MUSIC_DIR, track.path, true))
+      .filter(Boolean);
+    const result = await artwork.ensureEmbeddedAlbumArt(
+      ARTWORK_DIR, entry.artist, entry.album, sourcePaths, { nowMs });
+    if (result) console.log(`Recovered embedded album art: ${entry.artist} - ${entry.album}`);
+  }
+
+  const newAlbums = [];
+  const retries = [];
+  for (const entry of albums.values()) {
+    const status = artwork.artworkAttemptStatus(ARTWORK_DIR, entry.artist, entry.album, nowMs);
+    if (!status.due || status.needsEmbeddedCheck) continue;
+    (entry.wasNew ? newAlbums : retries).push({ entry, status });
   }
   // Newly added albums do not sit behind the historical retry backlog.
   const pending = [...newAlbums, ...retries].slice(0, ARTWORK_PASS_LIMIT);
-  for (const { track, status } of pending) {
-    const variation = status.candidate === track.album ? '' : ` as "${status.candidate}"`;
-    console.log(`Fetching album art (${status.candidateIndex + 1}/${status.candidateCount}): ${track.artist} - ${track.album}${variation}`);
-    const result = await artwork.ensureAlbumArt(ARTWORK_DIR, track.artist, track.album);
+  for (const { entry, status } of pending) {
+    const variation = status.candidate === entry.album ? '' : ` as "${status.candidate}"`;
+    console.log(`Fetching album art (${status.candidateIndex + 1}/${status.candidateCount}): ${entry.artist} - ${entry.album}${variation}`);
+    const result = await artwork.ensureAlbumArt(ARTWORK_DIR, entry.artist, entry.album);
     if (!result) console.log(`  candidate did not produce art: ${status.candidate}`);
   }
   // Artwork has its own five-minute budget. Do not accelerate the global
@@ -1431,8 +1503,11 @@ app.get('/api/artwork/*', async (req, res) => {
     res.status(404).json({ error: 'not found' });
     return;
   }
-  const key = artwork.albumCacheKey(track.artist, track.album);
-  const filePath = path.join(ARTWORK_DIR, `${key}.jpg`);
+  const filePath = cachedArtworkFileForTrack(track);
+  if (!filePath) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
   try {
     const contents = await fsp.readFile(filePath);
     res.type('image/jpeg').send(contents);

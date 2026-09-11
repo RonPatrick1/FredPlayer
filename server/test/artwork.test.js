@@ -43,9 +43,9 @@ test('artwork search advances one title candidate at a time and can succeed late
 
   const first = await artwork.ensureAlbumArt(directory, artist, album, {
     nowMs: now,
-    findReleaseId: async (_artist, candidate) => {
+    findReleaseIds: async (_artist, candidate) => {
       lookups.push(candidate);
-      return null;
+      return [];
     },
   });
   assert.equal(first, null);
@@ -55,9 +55,9 @@ test('artwork search advances one title candidate at a time and can succeed late
   const secondNow = now + artwork.ARTWORK_CANDIDATE_RETRY_MS;
   const second = await artwork.ensureAlbumArt(directory, artist, album, {
     nowMs: secondNow,
-    findReleaseId: async (_artist, candidate) => {
+    findReleaseIds: async (_artist, candidate) => {
       lookups.push(candidate);
-      return 'release-id';
+      return ['release-id'];
     },
     fetchCoverArtWithRetries: async () => Buffer.from('jpeg'),
   });
@@ -79,7 +79,7 @@ test('legacy empty misses migrate and exhausted searches receive a slow retry', 
   assert.equal(artwork.artworkAttemptStatus(directory, artist, album, now).due, true);
   await artwork.ensureAlbumArt(directory, artist, album, {
     nowMs: now,
-    findReleaseId: async () => null,
+    findReleaseIds: async () => [],
   });
   const state = JSON.parse(await fsp.readFile(missPath, 'utf8'));
   assert.deepEqual(state.attemptedCandidates, [album]);
@@ -90,4 +90,68 @@ test('legacy empty misses migrate and exhausted searches receive a slow retry', 
   assert.equal(retry.due, true);
   assert.equal(retry.restartCycle, true);
   assert.equal(retry.candidate, album);
+});
+
+test('embedded JPEG artwork is cached without a remote lookup', async (t) => {
+  const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'fredplayer-artwork-'));
+  t.after(() => fsp.rm(directory, { recursive: true, force: true }));
+  const artist = 'Embedded Artist';
+  const album = 'Embedded Album';
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+
+  const result = await artwork.ensureEmbeddedAlbumArt(
+    directory, artist, album, ['/music/track.flac'], {
+      nowMs: 3_000_000,
+      findEmbeddedPicture: async (paths) => {
+        assert.deepEqual(paths, ['/music/track.flac']);
+        return { format: 'image/jpeg', data: jpeg };
+      },
+      convertToJpeg: async () => {
+        assert.fail('JPEG artwork should not be converted');
+      },
+    });
+
+  assert.ok(result.endsWith('.jpg'));
+  assert.deepEqual(await fsp.readFile(result), jpeg);
+  assert.equal(artwork.artworkAttemptStatus(directory, artist, album).resolved, true);
+});
+
+test('artwork tries distinct releases for one title over time', async (t) => {
+  const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'fredplayer-artwork-'));
+  t.after(() => fsp.rm(directory, { recursive: true, force: true }));
+  const artist = 'Release Artist';
+  const album = 'Release Album';
+  const now = 4_000_000;
+  let searches = 0;
+  const fetched = [];
+
+  await artwork.ensureAlbumArt(directory, artist, album, {
+    nowMs: now,
+    findReleaseIds: async () => {
+      searches += 1;
+      return ['release-without-art', 'release-with-art'];
+    },
+    fetchCoverArtWithRetries: async (releaseId) => {
+      fetched.push(releaseId);
+      const error = new Error('not found');
+      error.statusCode = 404;
+      throw error;
+    },
+  });
+
+  const second = await artwork.ensureAlbumArt(directory, artist, album, {
+    nowMs: now + artwork.ARTWORK_CANDIDATE_RETRY_MS,
+    findReleaseIds: async () => {
+      assert.fail('the persisted MusicBrainz result should be reused');
+    },
+    fetchCoverArtWithRetries: async (releaseId) => {
+      fetched.push(releaseId);
+      return Buffer.from('jpeg');
+    },
+  });
+
+  assert.equal(searches, 1);
+  assert.deepEqual(fetched, ['release-without-art', 'release-with-art']);
+  assert.ok(second.endsWith('.jpg'));
+  assert.equal(await fsp.readFile(second, 'utf8'), 'jpeg');
 });
